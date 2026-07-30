@@ -304,9 +304,11 @@ def test_task6_string_item_and_name_schema_constraints_cover_every_field() -> No
     ):
         assert filters[field]["items"]["minLength"] == 1
         assert filters[field]["items"]["pattern"]
+        assert filters[field]["items"]["not"] == {"pattern": r"\s$"}
     rule = definitions["ScenarioRuleConfig"]["properties"]
     assert rule["name"]["minLength"] == 1
     assert rule["name"]["pattern"]
+    assert rule["name"]["not"] == {"pattern": r"\s$"}
     for field in (
         "required_any_tags",
         "required_all_tags",
@@ -317,9 +319,25 @@ def test_task6_string_item_and_name_schema_constraints_cover_every_field() -> No
     ):
         assert rule[field]["items"]["minLength"] == 1
         assert rule[field]["items"]["pattern"]
+        assert rule[field]["items"]["not"] == {"pattern": r"\s$"}
 
 
-@pytest.mark.parametrize("value", ["", "   ", " leading", "trailing "])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        " leading",
+        "trailing ",
+        "\n",
+        "value\n",
+        "\r",
+        "value\r\n",
+        "value\u2028",
+        "value\u2029",
+        "value\t",
+    ],
+)
 @pytest.mark.parametrize(
     ("location", "field"),
     [
@@ -351,13 +369,18 @@ def test_task6_trimmed_nonblank_strings_have_schema_and_load_parity(
         load_config(path)
 
 
-def test_internal_space_scenario_name_passes_schema_and_runtime(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "name", ["Left Turn Urban", "Left\tTurn", "Left\nTurn", "Left\u2028Turn", "Left\u2029Turn"]
+)
+def test_internal_space_scenario_name_passes_schema_and_runtime(
+    tmp_path: Path, name: str
+) -> None:
     data = minimal_config()
     data["scenarios"] = {
         "seed": 1,
-        "rules": [{"name": "Left Turn Urban", "quota": 0}],
+        "rules": [{"name": name, "quota": 0}],
     }
     assert not _schema_errors(data)
     path = tmp_path / "internal-space.json"
     path.write_text(json.dumps(data), encoding="utf-8")
-    assert load_config(path).scenarios.rules[0].name == "Left Turn Urban"
+    assert load_config(path).scenarios.rules[0].name == name

@@ -133,7 +133,11 @@ def _paths_overlap(first: Path, second: Path) -> bool:
 
 TrimmedNonBlankString = Annotated[
     str,
-    Field(min_length=1, pattern=r"^\S(?:[\s\S]*\S)?$"),
+    Field(
+        min_length=1,
+        pattern=r"^\S(?:[\s\S]*\S)?$",
+        json_schema_extra={"not": {"pattern": r"\s$"}},
+    ),
 ]
 Ratio = Annotated[float, Field(ge=0, le=1)]
 

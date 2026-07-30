@@ -105,6 +105,9 @@
         "blacklisted_blob_paths": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -115,6 +118,9 @@
         "blacklisted_scene_tokens": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -125,6 +131,9 @@
         "blacklisted_source_digests": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -135,6 +144,9 @@
         "excluded_labels": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -145,6 +157,9 @@
         "excluded_tags": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -334,6 +349,9 @@
         "required_all_labels": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -344,6 +362,9 @@
         "required_all_tags": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -354,6 +375,9 @@
         "required_any_labels": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -364,6 +388,9 @@
         "required_any_tags": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -697,6 +724,9 @@
         "excluded_labels": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -707,6 +737,9 @@
         "excluded_tags": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -727,6 +760,9 @@
         },
         "name": {
           "minLength": 1,
+          "not": {
+            "pattern": "\\s$"
+          },
           "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
           "title": "Name",
           "type": "string"
@@ -739,6 +775,9 @@
         "required_all_labels": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -749,6 +788,9 @@
         "required_all_tags": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -759,6 +801,9 @@
         "required_any_labels": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
@@ -769,6 +814,9 @@
         "required_any_tags": {
           "items": {
             "minLength": 1,
+            "not": {
+              "pattern": "\\s$"
+            },
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
