@@ -19,6 +19,7 @@ from PIL import Image
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.export import NUSCENES_VERSION, OFFICIAL_TABLES
 from dataset_devkit.provenance import canonical_hash, canonical_json
+from dataset_devkit.publication import StagingLease, hash_regular_files_fd
 
 _MANIFEST = "mz_extensions/content_manifest.json"
 _QUATERNION_TOLERANCE = 1e-9
@@ -27,6 +28,15 @@ _LEAKAGE_WARNING = (
     "adjacent scenes from one recording are assigned to different splits."
 )
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CHECKS = (
+    "tables",
+    "foreign_keys",
+    "chains",
+    "images",
+    "geometry",
+    "extensions",
+    "official_sdk",
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -1071,7 +1081,7 @@ def _extensions(
     findings: list[ValidationFinding],
     *,
     finalized: bool,
-) -> None:
+) -> object | None:
     scenes = {
         cast(str, item.get("token"))
         for item in tables["scene"]
@@ -1806,20 +1816,6 @@ def _extensions(
                 )
             )
     validation = loaded["validation"]
-    if finalized and (
-        not isinstance(validation, dict)
-        or validation.get("state") != "succeeded"
-        or validation.get("succeeded") is not True
-        or not isinstance(validation.get("report"), dict)
-    ):
-        findings.append(
-            ValidationFinding(
-                "error",
-                "validation_state",
-                "validation",
-                "finalized dataset must contain succeeded validation evidence",
-            )
-        )
     pipeline_audit = loaded["pipeline_audit"]
     _validate_pipeline_audit(
         pipeline_audit,
@@ -1874,54 +1870,30 @@ def _extensions(
                         "error", "camera_coverage", token, "required camera coverage is incomplete"
                     )
                 )
+    return validation
 
 
-def _walk_regular_files(root: Path) -> dict[str, tuple[int, str]]:
-    entries: dict[str, tuple[int, str]] = {}
-    root_stat = root.lstat()
-    if not stat.S_ISDIR(root_stat.st_mode):
+def _walk_regular_files(
+    root: Path, *, root_fd: int | None = None
+) -> dict[str, tuple[int, str]]:
+    if root_fd is not None:
+        return hash_regular_files_fd(root_fd, excluded=frozenset({_MANIFEST}))
+    before = root.lstat()
+    if not stat.S_ISDIR(before.st_mode):
         raise ValueError("dataset root is not a directory")
-    for directory, names, filenames in os.walk(root, followlinks=False):
-        base = Path(directory)
-        for name in names:
-            value = base / name
-            if not stat.S_ISDIR(value.lstat().st_mode):
-                raise ValueError(
-                    f"symlink or unsafe directory: {value.relative_to(root).as_posix()}"
-                )
-        for name in filenames:
-            path = base / name
-            relative = path.relative_to(root).as_posix()
-            if relative == _MANIFEST:
-                continue
-            before = path.lstat()
-            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-                raise ValueError(f"symlink or unsafe hardlink: {relative}")
-            digest = hashlib.sha256()
-            descriptor = os.open(path, os.O_RDONLY | _NOFOLLOW)
-            try:
-                opened = os.fstat(descriptor)
-                while chunk := os.read(descriptor, 1024 * 1024):
-                    digest.update(chunk)
-                after = os.fstat(descriptor)
-            finally:
-                os.close(descriptor)
-            listed = path.lstat()
-            def identity(item: os.stat_result) -> tuple[int, int, int, int]:
-                return item.st_dev, item.st_ino, item.st_size, item.st_nlink
-            if (
-                identity(before) != identity(opened)
-                or identity(opened) != identity(after)
-                or identity(after) != identity(listed)
-            ):
-                raise ValueError(f"path changed while hashing: {relative}")
-            entries[relative] = (before.st_size, digest.hexdigest())
-    return entries
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("dataset root identity changed")
+        return hash_regular_files_fd(descriptor, excluded=frozenset({_MANIFEST}))
+    finally:
+        os.close(descriptor)
 
 
-def build_content_manifest(root: Path) -> dict[str, object]:
+def build_content_manifest(root: Path, *, root_fd: int | None = None) -> dict[str, object]:
     """Hash every published regular file except the manifest itself."""
-    entries = _walk_regular_files(root)
+    entries = _walk_regular_files(root, root_fd=root_fd)
     serialized = [
         {"path": path, "size": size, "sha256": digest}
         for path, (size, digest) in sorted(entries.items())
@@ -1935,13 +1907,35 @@ def build_content_manifest(root: Path) -> dict[str, object]:
     }
 
 
-def _verify_manifest(root: Path, findings: list[ValidationFinding]) -> str | None:
-    value = _load_json(root / _MANIFEST, findings, _MANIFEST)
+def _verify_manifest(
+    root: Path,
+    findings: list[ValidationFinding],
+    *,
+    lease: StagingLease | None = None,
+) -> str | None:
+    if lease is None:
+        value = _load_json(root / _MANIFEST, findings, _MANIFEST)
+        root_fd = None
+    else:
+        lease.assert_bound()
+        root_fd = lease.duplicate_root_fd()
+        try:
+            value = _read_pinned_json(
+                root_fd, ("mz_extensions", "content_manifest.json")
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            findings.append(
+                ValidationFinding("error", "json", _MANIFEST, f"malformed JSON: {error}")
+            )
+            value = None
     try:
-        actual = build_content_manifest(root)
+        actual = build_content_manifest(root, root_fd=root_fd)
     except ValueError as error:
         findings.append(ValidationFinding("error", "manifest", _MANIFEST, str(error)))
         return None
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
     if value != actual:
         findings.append(
             ValidationFinding(
@@ -1953,6 +1947,75 @@ def _verify_manifest(root: Path, findings: list[ValidationFinding]) -> str | Non
         )
         return None
     return cast(str, actual["root_sha256"])
+
+
+def _read_pinned_json(root_fd: int, parts: tuple[str, ...]) -> object:
+    directory_fd = os.dup(root_fd)
+    try:
+        for component in parts[:-1]:
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = child
+        descriptor = os.open(parts[-1], os.O_RDONLY | _NOFOLLOW, dir_fd=directory_fd)
+        try:
+            before = os.fstat(descriptor)
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            listed = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+            def identity(item: os.stat_result) -> tuple[int, int, int, int, int, int]:
+                return (
+                    item.st_dev,
+                    item.st_ino,
+                    item.st_size,
+                    item.st_nlink,
+                    item.st_mtime_ns,
+                    item.st_ctime_ns,
+                )
+            if identity(before) != identity(after) or identity(after) != identity(listed):
+                raise ValueError("pinned JSON changed while reading")
+            return cast(object, json.loads(b"".join(chunks)))
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory_fd)
+
+
+def verify_publication_manifest(lease: StagingLease, expected_content_hash: str) -> None:
+    """Rebind finalized bytes to their manifest immediately before publication."""
+    lease.assert_bound()
+    root_fd = lease.duplicate_root_fd()
+    try:
+        manifest = _read_pinned_json(
+            root_fd, ("mz_extensions", "content_manifest.json")
+        )
+        actual = build_content_manifest(lease.root, root_fd=root_fd)
+    finally:
+        os.close(root_fd)
+    if manifest != actual or actual.get("root_sha256") != expected_content_hash:
+        raise DatasetValidationError(
+            ValidationReport(
+                False,
+                (
+                    ValidationFinding(
+                        "error",
+                        "manifest",
+                        _MANIFEST,
+                        "finalized bytes differ from the authorized publication manifest",
+                    ),
+                ),
+                (),
+                (),
+                None,
+                None,
+            )
+        )
+    lease.assert_bound()
 
 
 def _official_smoke(root: Path, version: str, tables: dict[str, list[dict[str, Any]]]) -> None:
@@ -1978,9 +2041,14 @@ def validate_dataset(
     official_smoke: bool = True,
     verify_manifest: bool = True,
     raise_on_error: bool = False,
+    lease: StagingLease | None = None,
 ) -> ValidationReport:
     """Validate a complete exported dataset, accumulating deterministic findings."""
     root = Path(dataroot).absolute()
+    if lease is not None:
+        if root != lease.root:
+            raise ValueError("validation root differs from staging lease")
+        lease.assert_bound()
     findings: list[ValidationFinding] = []
     if version != NUSCENES_VERSION:
         findings.append(
@@ -2130,8 +2198,12 @@ def validate_dataset(
                     f"invalid resolved config: {error}",
                 )
             )
-    _extensions(root, tables, config, findings, finalized=verify_manifest)
-    content_hash = _verify_manifest(root, findings) if verify_manifest else None
+    validation_evidence = _extensions(
+        root, tables, config, findings, finalized=verify_manifest
+    )
+    content_hash = (
+        _verify_manifest(root, findings, lease=lease) if verify_manifest else None
+    )
     if official_smoke and not any(item.severity == "error" for item in findings):
         try:
             _official_smoke(root, version, tables)
@@ -2141,41 +2213,84 @@ def validate_dataset(
                     "error", "official_smoke", "NuScenes", f"official SDK smoke failed: {error}"
                 )
             )
-    ordered = tuple(sorted(set(findings)))
     resolved_config_hash = (
         canonical_hash(config.model_dump(mode="json")) if config is not None else None
     )
+    table_counts = tuple((name, len(tables[name])) for name in OFFICIAL_TABLES)
+    if verify_manifest:
+        recomputed_findings = tuple(sorted(set(findings)))
+        recomputed = ValidationReport(
+            not any(item.severity == "error" for item in recomputed_findings),
+            recomputed_findings,
+            _CHECKS,
+            table_counts,
+            resolved_config_hash,
+            None,
+        )
+        if not recomputed.succeeded or validation_evidence != recomputed.to_extension():
+            findings.append(
+                ValidationFinding(
+                    "error",
+                    "validation_state",
+                    "validation",
+                    "finalized validation evidence differs from recomputed validation",
+                )
+            )
+    ordered = tuple(sorted(set(findings)))
     report = ValidationReport(
         not any(item.severity == "error" for item in ordered),
         ordered,
-        ("tables", "foreign_keys", "chains", "images", "geometry", "extensions", "official_sdk"),
-        tuple((name, len(tables[name])) for name in OFFICIAL_TABLES),
+        _CHECKS,
+        table_counts,
         resolved_config_hash,
         content_hash,
     )
+    if lease is not None:
+        lease.assert_bound()
     if raise_on_error and not report.succeeded:
         raise DatasetValidationError(report)
     return report
 
 
-def _atomic_json(root: Path, relative: str, value: object) -> None:
+def _atomic_json(
+    root: Path,
+    relative: str,
+    value: object,
+    *,
+    root_fd: int | None = None,
+) -> None:
     parts = PurePosixPath(relative).parts
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError("unsafe finalization path")
-    directory = root.joinpath(*parts[:-1])
-    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
+    directory_fd = (
+        os.dup(root_fd)
+        if root_fd is not None
+        else os.open(root, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
+    )
+    for component in parts[:-1]:
+        child = os.open(
+            component,
+            os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        os.close(directory_fd)
+        directory_fd = child
     temporary = f".{parts[-1]}.{os.getpid()}.tmp"
     descriptor = -1
     try:
-        destination = directory / parts[-1]
-        current = destination.lstat()
+        current = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
         if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
             raise ValueError("finalization destination is not a safe regular file")
         descriptor = os.open(
             temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=directory_fd
         )
         content = (canonical_json(value) + "\n").encode()
-        os.write(descriptor, content)
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("short write while finalizing dataset")
+            offset += written
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
@@ -2194,17 +2309,43 @@ def finalize_dataset(
     version: str = NUSCENES_VERSION,
     *,
     official_smoke: bool = True,
+    lease: StagingLease | None = None,
 ) -> ValidationReport:
     """Validate, record success, create the manifest last, and revalidate."""
     root = Path(dataroot).absolute()
+    if lease is not None:
+        if root != lease.root:
+            raise ValueError("finalization root differs from staging lease")
+        lease.assert_bound()
     preliminary = validate_dataset(
-        root, version, official_smoke=official_smoke, verify_manifest=False
+        root,
+        version,
+        official_smoke=official_smoke,
+        verify_manifest=False,
+        lease=lease,
     )
     if not preliminary.succeeded:
         raise DatasetValidationError(preliminary)
-    _atomic_json(root, "mz_extensions/validation.json", preliminary.to_extension())
-    _atomic_json(root, _MANIFEST, build_content_manifest(root))
-    final = validate_dataset(root, version, official_smoke=official_smoke, verify_manifest=True)
+    root_fd = lease._root_fd if lease is not None else None
+    _atomic_json(
+        root,
+        "mz_extensions/validation.json",
+        preliminary.to_extension(),
+        root_fd=root_fd,
+    )
+    _atomic_json(
+        root,
+        _MANIFEST,
+        build_content_manifest(root, root_fd=root_fd),
+        root_fd=root_fd,
+    )
+    final = validate_dataset(
+        root,
+        version,
+        official_smoke=official_smoke,
+        verify_manifest=True,
+        lease=lease,
+    )
     if not final.succeeded:
         failed = ValidationReport(
             False,
@@ -2214,6 +2355,11 @@ def finalize_dataset(
             final.resolved_config_hash,
             None,
         )
-        _atomic_json(root, "mz_extensions/validation.json", failed.to_extension())
+        _atomic_json(
+            root,
+            "mz_extensions/validation.json",
+            failed.to_extension(),
+            root_fd=root_fd,
+        )
         raise DatasetValidationError(failed)
     return final

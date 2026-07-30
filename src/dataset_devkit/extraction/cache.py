@@ -6,7 +6,6 @@ import fcntl
 import hashlib
 import json
 import os
-import shutil
 import stat
 import sys
 import tempfile
@@ -302,17 +301,21 @@ class ExtractionResultCache:
             }
             (temporary / "manifest.json").write_text(canonical_json(manifest) + "\n")
             if existing_identity is None:
-                publish_staging(temporary, final)
+                publish_staging(
+                    temporary,
+                    final,
+                    expected_identity=_directory_identity(temporary),
+                )
             else:
                 self._publish_refresh(temporary, final, existing_identity)
-                shutil.rmtree(temporary)
             loaded = self.load(source, config_hash, result.source_path)
             if loaded is None:
                 raise ValueError("stored extraction result did not revalidate")
             return loaded
         except Exception:
-            if temporary.exists():
-                shutil.rmtree(temporary)
+            # Never pathname-delete a possibly exchanged or replaced cache generation.
+            # An incomplete or predecessor generation is ignored because only the exact
+            # canonical final key is loadable; explicit maintenance may remove stale dirs.
             raise
 
     def _publish_refresh(

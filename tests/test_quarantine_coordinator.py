@@ -22,7 +22,11 @@ from dataset_devkit.coordinator import (
 )
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.service import RecordingExtractor
-from dataset_devkit.quarantine import QuarantineReport, write_quarantine_report
+from dataset_devkit.quarantine import (
+    QuarantineReport,
+    write_quarantine_report,
+    write_rejection_manifest,
+)
 from dataset_devkit.sanity import SANITY_CHECK_CODES
 from dataset_devkit.validity import INVALIDITY_CODES
 from mcap_fixture import camera_message, write_mcap
@@ -195,6 +199,117 @@ def test_new_quarantine_ancestors_are_fsynced(
     write_quarantine_report(tmp_path / "a" / "b" / "c", _report())
 
     assert directory_fsyncs >= 4
+
+
+def test_rejection_manifest_revalidates_lock_inode_after_flock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_flock = quarantine_module.fcntl.flock
+    replaced = False
+
+    def replace_lock_after_flock(file_descriptor: int, operation: int) -> None:
+        nonlocal replaced
+        original_flock(file_descriptor, operation)
+        if operation == quarantine_module.fcntl.LOCK_EX and not replaced:
+            replaced = True
+            lock = tmp_path / ".rejections.jsonl.lock"
+            lock.rename(tmp_path / ".rejections.jsonl.lock.stale")
+            lock.write_bytes(b"")
+
+    monkeypatch.setattr(quarantine_module.fcntl, "flock", replace_lock_after_flock)
+
+    with pytest.raises(StructuralExtractionError, match="manifest lock"):
+        write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
+
+    assert not (tmp_path / "rejections.jsonl").exists()
+
+
+def test_rejection_manifest_read_is_bound_to_opened_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
+    original_content = manifest.read_bytes()
+    original_open = quarantine_module.os.open
+    raced = False
+
+    def replace_manifest_before_open(
+        path: str | bytes | int,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal raced
+        if path == "rejections.jsonl" and flags & os.O_ACCMODE == os.O_RDONLY and not raced:
+            raced = True
+            manifest.rename(tmp_path / "rejections.jsonl.stale")
+            manifest.write_text('{"forged":true}\n', encoding="utf-8")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(quarantine_module.os, "open", replace_manifest_before_open)
+
+    with pytest.raises(StructuralExtractionError, match="manifest.*identity"):
+        write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
+
+    assert manifest.read_bytes() == b'{"forged":true}\n'
+    assert (tmp_path / "rejections.jsonl.stale").read_bytes() == original_content
+
+
+def test_rejection_manifest_write_is_bound_to_temporary_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
+    original_content = manifest.read_bytes()
+    original_write_all = quarantine_module._write_all
+    raced = False
+
+    def replace_temporary_after_write(file_descriptor: int, content: bytes) -> None:
+        nonlocal raced
+        original_write_all(file_descriptor, content)
+        if not raced:
+            raced = True
+            temporary = next(tmp_path.glob(".rejections.jsonl.*.tmp"))
+            temporary.rename(tmp_path / "owned-written-manifest.tmp")
+            temporary.write_text('{"forged":true}\n', encoding="utf-8")
+
+    monkeypatch.setattr(quarantine_module, "_write_all", replace_temporary_after_write)
+
+    with pytest.raises(StructuralExtractionError, match="manifest.*identity"):
+        write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
+
+    assert manifest.read_bytes() == original_content
+    assert next(tmp_path.glob(".rejections.jsonl.*.tmp")).read_bytes() == b'{"forged":true}\n'
+
+
+def test_rejection_manifest_write_refuses_replaced_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
+    original_content = manifest.read_bytes()
+    original_write_all = quarantine_module._write_all
+    raced = False
+
+    def replace_manifest_after_temporary_write(
+        file_descriptor: int, content: bytes
+    ) -> None:
+        nonlocal raced
+        original_write_all(file_descriptor, content)
+        if not raced:
+            raced = True
+            manifest.rename(tmp_path / "rejections.jsonl.stale")
+            manifest.write_text('{"forged":true}\n', encoding="utf-8")
+
+    monkeypatch.setattr(
+        quarantine_module,
+        "_write_all",
+        replace_manifest_after_temporary_write,
+    )
+
+    with pytest.raises(StructuralExtractionError, match="manifest.*identity"):
+        write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
+
+    assert manifest.read_bytes() == b'{"forged":true}\n'
+    assert (tmp_path / "rejections.jsonl.stale").read_bytes() == original_content
 
 
 def _policy_config(config_factory: object, *, sanity_off: bool = True) -> GlobalConfig:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ import pytest
 from conftest import FeatureFactory
 from dataset_devkit import publication as publication_module
 from dataset_devkit import services as services_module
+from dataset_devkit import validation as validation_module
 from dataset_devkit.acquisition import AcquisitionResult
 from dataset_devkit.config import (
     FiltersConfig,
@@ -41,6 +43,7 @@ from dataset_devkit.services import (
 )
 from dataset_devkit.validation import (
     DatasetValidationError,
+    build_content_manifest,
     finalize_dataset,
     validate_dataset,
 )
@@ -185,6 +188,96 @@ def test_finalize_validates_and_creates_deterministic_manifest(
     assert manifest["excluded_paths"] == ["mz_extensions/content_manifest.json"]
     assert manifest["root_sha256"] == first_report.content_hash
     assert not any("timestamp" in key for key in manifest)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "empty_report",
+        "schema_version",
+        "top_level_keys",
+        "report_keys",
+        "checks",
+        "table_counts",
+        "findings",
+        "resolved_config_hash",
+    ),
+)
+def test_finalized_validation_rejects_forged_success_evidence(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    feature_factory: FeatureFactory,
+    mutation: str,
+) -> None:
+    root = _export(tmp_path, config_factory, feature_factory)
+    finalize_dataset(root, official_smoke=False)
+    validation_path = root / "mz_extensions/validation.json"
+    forged = json.loads(validation_path.read_text(encoding="utf-8"))
+    if mutation == "empty_report":
+        forged["report"] = {}
+    elif mutation == "schema_version":
+        forged["schema_version"] = 2
+    elif mutation == "top_level_keys":
+        forged["extra"] = True
+    elif mutation == "report_keys":
+        forged["report"]["extra"] = True
+    elif mutation == "checks":
+        forged["report"]["checks"] = []
+    elif mutation == "table_counts":
+        forged["report"]["table_counts"] = {}
+    elif mutation == "findings":
+        forged["report"]["findings"] = [
+            {
+                "severity": "warning",
+                "code": "forged",
+                "location": "validation",
+                "message": "not recomputed",
+            }
+        ]
+    else:
+        forged["report"]["resolved_config_sha256"] = "0" * 64
+    validation_path.write_text(json.dumps(forged), encoding="utf-8")
+    manifest_path = root / "mz_extensions/content_manifest.json"
+    manifest_path.write_text(
+        json.dumps(build_content_manifest(root)),
+        encoding="utf-8",
+    )
+
+    report = validate_dataset(root, official_smoke=False)
+
+    assert report.succeeded is False
+    assert any(item.code == "validation_state" for item in report.findings)
+
+
+def test_atomic_json_retries_short_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extension_dir = tmp_path / "mz_extensions"
+    extension_dir.mkdir()
+    destination = extension_dir / "validation.json"
+    destination.write_text("{}\n", encoding="utf-8")
+    original_write = os.write
+    writes = 0
+
+    def short_write(descriptor: int, content: bytes) -> int:
+        nonlocal writes
+        writes += 1
+        return original_write(descriptor, content[:3])
+
+    monkeypatch.setattr(os, "write", short_write)
+
+    validation_module._atomic_json(
+        tmp_path,
+        "mz_extensions/validation.json",
+        {"schema_version": 1, "state": "succeeded"},
+    )
+
+    assert writes > 1
+    assert json.loads(destination.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "state": "succeeded",
+    }
 
 
 @pytest.mark.parametrize(
@@ -452,7 +545,12 @@ def test_inspect_and_atomic_publication_refuses_overwrite(
     finalize_dataset(staging, official_smoke=False)
     final = staging.parent / "v1.0-trainval"
 
-    published = publish_staging(staging, final)
+    staging_stat = staging.stat()
+    published = publish_staging(
+        staging,
+        final,
+        expected_identity=(staging_stat.st_dev, staging_stat.st_ino),
+    )
     summary = inspect_dataset(published, "v1.0-trainval", official_smoke=False)
 
     assert summary.validation_state == "succeeded"
@@ -600,30 +698,58 @@ def test_stage_injected_partial_failure_requires_persisted_quarantine(
     assert rows[0]["artifact_handling"] == "no_owned_artifacts"
 
 
-def test_identity_bound_cleanup_and_publish_race_fail_closed(
+def test_build_never_publishes_or_deletes_a_replacement_staging_entry(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = tmp_path / "recording.mcap"
+    write_mcap(
+        recording,
+        camera_payloads=tuple(
+            camera_message(
+                timestamp,
+                (timestamp + 10, timestamp + 20),
+                camera_names=("front", "rear"),
+            )
+            for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
+        ),
+    )
+    blob = "mcap-h265/recording.mcap"
+    config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: _FakeAcquirer({blob: recording}),
+        decoder_factory=DeterministicDecoder,
+        official_smoke=False,
+    )
+    original_finalize = services_module.finalize_dataset
+    replacement: Path | None = None
+    sentinel: Path | None = None
+
+    def displace_after_validation(*args: object, **kwargs: object) -> object:
+        nonlocal replacement, sentinel
+        report = original_finalize(*args, **kwargs)
+        staging = Path(str(args[0]))
+        staging.rename(staging.with_name(f"{staging.name}.displaced"))
+        staging.mkdir()
+        replacement = staging
+        sentinel = staging / "unrelated"
+        sentinel.write_text("survives", encoding="utf-8")
+        return report
+
+    monkeypatch.setattr(services_module, "finalize_dataset", displace_after_validation)
+
+    with pytest.raises(ValueError, match="entry no longer names"):
+        build_dataset(config, runtime=runtime)
+
+    assert replacement is not None and replacement.is_dir()
+    assert sentinel is not None and sentinel.read_text(encoding="utf-8") == "survives"
+    assert not (config.paths.output_dir / "v1.0-trainval").exists()
+
+
+def test_exclusive_publish_race_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "owned.txt").write_text("owned")
-    current = staging.stat()
-    assert services_module._cleanup_owned_staging(
-        staging, (current.st_dev, current.st_ino)
-    )
-    assert not staging.exists()
-
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "keep.txt").write_text("keep")
-    staging.mkdir()
-    stale = staging.stat()
-    staging.rmdir()
-    staging.symlink_to(outside, target_is_directory=True)
-    assert not services_module._cleanup_owned_staging(
-        staging, (stale.st_dev, stale.st_ino)
-    )
-    assert (outside / "keep.txt").read_text() == "keep"
-
     source = tmp_path / "source"
     source.mkdir()
     destination = tmp_path / "final"
@@ -634,8 +760,13 @@ def test_identity_bound_cleanup_and_publish_race_fail_closed(
         original(parent_fd, source_name, destination_name)
 
     monkeypatch.setattr(publication_module, "_rename_exclusive", race)
+    source_stat = source.stat()
     with pytest.raises(FileExistsError, match="overwrite"):
-        publish_staging(source, destination)
+        publish_staging(
+            source,
+            destination,
+            expected_identity=(source_stat.st_dev, source_stat.st_ino),
+        )
     assert source.is_dir()
     assert destination.is_dir()
 
@@ -766,6 +897,58 @@ def test_extraction_result_cache_interrupted_refresh_preserves_previous_generati
     assert loaded.samples[0].staged_image.path.stat().st_ino == first_identity
 
 
+def test_extraction_result_cache_refresh_cleanup_preserves_replacement_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = tmp_path / "recording.mcap"
+    write_mcap(
+        recording,
+        camera_payloads=(
+            camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
+        ),
+    )
+    extracted = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=1,
+        tolerance_ns=0,
+        staging_root=tmp_path / "staging",
+        decoder_factory=DeterministicDecoder,
+    ).extract(recording)
+    source = SourceFingerprint(
+        "https://example.blob.core.windows.net",
+        "recordings",
+        "mcap-h265/recording.mcap",
+        '"etag"',
+        recording.stat().st_size,
+    )
+    config_hash = "a" * 64
+    cache = ExtractionResultCache(tmp_path / "cache")
+    cache.store(source, config_hash, extracted)
+    original_publish = cache._publish_refresh
+    replacement: Path | None = None
+
+    def replace_exchanged_predecessor(
+        temporary: Path,
+        final: Path,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        nonlocal replacement
+        original_publish(temporary, final, expected_identity)
+        temporary.rename(temporary.with_name(f"{temporary.name}.owned-stale"))
+        temporary.mkdir()
+        replacement = temporary
+        (temporary / "keep.txt").write_text("unrelated", encoding="utf-8")
+
+    monkeypatch.setattr(cache, "_publish_refresh", replace_exchanged_predecessor)
+
+    cache.store(source, config_hash, extracted, force_refresh=True)
+
+    assert replacement is not None
+    assert (replacement / "keep.txt").read_text(encoding="utf-8") == "unrelated"
+
+
 def test_extraction_result_cache_concurrent_refreshes_publish_complete_generations(
     tmp_path: Path,
 ) -> None:
@@ -818,4 +1001,6 @@ def test_extraction_result_cache_concurrent_refreshes_publish_complete_generatio
     assert loaded is not None
     assert len(loaded.samples) == len(extracted.samples)
     assert loaded.samples[0].staged_image.inode in refreshed_identities
-    assert not tuple(cache.path_for(source, config_hash).parent.glob("*.staging-*"))
+    stale = tuple(cache.path_for(source, config_hash).parent.glob("*.staging-*"))
+    assert len(stale) == 2
+    assert all(path.is_dir() for path in stale)

@@ -3,10 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import stat
-import tempfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -38,7 +34,7 @@ from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.features import SceneFeatures, compute_recording_features
 from dataset_devkit.filtering import filter_scenes
 from dataset_devkit.provenance import SourceFingerprint, canonical_hash, extraction_config_hash
-from dataset_devkit.publication import publish_staging
+from dataset_devkit.publication import StagingLease, publish_staging
 from dataset_devkit.quarantine import write_rejection_manifest
 from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scenes import build_recording_scenes
@@ -114,26 +110,6 @@ class InspectionSummary:
             "validation_state": self.validation_state,
             "content_hash": self.content_hash,
         }
-
-
-def _cleanup_owned_staging(staging: Path, identity: tuple[int, int]) -> bool:
-    """Delete only the invocation-owned staging entry through its pinned parent."""
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    parent_fd = os.open(staging.parent, os.O_RDONLY | os.O_DIRECTORY | nofollow)
-    try:
-        current = os.stat(staging.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            (current.st_dev, current.st_ino) != identity
-            or not stat.S_ISDIR(current.st_mode)
-        ):
-            return False
-        shutil.rmtree(staging.name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(parent_fd)
 
 
 def _build_evidence(
@@ -365,24 +341,32 @@ def build_dataset(config: GlobalConfig, *, runtime: BuildRuntime | None = None) 
         )
     selected_runtime = BuildRuntime() if runtime is None else runtime
     output = config.paths.output_dir
-    output.mkdir(parents=True, exist_ok=True)
     final = output / config.publication.version
     if final.exists() or final.is_symlink():
         raise FileExistsError(f"refusing to overwrite existing final dataset: {final}")
     evidence, failures = _build_evidence(config, selected_runtime)
-    staging = Path(tempfile.mkdtemp(prefix=f".{config.publication.version}.staging-", dir=output))
-    identity = staging.stat().st_dev, staging.stat().st_ino
+    lease = StagingLease.create(output, f".{config.publication.version}.staging-")
+    staging = lease.root
     try:
-        exported = export_dataset(staging, evidence)
+        exported = export_dataset(staging, evidence, lease=lease)
         report = finalize_dataset(
-            staging, config.publication.version, official_smoke=selected_runtime.official_smoke
+            staging,
+            config.publication.version,
+            official_smoke=selected_runtime.official_smoke,
+            lease=lease,
         )
         if not report.succeeded or report.content_hash is None:
             raise BuildOperationalError("final validation failed")
-        published = publish_staging(staging, final)
+        published = publish_staging(
+            lease,
+            final,
+            expected_content_hash=report.content_hash,
+        )
     except Exception:
-        _cleanup_owned_staging(staging, identity)
+        lease.cleanup()
         raise
+    finally:
+        lease.close()
     return BuildResult(
         published,
         config.publication.version,

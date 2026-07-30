@@ -21,6 +21,7 @@ from dataset_devkit.extraction.models import CameraCalibration, EgoPose, StagedI
 from dataset_devkit.features import SceneFeatures
 from dataset_devkit.identifiers import validate_safe_segment
 from dataset_devkit.provenance import canonical_hash, canonical_json
+from dataset_devkit.publication import StagingLease
 from dataset_devkit.scenario_selection import ScenarioSelectionResult, validate_scenario_selection
 from dataset_devkit.scene_models import (
     RecordingSceneResult,
@@ -101,11 +102,22 @@ def _open_absolute_directory(
 class _SafeDatarootWriter:
     """Pinned no-follow, exclusive writer for one initially empty staging dataroot."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, lease: StagingLease | None = None) -> None:
         self.root = Path(root).absolute()
-        self._root_fd, self._chain_identities = _open_absolute_directory(
-            self.root, create=True
-        )
+        self._lease = lease
+        if lease is not None:
+            if self.root != lease.root:
+                raise ValueError("staging writer root differs from staging lease")
+            lease.assert_bound()
+            self._root_fd = lease.duplicate_root_fd()
+            check_fd, self._chain_identities = _open_absolute_directory(
+                self.root, create=False
+            )
+            os.close(check_fd)
+        else:
+            self._root_fd, self._chain_identities = _open_absolute_directory(
+                self.root, create=True
+            )
         self._closed = False
         try:
             has_entries = bool(os.listdir(self._root_fd))
@@ -133,6 +145,10 @@ class _SafeDatarootWriter:
             raise ValueError("staging dataroot writer is closed")
         if _identity(os.fstat(self._root_fd)) != self._root_identity:
             raise ValueError("staging dataroot root identity changed")
+        if self._lease is not None:
+            self._lease.assert_bound()
+            if self._root_identity != self._lease.root_identity:
+                raise ValueError("opened staging root differs from lease identity")
         try:
             check_fd, actual_chain = _open_absolute_directory(self.root, create=False)
         except ValueError as error:
@@ -1054,7 +1070,12 @@ def _export_into(
     )
 
 
-def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> ExportResult:
+def export_dataset(
+    staging_dataroot: str | Path,
+    evidence: ExportEvidence,
+    *,
+    lease: StagingLease | None = None,
+) -> ExportResult:
     """Export selected scenes into a new or existing empty staging dataroot.
 
     Integer nanoseconds are converted to official nuScenes integer microseconds with
@@ -1064,5 +1085,5 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
     lifecycle cleanup for its publication staging directories.
     """
     _validate_boundary(evidence)
-    with _SafeDatarootWriter(staging_dataroot) as writer:
+    with _SafeDatarootWriter(staging_dataroot, lease=lease) as writer:
         return _export_into(writer, evidence)

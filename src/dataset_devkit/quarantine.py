@@ -153,6 +153,70 @@ def _unlink_if_identity(
             os.unlink(filename, dir_fd=directory_fd)
 
 
+def _owned_file_identity(
+    directory_fd: int,
+    filename: str,
+    file_descriptor: int,
+    *,
+    expected: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    opened = os.fstat(file_descriptor)
+    listed = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    identity = opened.st_dev, opened.st_ino
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or not stat.S_ISREG(listed.st_mode)
+        or listed.st_nlink != 1
+        or identity != (listed.st_dev, listed.st_ino)
+        or (expected is not None and identity != expected)
+    ):
+        raise StructuralExtractionError("quarantine manifest file identity changed")
+    return identity
+
+
+def _read_owned_manifest(
+    directory_fd: int,
+    manifest_name: str,
+    expected: tuple[int, int],
+) -> bytes:
+    read_fd = os.open(manifest_name, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        _owned_file_identity(
+            directory_fd,
+            manifest_name,
+            read_fd,
+            expected=expected,
+        )
+        content = _read_all(read_fd)
+        _owned_file_identity(
+            directory_fd,
+            manifest_name,
+            read_fd,
+            expected=expected,
+        )
+        return content
+    finally:
+        os.close(read_fd)
+
+
+def _revalidate_manifest_identity(
+    directory_fd: int,
+    manifest_name: str,
+    expected: tuple[int, int],
+) -> None:
+    read_fd = os.open(manifest_name, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        _owned_file_identity(
+            directory_fd,
+            manifest_name,
+            read_fd,
+            expected=expected,
+        )
+    finally:
+        os.close(read_fd)
+
+
 def write_quarantine_report(directory: Path, report: QuarantineReport) -> QuarantineArtifact:
     """Durably publish complete canonical bytes below a no-follow root."""
     content = (
@@ -264,6 +328,7 @@ def write_rejection_manifest(
     directory_fd = _open_directory(directory)
     lock_fd = -1
     temporary: str | None = None
+    temporary_identity: tuple[int, int] | None = None
     try:
         lock_fd = os.open(
             f".{manifest_name}.lock",
@@ -271,11 +336,26 @@ def write_rejection_manifest(
             0o600,
             dir_fd=directory_fd,
         )
-        lock_stat = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
-            raise StructuralExtractionError("unsafe quarantine manifest lock")
+        try:
+            lock_identity = _owned_file_identity(
+                directory_fd,
+                f".{manifest_name}.lock",
+                lock_fd,
+            )
+        except StructuralExtractionError as error:
+            raise StructuralExtractionError("unsafe quarantine manifest lock") from error
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            _owned_file_identity(
+                directory_fd,
+                f".{manifest_name}.lock",
+                lock_fd,
+                expected=lock_identity,
+            )
+        except StructuralExtractionError as error:
+            raise StructuralExtractionError("unsafe quarantine manifest lock identity") from error
         existing: list[dict[str, Any]] = []
+        manifest_identity: tuple[int, int] | None = None
         try:
             manifest_stat = os.stat(
                 manifest_name, dir_fd=directory_fd, follow_symlinks=False
@@ -285,15 +365,16 @@ def write_rejection_manifest(
         else:
             if not stat.S_ISREG(manifest_stat.st_mode) or manifest_stat.st_nlink != 1:
                 raise StructuralExtractionError("unsafe existing quarantine manifest")
-            read_fd = os.open(manifest_name, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd)
-            try:
-                for line in _read_all(read_fd).decode("utf-8").splitlines():
-                    value = json.loads(line)
-                    if not isinstance(value, dict):
-                        raise ValueError("rejection manifest row must be an object")
-                    existing.append(value)
-            finally:
-                os.close(read_fd)
+            manifest_identity = manifest_stat.st_dev, manifest_stat.st_ino
+            for line in _read_owned_manifest(
+                directory_fd,
+                manifest_name,
+                manifest_identity,
+            ).decode("utf-8").splitlines():
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise ValueError("rejection manifest row must be an object")
+                existing.append(value)
         rows = existing + [report.as_dict() for report in reports]
         unique = {canonical_json(row): row for row in rows}
         content = "".join(f"{key}\n" for key in sorted(unique)).encode("utf-8")
@@ -305,20 +386,54 @@ def write_rejection_manifest(
             dir_fd=directory_fd,
         )
         try:
+            temporary_identity = _owned_file_identity(
+                directory_fd,
+                temporary,
+                write_fd,
+            )
             _write_all(write_fd, content)
             os.fsync(write_fd)
+            _owned_file_identity(
+                directory_fd,
+                temporary,
+                write_fd,
+                expected=temporary_identity,
+            )
         finally:
             os.close(write_fd)
+        if manifest_identity is None:
+            try:
+                os.stat(manifest_name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise StructuralExtractionError(
+                    "quarantine manifest destination identity changed"
+                )
+        else:
+            _revalidate_manifest_identity(
+                directory_fd,
+                manifest_name,
+                manifest_identity,
+            )
         os.replace(temporary, manifest_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        final = os.stat(manifest_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino) != temporary_identity
+        ):
+            raise StructuralExtractionError("quarantine manifest publication identity changed")
         temporary = None
         os.fsync(directory_fd)
         return directory / manifest_name
+    except StructuralExtractionError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise StructuralExtractionError("failed to update quarantine rejection manifest") from error
     finally:
         if temporary is not None:
-            with suppress(OSError):
-                os.unlink(temporary, dir_fd=directory_fd)
+            _unlink_if_identity(directory_fd, temporary, temporary_identity)
         if lock_fd >= 0:
             with suppress(OSError):
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
