@@ -280,6 +280,34 @@ def test_opaque_bearer_tokens_are_rejected(tmp_path: Path, scheme: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "token",
+    [
+        "abcdefghijklmnopqrstuvwxyz123456.",
+        "abcdefghijklmnopqrstuvwxyz123456~",
+        "abcdefghijklmnopqrstuvwxyz123456+",
+        "abcdefghijklmnopqrstuvwxyz123456/",
+        "abcdefghijklmnop/qrstuvwxyz12/345678",
+        "abcdefghijklmnopqrstuvwxyz123456==",
+    ],
+)
+def test_rfc6750_b64token_characters_are_rejected(tmp_path: Path, token: str) -> None:
+    data = minimal_config()
+    set_nested(data, "publication.version", f"Bearer {token}")
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_bearer_prefixed_path_with_digits_is_allowed(tmp_path: Path) -> None:
+    data = minimal_config()
+    set_nested(data, "publication.version", "bearer archive/2026/annotations.jsonl")
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.publication.version.endswith("annotations.jsonl")
+
+
+@pytest.mark.parametrize(
     ("field", "url"),
     [
         (
@@ -315,6 +343,31 @@ def test_ordinary_url_query_parameters_are_allowed(tmp_path: Path) -> None:
     config = load_config(write_config(tmp_path, data))
 
     assert "api-version=2023-11-03" in config.azure.account_url
+
+
+@pytest.mark.parametrize(
+    ("query_key", "query_value"),
+    [
+        ("sp", "robotics"),
+        ("st", "2026-01-01T00:00:00Z"),
+        ("se", "2030-01-01T00:00:00Z"),
+        ("sr", "search"),
+        ("sv", "2024-11-04"),
+    ],
+)
+def test_standalone_sas_metadata_query_parameters_are_allowed(
+    tmp_path: Path, query_key: str, query_value: str
+) -> None:
+    data = minimal_config()
+    set_nested(
+        data,
+        "azure.account_url",
+        f"https://example.test/search?{query_key}={query_value}",
+    )
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert f"{query_key}={query_value}" in config.azure.account_url
 
 
 def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> None:

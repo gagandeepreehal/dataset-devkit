@@ -17,7 +17,10 @@ _JWT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}"
     r"\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?![A-Za-z0-9_-])"
 )
-_BEARER_TOKEN_PATTERN = re.compile(r"^bearer[ \t]+(?P<token>[A-Za-z0-9_-]{32,})$", re.IGNORECASE)
+_BEARER_TOKEN_PATTERN = re.compile(
+    r"^bearer[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{32,})(?P<padding>=*)$",
+    re.IGNORECASE,
+)
 _CREDENTIAL_KEY_NAMES = {
     "auth",
     "authentication",
@@ -45,31 +48,7 @@ _CREDENTIAL_KEY_NAMES = {
     "signingkey",
     "storagekey",
 }
-_CREDENTIAL_QUERY_KEYS = _CREDENTIAL_KEY_NAMES | {
-    "sig",
-    "signature",
-    # Azure service and user-delegation SAS parameters.
-    "sv",
-    "ss",
-    "srt",
-    "sp",
-    "se",
-    "st",
-    "spr",
-    "sip",
-    "sr",
-    "skoid",
-    "sktid",
-    "skt",
-    "ske",
-    "sks",
-    "skv",
-    "rscc",
-    "rscd",
-    "rsce",
-    "rscl",
-    "rsct",
-}
+_CREDENTIAL_QUERY_KEYS = _CREDENTIAL_KEY_NAMES | {"sig", "signature"}
 
 
 def _is_credential_key(key: object) -> bool:
@@ -113,6 +92,10 @@ def _looks_like_opaque_bearer_token(value: str) -> bool:
     if match is None:
         return False
     token = match.group("token")
+    final_component = token.rsplit("/", maxsplit=1)[-1]
+    looks_like_path = re.search(r"\.[A-Za-z][A-Za-z0-9]{0,9}$", final_component) is not None
+    if looks_like_path:
+        return False
     return any(character.isalpha() for character in token) and any(
         character.isdigit() for character in token
     )
