@@ -109,7 +109,11 @@ def _open_directory(path: Path) -> int:
                 raise StructuralExtractionError(
                     "unsafe quarantine directory ancestor or symlink"
                 ) from error
-            child_stat = os.fstat(child)
+            try:
+                child_stat = os.fstat(child)
+            except Exception:
+                os.close(child)
+                raise
             if not stat.S_ISDIR(child_stat.st_mode):
                 os.close(child)
                 raise StructuralExtractionError("unsafe quarantine directory ancestor")
@@ -119,6 +123,52 @@ def _open_directory(path: Path) -> int:
     except Exception:
         os.close(current)
         raise
+
+
+def _directory_path_identities(path: Path) -> tuple[tuple[int, int], ...]:
+    if not path.is_absolute() or ".." in path.parts:
+        raise StructuralExtractionError("quarantine directory must be an absolute trusted path")
+    current = os.open("/", _DIRECTORY_FLAGS)
+    root_stat = os.fstat(current)
+    identities = [(root_stat.st_dev, root_stat.st_ino)]
+    try:
+        for component in path.parts[1:]:
+            if not component or component == ".":
+                continue
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+            except OSError as error:
+                raise StructuralExtractionError(
+                    "quarantine directory path identity changed"
+                ) from error
+            child_stat = os.fstat(child)
+            if not stat.S_ISDIR(child_stat.st_mode):
+                os.close(child)
+                raise StructuralExtractionError(
+                    "quarantine directory path identity changed"
+                )
+            identities.append((child_stat.st_dev, child_stat.st_ino))
+            os.close(current)
+            current = child
+        return tuple(identities)
+    finally:
+        os.close(current)
+
+
+def _revalidate_directory_identity(
+    path: Path,
+    directory_fd: int,
+    expected_path: tuple[tuple[int, int], ...],
+) -> None:
+    opened = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not expected_path
+        or (opened.st_dev, opened.st_ino) != expected_path[-1]
+    ):
+        raise StructuralExtractionError("quarantine directory path identity changed")
+    if _directory_path_identities(path) != expected_path:
+        raise StructuralExtractionError("quarantine directory path identity changed")
 
 
 def _write_all(file_descriptor: int, content: bytes) -> None:
@@ -326,34 +376,22 @@ def write_rejection_manifest(
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", manifest_name) is None:
         raise StructuralExtractionError("unsafe quarantine manifest name")
     directory_fd = _open_directory(directory)
-    lock_fd = -1
+    locked = False
     temporary: str | None = None
     temporary_identity: tuple[int, int] | None = None
     try:
-        lock_fd = os.open(
-            f".{manifest_name}.lock",
-            os.O_RDWR | os.O_CREAT | _FILE_NOFOLLOW,
-            0o600,
-            dir_fd=directory_fd,
-        )
-        try:
-            lock_identity = _owned_file_identity(
-                directory_fd,
-                f".{manifest_name}.lock",
-                lock_fd,
-            )
-        except StructuralExtractionError as error:
-            raise StructuralExtractionError("unsafe quarantine manifest lock") from error
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            _owned_file_identity(
-                directory_fd,
-                f".{manifest_name}.lock",
-                lock_fd,
-                expected=lock_identity,
-            )
-        except StructuralExtractionError as error:
-            raise StructuralExtractionError("unsafe quarantine manifest lock identity") from error
+        directory_stat = os.fstat(directory_fd)
+        directory_identity = directory_stat.st_dev, directory_stat.st_ino
+        directory_path_identities = _directory_path_identities(directory)
+        if (
+            not directory_path_identities
+            or directory_path_identities[-1] != directory_identity
+        ):
+            raise StructuralExtractionError("quarantine directory path identity changed")
+        _revalidate_directory_identity(directory, directory_fd, directory_path_identities)
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        locked = True
+        _revalidate_directory_identity(directory, directory_fd, directory_path_identities)
         existing: list[dict[str, Any]] = []
         manifest_identity: tuple[int, int] | None = None
         try:
@@ -416,6 +454,7 @@ def write_rejection_manifest(
                 manifest_name,
                 manifest_identity,
             )
+        _revalidate_directory_identity(directory, directory_fd, directory_path_identities)
         os.replace(temporary, manifest_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         final = os.stat(manifest_name, dir_fd=directory_fd, follow_symlinks=False)
         if (
@@ -426,6 +465,7 @@ def write_rejection_manifest(
             raise StructuralExtractionError("quarantine manifest publication identity changed")
         temporary = None
         os.fsync(directory_fd)
+        _revalidate_directory_identity(directory, directory_fd, directory_path_identities)
         return directory / manifest_name
     except StructuralExtractionError:
         raise
@@ -434,8 +474,7 @@ def write_rejection_manifest(
     finally:
         if temporary is not None:
             _unlink_if_identity(directory_fd, temporary, temporary_identity)
-        if lock_fd >= 0:
+        if locked:
             with suppress(OSError):
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+                fcntl.flock(directory_fd, fcntl.LOCK_UN)
         os.close(directory_fd)

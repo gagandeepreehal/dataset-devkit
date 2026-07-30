@@ -10,7 +10,7 @@ import stat
 import sys
 import tempfile
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from ctypes import CDLL, c_char_p, c_int, get_errno
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
@@ -21,7 +21,11 @@ from pydantic import TypeAdapter, ValidationError
 from dataset_devkit.extraction.models import RecordingExtractionResult, StagedImage
 from dataset_devkit.extraction.staging import staged_directory_metadata
 from dataset_devkit.provenance import SourceFingerprint, canonical_json
-from dataset_devkit.publication import fsync_tree, publish_staging
+from dataset_devkit.publication import (
+    cleanup_pinned_directory,
+    fsync_tree,
+    publish_staging,
+)
 
 _ADAPTER = TypeAdapter(RecordingExtractionResult)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -256,6 +260,17 @@ class ExtractionResultCache:
         temporary = Path(
             tempfile.mkdtemp(prefix=f".{config_hash}.staging-", dir=final.parent)
         )
+        parent_fd = os.open(final.parent, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
+        temporary_fd = os.open(
+            temporary.name,
+            os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        temporary_identity = (
+            os.fstat(temporary_fd).st_dev,
+            os.fstat(temporary_fd).st_ino,
+        )
+        published = False
         try:
             image_directory = temporary / "images"
             image_directory.mkdir()
@@ -308,15 +323,37 @@ class ExtractionResultCache:
                 )
             else:
                 self._publish_refresh(temporary, final, existing_identity)
+            published = True
             loaded = self.load(source, config_hash, result.source_path)
             if loaded is None:
                 raise ValueError("stored extraction result did not revalidate")
             return loaded
-        except Exception:
-            # Never pathname-delete a possibly exchanged or replaced cache generation.
-            # An incomplete or predecessor generation is ignored because only the exact
-            # canonical final key is loadable; explicit maintenance may remove stale dirs.
-            raise
+        finally:
+            try:
+                if not published:
+                    try:
+                        final_stat = os.stat(
+                            final.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        reached_final = (
+                            final_stat.st_dev,
+                            final_stat.st_ino,
+                        ) == temporary_identity
+                    except FileNotFoundError:
+                        reached_final = False
+                    if not reached_final:
+                        with suppress(OSError, ValueError):
+                            cleanup_pinned_directory(
+                                parent_fd,
+                                temporary.name,
+                                temporary_fd,
+                                temporary_identity,
+                            )
+            finally:
+                os.close(temporary_fd)
+                os.close(parent_fd)
 
     def _publish_refresh(
         self,
@@ -328,6 +365,8 @@ class ExtractionResultCache:
         temporary_identity = _directory_identity(temporary)
         fsync_tree(temporary)
         parent_fd = os.open(final.parent, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
+        predecessor_fd = -1
+        exchanged = False
         try:
             listed_temporary = os.stat(
                 temporary.name, dir_fd=parent_fd, follow_symlinks=False
@@ -337,7 +376,16 @@ class ExtractionResultCache:
                 raise ValueError("cache staging directory identity changed")
             if (listed_final.st_dev, listed_final.st_ino) != expected_identity:
                 raise ValueError("cache generation identity changed before refresh")
+            predecessor_fd = os.open(
+                final.name,
+                os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            opened_predecessor = os.fstat(predecessor_fd)
+            if (opened_predecessor.st_dev, opened_predecessor.st_ino) != expected_identity:
+                raise ValueError("opened cache generation identity differs")
             _exchange_directories(parent_fd, temporary.name, final.name)
+            exchanged = True
             os.fsync(parent_fd)
             refreshed = os.stat(final.name, dir_fd=parent_fd, follow_symlinks=False)
             predecessor = os.stat(
@@ -348,4 +396,16 @@ class ExtractionResultCache:
             if (predecessor.st_dev, predecessor.st_ino) != expected_identity:
                 raise ValueError("replaced cache generation identity differs")
         finally:
-            os.close(parent_fd)
+            try:
+                if exchanged and predecessor_fd >= 0:
+                    with suppress(OSError, ValueError):
+                        cleanup_pinned_directory(
+                            parent_fd,
+                            temporary.name,
+                            predecessor_fd,
+                            expected_identity,
+                        )
+            finally:
+                if predecessor_fd >= 0:
+                    os.close(predecessor_fd)
+                os.close(parent_fd)

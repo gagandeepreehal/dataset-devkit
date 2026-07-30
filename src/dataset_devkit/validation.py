@@ -1986,17 +1986,12 @@ def _read_pinned_json(root_fd: int, parts: tuple[str, ...]) -> object:
         os.close(directory_fd)
 
 
-def verify_publication_manifest(lease: StagingLease, expected_content_hash: str) -> None:
-    """Rebind finalized bytes to their manifest immediately before publication."""
-    lease.assert_bound()
-    root_fd = lease.duplicate_root_fd()
-    try:
-        manifest = _read_pinned_json(
-            root_fd, ("mz_extensions", "content_manifest.json")
-        )
-        actual = build_content_manifest(lease.root, root_fd=root_fd)
-    finally:
-        os.close(root_fd)
+def verify_publication_manifest_fd(root_fd: int, expected_content_hash: str) -> None:
+    """Rebind finalized bytes to their manifest through pinned root authority."""
+    manifest = _read_pinned_json(
+        root_fd, ("mz_extensions", "content_manifest.json")
+    )
+    actual = build_content_manifest(Path("."), root_fd=root_fd)
     if manifest != actual or actual.get("root_sha256") != expected_content_hash:
         raise DatasetValidationError(
             ValidationReport(
@@ -2015,6 +2010,16 @@ def verify_publication_manifest(lease: StagingLease, expected_content_hash: str)
                 None,
             )
         )
+
+
+def verify_publication_manifest(lease: StagingLease, expected_content_hash: str) -> None:
+    """Rebind finalized bytes to their manifest immediately before publication."""
+    lease.assert_bound()
+    root_fd = lease.duplicate_root_fd()
+    try:
+        verify_publication_manifest_fd(root_fd, expected_content_hash)
+    finally:
+        os.close(root_fd)
     lease.assert_bound()
 
 

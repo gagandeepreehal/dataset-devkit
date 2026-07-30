@@ -6,7 +6,6 @@ import os
 import stat
 import sys
 import uuid
-from collections.abc import Iterator
 from contextlib import suppress
 from ctypes import CDLL, c_char_p, c_int, get_errno
 from dataclasses import dataclass
@@ -125,11 +124,16 @@ class StagingLease:
         return os.dup(self._root_fd)
 
     def cleanup(self) -> bool:
-        """Leave failed staging for explicit maintenance; never pathname-delete it."""
-        # POSIX has no portable conditional rmdir-by-inode operation. Even with pinned
-        # descriptors, stat-then-rmtree would reopen a race that can delete a same-name
-        # replacement. Failed invocations are therefore fail-safe and intentionally stale.
-        return False
+        """Boundedly clean this invocation through retained authoritative descriptors."""
+        try:
+            return cleanup_pinned_directory(
+                self._parent_fd,
+                self.name,
+                self._root_fd,
+                self.root_identity,
+            )
+        except (OSError, ValueError):
+            return False
 
     def close(self) -> None:
         if not self._closed:
@@ -138,60 +142,146 @@ class StagingLease:
             self._closed = True
 
 
-def _walk_fd(directory_fd: int, prefix: str = "") -> Iterator[tuple[str, int, os.stat_result]]:
-    directory_before = os.fstat(directory_fd)
+def _open_tree_snapshot(
+    directory_fd: int,
+    *,
+    prefix: str,
+    files: list[tuple[str, str, int, int, os.stat_result, os.stat_result]],
+    directories: list[tuple[str, str, int, int, os.stat_result, os.stat_result]],
+) -> None:
     for name in sorted(os.listdir(directory_fd)):
         relative = f"{prefix}/{name}" if prefix else name
         listed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISDIR(listed.st_mode):
             child = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
-            try:
-                if _identity(os.fstat(child)) != _identity(listed):
-                    raise ValueError(f"directory changed while walking: {relative}")
-                yield from _walk_fd(child, relative)
-                after = os.fstat(child)
-                relisted = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                if _stable_identity(after) != _stable_identity(relisted):
-                    raise ValueError(f"directory changed while walking: {relative}")
-            finally:
+            opened = os.fstat(child)
+            if _identity(opened) != _identity(listed):
                 os.close(child)
+                raise ValueError(f"directory changed while walking: {relative}")
+            directories.append((relative, name, directory_fd, child, listed, opened))
+            _open_tree_snapshot(
+                child,
+                prefix=relative,
+                files=files,
+                directories=directories,
+            )
         elif stat.S_ISREG(listed.st_mode) and listed.st_nlink == 1:
             descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_fd)
-            yield relative, descriptor, listed
-            relisted = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if _stable_identity(relisted) != _stable_identity(listed):
+            opened = os.fstat(descriptor)
+            if _stable_identity(opened) != _stable_identity(listed):
+                os.close(descriptor)
                 raise ValueError(f"path changed while hashing: {relative}")
+            files.append((relative, name, directory_fd, descriptor, listed, opened))
         else:
             raise ValueError(f"symlink or unsafe hardlink: {relative}")
-    directory_after = os.fstat(directory_fd)
-    if _stable_identity(directory_before) != _stable_identity(directory_after):
-        raise ValueError(f"directory changed while walking: {prefix or '.'}")
 
 
 def hash_regular_files_fd(
     root_fd: int, *, excluded: frozenset[str] = frozenset()
 ) -> dict[str, tuple[int, str]]:
-    """Hash a pinned tree and reject metadata or identity changes during every read."""
+    """Hash one whole pinned-tree snapshot, retaining every descriptor until recheck."""
     import hashlib
 
+    root_before = os.fstat(root_fd)
+    files: list[tuple[str, str, int, int, os.stat_result, os.stat_result]] = []
+    directories: list[tuple[str, str, int, int, os.stat_result, os.stat_result]] = []
     entries: dict[str, tuple[int, str]] = {}
-    for relative, descriptor, listed in _walk_fd(root_fd):
-        try:
-            opened = os.fstat(descriptor)
+    try:
+        _open_tree_snapshot(
+            root_fd,
+            prefix="",
+            files=files,
+            directories=directories,
+        )
+        for relative, _, _, descriptor, _, opened in files:
             digest = hashlib.sha256()
             while chunk := os.read(descriptor, 1024 * 1024):
                 digest.update(chunk)
+            if relative not in excluded:
+                entries[relative] = (opened.st_size, digest.hexdigest())
+
+        for relative, name, parent_fd, descriptor, listed, opened in files:
             after = os.fstat(descriptor)
-        finally:
+            relisted = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not (
+                _stable_identity(listed)
+                == _stable_identity(opened)
+                == _stable_identity(after)
+                == _stable_identity(relisted)
+            ):
+                raise ValueError(f"path changed while hashing: {relative}")
+        for relative, name, parent_fd, descriptor, listed, opened in reversed(directories):
+            after = os.fstat(descriptor)
+            relisted = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not (
+                _stable_identity(listed)
+                == _stable_identity(opened)
+                == _stable_identity(after)
+                == _stable_identity(relisted)
+            ):
+                raise ValueError(f"directory changed while walking: {relative}")
+        if _stable_identity(root_before) != _stable_identity(os.fstat(root_fd)):
+            raise ValueError("directory changed while walking: .")
+        return entries
+    finally:
+        for _, _, _, descriptor, _, _ in files:
             os.close(descriptor)
-        if (
-            _stable_identity(listed) != _stable_identity(opened)
-            or _stable_identity(opened) != _stable_identity(after)
-        ):
-            raise ValueError(f"path changed while hashing: {relative}")
-        if relative not in excluded:
-            entries[relative] = (opened.st_size, digest.hexdigest())
-    return entries
+        for _, _, _, descriptor, _, _ in reversed(directories):
+            os.close(descriptor)
+
+
+def _cleanup_contents_fd(directory_fd: int) -> None:
+    """Recursively remove entries below one already-open authoritative directory."""
+    for name in sorted(os.listdir(directory_fd)):
+        listed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        identity = _identity(listed)
+        if stat.S_ISDIR(listed.st_mode):
+            child = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            try:
+                if _identity(os.fstat(child)) != identity:
+                    raise ValueError("cleanup child identity changed")
+                _cleanup_contents_fd(child)
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISDIR(current.st_mode) and _identity(current) == identity:
+                    os.rmdir(name, dir_fd=directory_fd)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(listed.st_mode):
+            descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_fd)
+            try:
+                if _identity(os.fstat(descriptor)) != identity:
+                    raise ValueError("cleanup file identity changed")
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISREG(current.st_mode) and _identity(current) == identity:
+                    os.unlink(name, dir_fd=directory_fd)
+            finally:
+                os.close(descriptor)
+        else:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if _identity(current) == identity:
+                os.unlink(name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
+def cleanup_pinned_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    expected_identity: tuple[int, int],
+) -> bool:
+    """Empty one pinned directory and remove its name only while identity-bound."""
+    if _identity(os.fstat(directory_fd)) != expected_identity:
+        raise ValueError("cleanup authority differs from expected directory identity")
+    _cleanup_contents_fd(directory_fd)
+    try:
+        listed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(listed.st_mode) or _identity(listed) != expected_identity:
+        return False
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+    return True
 
 
 def _rename_exclusive(parent_fd: int, source: str, destination: str) -> None:
@@ -216,6 +306,30 @@ def _rename_exclusive(parent_fd: int, source: str, destination: str) -> None:
                 f"refusing to overwrite existing final dataset: {destination}"
             )
         raise OSError(error_number, os.strerror(error_number))
+
+
+def _quarantine_published_identity(
+    parent_fd: int, final_name: str, expected_identity: tuple[int, int]
+) -> str:
+    """Atomically remove an owned failed publication from its final name."""
+    listed = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(listed.st_mode) or _identity(listed) != expected_identity:
+        raise ValueError("refusing to roll back a replaced final dataset")
+    for _ in range(128):
+        quarantine_name = f".{final_name}.rejected-{uuid.uuid4().hex}"
+        try:
+            _rename_exclusive(parent_fd, final_name, quarantine_name)
+        except FileExistsError:
+            continue
+        quarantined = os.stat(
+            quarantine_name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if not stat.S_ISDIR(quarantined.st_mode) or _identity(quarantined) != expected_identity:
+            with suppress(Exception):
+                _rename_exclusive(parent_fd, quarantine_name, final_name)
+            raise ValueError("publication rollback identity changed")
+        return quarantine_name
+    raise FileExistsError("unable to allocate publication rollback quarantine")
 
 
 def _directory_identity(path: Path) -> tuple[int, int]:
@@ -331,8 +445,30 @@ def publish_staging(
         listed = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
         if (listed.st_dev, listed.st_ino) != source_identity:
             raise ValueError("staging directory identity changed before publication")
-        _rename_exclusive(parent_fd, source.name, destination.name)
-        os.fsync(parent_fd)
+        published = False
+        try:
+            _rename_exclusive(parent_fd, source.name, destination.name)
+            published = True
+            if lease is not None:
+                from dataset_devkit.validation import verify_publication_manifest_fd
+
+                if expected_content_hash is None:
+                    raise ValueError("leased publication requires an expected content hash")
+                root_fd = os.dup(lease._root_fd)
+                try:
+                    if _identity(os.fstat(root_fd)) != source_identity:
+                        raise ValueError("leased root identity changed after publication")
+                    verify_publication_manifest_fd(root_fd, expected_content_hash)
+                finally:
+                    os.close(root_fd)
+            os.fsync(parent_fd)
+        except Exception:
+            if published:
+                _quarantine_published_identity(
+                    parent_fd, destination.name, source_identity
+                )
+                os.fsync(parent_fd)
+            raise
     finally:
         os.close(parent_fd)
     return destination

@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -202,29 +203,137 @@ def test_new_quarantine_ancestors_are_fsynced(
     assert directory_fsyncs >= 4
 
 
-def test_rejection_manifest_revalidates_lock_inode_after_flock(
+def test_rejection_manifest_lock_file_replacement_cannot_lose_concurrent_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original_flock = fcntl.flock
-    replaced = False
+    first_locked = threading.Event()
+    second_attempted = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
 
     def replace_lock_after_flock(file_descriptor: int, operation: int) -> None:
-        nonlocal replaced
+        nonlocal calls
+        if operation != fcntl.LOCK_EX:
+            original_flock(file_descriptor, operation)
+            return
+        with calls_lock:
+            calls += 1
+            call = calls
+        if call == 2:
+            second_attempted.set()
         original_flock(file_descriptor, operation)
-        if operation == fcntl.LOCK_EX and not replaced:
-            replaced = True
+        if call == 1:
             lock = tmp_path / ".rejections.jsonl.lock"
-            lock.rename(tmp_path / ".rejections.jsonl.lock.stale")
+            if lock.exists():
+                lock.rename(tmp_path / ".rejections.jsonl.lock.stale")
             lock.write_bytes(b"")
+            first_locked.set()
+            assert second_attempted.wait(timeout=5)
 
     monkeypatch.setattr(
         "dataset_devkit.quarantine.fcntl.flock", replace_lock_after_flock
     )
+    first = replace(_report(), recording_id="first")
+    second = replace(_report(), recording_id="second")
 
-    with pytest.raises(StructuralExtractionError, match="manifest lock"):
-        write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(
+            write_rejection_manifest, tmp_path, "rejections.jsonl", (first,)
+        )
+        assert first_locked.wait(timeout=5)
+        second_future = pool.submit(
+            write_rejection_manifest, tmp_path, "rejections.jsonl", (second,)
+        )
+        first_future.result(timeout=5)
+        second_future.result(timeout=5)
 
-    assert not (tmp_path / "rejections.jsonl").exists()
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "rejections.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert {row["recording_id"] for row in rows} == {"first", "second"}
+
+
+@pytest.mark.parametrize("replaced_component", ["directory", "ancestor"])
+def test_rejection_manifest_binds_configured_directory_path_for_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replaced_component: str,
+) -> None:
+    ancestor = tmp_path / "configured"
+    directory = ancestor / "quarantine"
+    manifest = write_rejection_manifest(directory, "rejections.jsonl", (_report(),))
+    original_content = manifest.read_bytes()
+    original_write_all = quarantine_module._write_all
+    raced = False
+
+    def replace_path_after_temporary_write(file_descriptor: int, content: bytes) -> None:
+        nonlocal raced
+        original_write_all(file_descriptor, content)
+        if raced:
+            return
+        raced = True
+        if replaced_component == "directory":
+            directory.rename(ancestor / "quarantine-stale")
+            directory.mkdir()
+        else:
+            ancestor.rename(tmp_path / "configured-stale")
+            ancestor.mkdir()
+            (tmp_path / "configured-stale" / "quarantine").rename(directory)
+
+    monkeypatch.setattr(
+        quarantine_module,
+        "_write_all",
+        replace_path_after_temporary_write,
+    )
+
+    with pytest.raises(StructuralExtractionError, match="quarantine directory.*identity"):
+        write_rejection_manifest(
+            directory,
+            "rejections.jsonl",
+            (replace(_report(), recording_id="raced"),),
+        )
+
+    if replaced_component == "directory":
+        assert (ancestor / "quarantine-stale" / "rejections.jsonl").read_bytes() == (
+            original_content
+        )
+        assert not (directory / "rejections.jsonl").exists()
+    else:
+        assert (directory / "rejections.jsonl").read_bytes() == original_content
+
+
+def test_rejection_manifest_revalidates_directory_path_after_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "configured" / "quarantine"
+    write_rejection_manifest(directory, "rejections.jsonl", (_report(),))
+    original_fsync = os.fsync
+    raced = False
+
+    def replace_path_after_directory_fsync(file_descriptor: int) -> None:
+        nonlocal raced
+        original_fsync(file_descriptor)
+        if raced or not stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+            return
+        raced = True
+        directory.rename(directory.parent / "quarantine-stale")
+        directory.mkdir()
+
+    monkeypatch.setattr(
+        "dataset_devkit.quarantine.os.fsync", replace_path_after_directory_fsync
+    )
+
+    with pytest.raises(StructuralExtractionError, match="quarantine directory.*identity"):
+        write_rejection_manifest(
+            directory,
+            "rejections.jsonl",
+            (replace(_report(), recording_id="published-before-race"),),
+        )
+
+    assert raced
+    assert not (directory / "rejections.jsonl").exists()
 
 
 def test_rejection_manifest_read_is_bound_to_opened_inode(

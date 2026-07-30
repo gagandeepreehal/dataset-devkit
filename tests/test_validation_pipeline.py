@@ -938,27 +938,82 @@ def test_extraction_result_cache_refresh_cleanup_preserves_replacement_directory
     config_hash = "a" * 64
     cache = ExtractionResultCache(tmp_path / "cache")
     cache.store(source, config_hash, extracted)
-    original_publish = cache._publish_refresh
+    original_cleanup = publication_module.cleanup_pinned_directory
     replacement: Path | None = None
+    displaced: Path | None = None
 
-    def replace_exchanged_predecessor(
-        temporary: Path,
-        final: Path,
+    def replace_exchanged_predecessor_before_cleanup(
+        parent_fd: int,
+        name: str,
+        directory_fd: int,
         expected_identity: tuple[int, int],
-    ) -> None:
-        nonlocal replacement
-        original_publish(temporary, final, expected_identity)
-        temporary.rename(temporary.with_name(f"{temporary.name}.owned-stale"))
-        temporary.mkdir()
-        replacement = temporary
-        (temporary / "keep.txt").write_text("unrelated", encoding="utf-8")
+    ) -> bool:
+        nonlocal displaced, replacement
+        predecessor = cache.path_for(source, config_hash).parent / name
+        displaced = predecessor.with_name(f"{predecessor.name}.owned-stale")
+        predecessor.rename(displaced)
+        predecessor.mkdir()
+        replacement = predecessor
+        (predecessor / "keep.txt").write_text("unrelated", encoding="utf-8")
+        return original_cleanup(parent_fd, name, directory_fd, expected_identity)
 
-    monkeypatch.setattr(cache, "_publish_refresh", replace_exchanged_predecessor)
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.cache.cleanup_pinned_directory",
+        replace_exchanged_predecessor_before_cleanup,
+    )
 
     cache.store(source, config_hash, extracted, force_refresh=True)
 
     assert replacement is not None
     assert (replacement / "keep.txt").read_text(encoding="utf-8") == "unrelated"
+    assert displaced is not None
+    assert tuple(displaced.iterdir()) == ()
+
+
+def test_extraction_result_cache_post_exchange_failure_never_cleans_new_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = tmp_path / "recording.mcap"
+    write_mcap(
+        recording,
+        camera_payloads=(
+            camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
+        ),
+    )
+    extracted = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=1,
+        tolerance_ns=0,
+        staging_root=tmp_path / "staging",
+        decoder_factory=DeterministicDecoder,
+    ).extract(recording)
+    source = SourceFingerprint(
+        "https://example.blob.core.windows.net",
+        "recordings",
+        "mcap-h265/recording.mcap",
+        '"etag"',
+        recording.stat().st_size,
+    )
+    config_hash = "a" * 64
+    cache = ExtractionResultCache(tmp_path / "cache")
+    cache.store(source, config_hash, extracted)
+    from dataset_devkit.extraction import cache as cache_module
+
+    original_exchange = cache_module._exchange_directories
+
+    def fail_after_exchange(parent_fd: int, left: str, right: str) -> None:
+        original_exchange(parent_fd, left, right)
+        raise RuntimeError("injected after exchange")
+
+    monkeypatch.setattr(cache_module, "_exchange_directories", fail_after_exchange)
+    with pytest.raises(RuntimeError, match="injected after exchange"):
+        cache.store(source, config_hash, extracted, force_refresh=True)
+
+    loaded = cache.load(source, config_hash, recording)
+    assert loaded is not None
+    assert loaded.samples[0].staged_image.path.read_bytes()
 
 
 def test_extraction_result_cache_concurrent_refreshes_publish_complete_generations(
@@ -1014,5 +1069,4 @@ def test_extraction_result_cache_concurrent_refreshes_publish_complete_generatio
     assert len(loaded.samples) == len(extracted.samples)
     assert loaded.samples[0].staged_image.inode in refreshed_identities
     stale = tuple(cache.path_for(source, config_hash).parent.glob("*.staging-*"))
-    assert len(stale) == 2
-    assert all(path.is_dir() for path in stale)
+    assert stale == ()
