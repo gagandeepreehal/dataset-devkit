@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from google.protobuf import descriptor_pb2, descriptor_pool, json_format, message_factory
-from google.protobuf.descriptor import Descriptor
+from google.protobuf.descriptor import Descriptor, FieldDescriptor
 from google.protobuf.message import DecodeError, Message
 from google.protobuf.timestamp_pb2 import Timestamp
 from mcap.reader import make_reader
@@ -28,6 +28,11 @@ from dataset_devkit.extraction.models import (
 )
 
 CAMERA_SCHEMA_NAME = "autonome.CompressedVideos"
+_GNSS_NUMERIC_FIELDS = {
+    "lat_lon_ht": ("latitude_deg", "longitude_deg", "height_m"),
+    "orientation": ("roll_rad", "pitch_rad", "yaw_rad"),
+    "position_error": ("east_sigma_m", "north_sigma_m", "up_sigma_m", "hdop"),
+}
 
 
 def _message_names(
@@ -133,6 +138,159 @@ def _parse_message(message_type: type[Message], payload: bytes, context: str) ->
     return message
 
 
+def _require_descriptor_field(
+    descriptor: Descriptor,
+    *,
+    context: str,
+    path: str,
+    name: str,
+    field_type: int,
+    repeated: bool,
+    number: int | None = None,
+    message_type: str | None = None,
+) -> FieldDescriptor:
+    field = descriptor.fields_by_name.get(name)
+    valid = (
+        field is not None
+        and field.type == field_type
+        and field.is_repeated is repeated
+        and (repeated or not field.is_required)
+        and (number is None or field.number == number)
+        and (
+            message_type is None
+            or (field.message_type is not None and field.message_type.full_name == message_type)
+        )
+    )
+    if not valid or field is None:
+        raise StructuralExtractionError(
+            f"{context} schema field {path!r} has the wrong number, type, or cardinality"
+        )
+    return cast(FieldDescriptor, field)
+
+
+def _validate_camera_schema(descriptor: Descriptor) -> None:
+    scalar_specs = (
+        ("rec_frame_id", 1, FieldDescriptor.TYPE_INT64),
+        ("format", 4, FieldDescriptor.TYPE_STRING),
+        ("frame_id", 5, FieldDescriptor.TYPE_INT64),
+        ("width", 8, FieldDescriptor.TYPE_INT32),
+        ("height", 9, FieldDescriptor.TYPE_INT32),
+        ("number_of_cameras", 10, FieldDescriptor.TYPE_INT32),
+    )
+    for name, number, field_type in scalar_specs:
+        _require_descriptor_field(
+            descriptor,
+            context="camera",
+            path=name,
+            name=name,
+            field_type=field_type,
+            repeated=False,
+            number=number,
+        )
+    for name, number in (("rec_timestamp", 2), ("timestamp", 3)):
+        _require_descriptor_field(
+            descriptor,
+            context="camera",
+            path=name,
+            name=name,
+            field_type=FieldDescriptor.TYPE_MESSAGE,
+            repeated=False,
+            number=number,
+            message_type="google.protobuf.Timestamp",
+        )
+    for name, number, field_type in (
+        ("data", 6, FieldDescriptor.TYPE_BYTES),
+        ("name", 7, FieldDescriptor.TYPE_STRING),
+    ):
+        _require_descriptor_field(
+            descriptor,
+            context="camera",
+            path=name,
+            name=name,
+            field_type=field_type,
+            repeated=True,
+            number=number,
+        )
+    _require_descriptor_field(
+        descriptor,
+        context="camera",
+        path="camera_timestamp",
+        name="camera_timestamp",
+        field_type=FieldDescriptor.TYPE_MESSAGE,
+        repeated=True,
+        number=14,
+        message_type="google.protobuf.Timestamp",
+    )
+    intrinsic_field = _require_descriptor_field(
+        descriptor,
+        context="camera",
+        path="camera_intrinsic",
+        name="camera_intrinsic",
+        field_type=FieldDescriptor.TYPE_MESSAGE,
+        repeated=True,
+        number=11,
+        message_type="autonome.CameraIntrinsic",
+    )
+    extrinsic_field = _require_descriptor_field(
+        descriptor,
+        context="camera",
+        path="camera_extrinsic",
+        name="camera_extrinsic",
+        field_type=FieldDescriptor.TYPE_MESSAGE,
+        repeated=True,
+        number=12,
+        message_type="autonome.CameraExtrinsic",
+    )
+    intrinsic = cast(Descriptor, intrinsic_field.message_type)
+    for name, number in (
+        ("focal_length_x", 1),
+        ("focal_length_y", 2),
+        ("optical_center_x", 3),
+        ("optical_center_y", 4),
+        ("rmse", 5),
+        ("skew", 6),
+    ):
+        _require_descriptor_field(
+            intrinsic,
+            context="camera",
+            path=f"camera_intrinsic.{name}",
+            name=name,
+            field_type=FieldDescriptor.TYPE_DOUBLE,
+            repeated=False,
+            number=number,
+        )
+    _require_descriptor_field(
+        intrinsic,
+        context="camera",
+        path="camera_intrinsic.distortion_coeffs",
+        name="distortion_coeffs",
+        field_type=FieldDescriptor.TYPE_DOUBLE,
+        repeated=True,
+        number=7,
+    )
+    for name, number in (("width", 8), ("height", 9)):
+        _require_descriptor_field(
+            intrinsic,
+            context="camera",
+            path=f"camera_intrinsic.{name}",
+            name=name,
+            field_type=FieldDescriptor.TYPE_INT32,
+            repeated=False,
+            number=number,
+        )
+    extrinsic = cast(Descriptor, extrinsic_field.message_type)
+    for name, number in (("rotation_vector", 1), ("translation_vector", 2)):
+        _require_descriptor_field(
+            extrinsic,
+            context="camera",
+            path=f"camera_extrinsic.{name}",
+            name=name,
+            field_type=FieldDescriptor.TYPE_DOUBLE,
+            repeated=True,
+            number=number,
+        )
+
+
 def _parse_camera(message: Message) -> RawCameraBatch:
     dynamic: Any = message
     try:
@@ -209,35 +367,52 @@ def _parse_camera(message: Message) -> RawCameraBatch:
         ) from error
 
 
-def _require_nested_shape(
-    descriptor: Descriptor, field_name: str, required_fields: set[str]
-) -> None:
-    field = descriptor.fields_by_name.get(field_name)
-    if field is None or field.message_type is None:
-        raise StructuralExtractionError(
-            f"GNSS schema lacks required message field {field_name!r}"
+def _validate_gnss_schema(descriptor: Descriptor) -> None:
+    for name in ("timestamp", "rec_timestamp"):
+        _require_descriptor_field(
+            descriptor,
+            context="GNSS",
+            path=name,
+            name=name,
+            field_type=FieldDescriptor.TYPE_MESSAGE,
+            repeated=False,
+            message_type="google.protobuf.Timestamp",
         )
-    missing = required_fields - set(field.message_type.fields_by_name)
-    if missing:
-        raise StructuralExtractionError(
-            f"GNSS schema field {field_name!r} lacks required fields: {', '.join(sorted(missing))}"
-        )
-
-
-def _validate_gnss_shape(descriptor: Descriptor) -> None:
-    for field_name in ("timestamp", "rec_timestamp", "is_valid"):
-        if field_name not in descriptor.fields_by_name:
-            raise StructuralExtractionError(f"GNSS schema lacks required field {field_name!r}")
-    _require_nested_shape(
-        descriptor, "lat_lon_ht", {"latitude_deg", "longitude_deg", "height_m"}
-    )
-    _require_nested_shape(descriptor, "orientation", {"roll_rad", "pitch_rad", "yaw_rad"})
-    _require_nested_shape(
+    _require_descriptor_field(
         descriptor,
-        "position_error",
-        {"east_sigma_m", "north_sigma_m", "up_sigma_m", "hdop"},
+        context="GNSS",
+        path="is_valid",
+        name="is_valid",
+        field_type=FieldDescriptor.TYPE_BOOL,
+        repeated=False,
     )
-    _require_nested_shape(descriptor, "orientation_error", set())
+    for parent_name, child_names in _GNSS_NUMERIC_FIELDS.items():
+        parent = _require_descriptor_field(
+            descriptor,
+            context="GNSS",
+            path=parent_name,
+            name=parent_name,
+            field_type=FieldDescriptor.TYPE_MESSAGE,
+            repeated=False,
+        )
+        nested = cast(Descriptor, parent.message_type)
+        for child_name in child_names:
+            _require_descriptor_field(
+                nested,
+                context="GNSS",
+                path=f"{parent_name}.{child_name}",
+                name=child_name,
+                field_type=FieldDescriptor.TYPE_DOUBLE,
+                repeated=False,
+            )
+    _require_descriptor_field(
+        descriptor,
+        context="GNSS",
+        path="orientation_error",
+        name="orientation_error",
+        field_type=FieldDescriptor.TYPE_MESSAGE,
+        repeated=False,
+    )
 
 
 def _message_dict(message: Message) -> dict[str, Any]:
@@ -249,9 +424,27 @@ def _message_dict(message: Message) -> dict[str, Any]:
 
 
 def _parse_gnss(message: Message) -> GnssSample:
-    _validate_gnss_shape(cast(Descriptor, message.DESCRIPTOR))
     dynamic: Any = message
     try:
+        for field_name in (
+            "lat_lon_ht",
+            "orientation",
+            "position_error",
+            "orientation_error",
+        ):
+            if not message.HasField(field_name):
+                raise StructuralExtractionError(
+                    f"GNSS message has no value for required field {field_name!r}"
+                )
+        for parent_name, child_names in _GNSS_NUMERIC_FIELDS.items():
+            nested_message: Message = getattr(message, parent_name)
+            for child_name in child_names:
+                child = nested_message.DESCRIPTOR.fields_by_name[child_name]
+                if child.has_presence and not nested_message.HasField(child_name):
+                    raise StructuralExtractionError(
+                        f"GNSS message has no value for required field "
+                        f"{parent_name}.{child_name}"
+                    )
         lat_lon_ht = dynamic.lat_lon_ht
         orientation = dynamic.orientation
         position_error = dynamic.position_error
@@ -377,6 +570,7 @@ def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecordi
                 schema_name, message_type = cached
                 if channel.topic == camera_topic:
                     camera_seen = True
+                    _validate_camera_schema(cast(Descriptor, message_type.DESCRIPTOR))
                     batch = _parse_camera(
                         _parse_message(message_type, record.data, "camera")
                     )
@@ -384,6 +578,7 @@ def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecordi
                     camera_batches.append(batch)
                 elif channel.topic == gnss_topic:
                     gnss_seen = True
+                    _validate_gnss_schema(cast(Descriptor, message_type.DESCRIPTOR))
                     gnss_samples.append(
                         _parse_gnss(_parse_message(message_type, record.data, "GNSS"))
                     )

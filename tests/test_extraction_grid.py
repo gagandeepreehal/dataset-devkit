@@ -44,9 +44,16 @@ def test_grid_keeps_final_target_when_last_batch_is_early_jitter() -> None:
 
 
 def test_grid_is_deterministic_for_unsorted_input_and_rejects_duplicates() -> None:
-    ordered = select_camera_grid([0, 510, 1_000], Fraction(2_000_000, 1), 20)
-    unsorted = select_camera_grid([1_000, 0, 510], Fraction(2_000_000, 1), 20)
-    assert unsorted == ordered
+    unsorted = select_camera_grid([1_000, 0, 1_510], Fraction(2_000_000, 1), 20)
+    chosen = [
+        (entry.target_timestamp_ns, entry.batch_timestamp_ns)
+        for entry in unsorted.entries
+    ]
+    assert chosen == [
+        (1_000, 1_000),
+        (1_500, 1_510),
+    ]
+    assert unsorted.unused_batch_timestamps_ns == (0,)
 
     with pytest.raises(ValueError, match="duplicate camera batch timestamp"):
         select_camera_grid([0, 0], Fraction(1, 1), 0)

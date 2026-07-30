@@ -49,7 +49,7 @@ def select_camera_grid(
     if not ordered:
         return GridSelection((), (), ())
 
-    anchor = ordered[0]
+    anchor = batch_timestamps_ns[0]
     end = ordered[-1]
     period_ns = Fraction(1_000_000_000, 1) / target_fps
     available = set(ordered)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from contextlib import suppress
 from fractions import Fraction
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from dataset_devkit.extraction.models import (
     ExtractedCameraSample,
     RecordingExtractionResult,
 )
-from dataset_devkit.extraction.staging import stage_jpeg
+from dataset_devkit.extraction.staging import remove_staged_jpeg, stage_jpeg
 
 
 def _recording_id(path: Path) -> str:
@@ -65,6 +66,8 @@ class RecordingExtractor:
         first_batch = recording.camera_batches[0]
         poses: dict[int, EgoPose] = {}
         samples: list[ExtractedCameraSample] = []
+        recording_id = _recording_id(path)
+        staged_filenames: list[str] = []
 
         def pose_for(timestamp_ns: int) -> EgoPose:
             existing = poses.get(timestamp_ns)
@@ -92,37 +95,45 @@ class RecordingExtractor:
             poses[timestamp_ns] = pose
             return pose
 
-        with CameraDecoderSet(len(first_batch.frames), self.decoder_factory) as decoders:
-            for batch in recording.camera_batches:
-                selected_target = target_by_batch.get(batch.rec_timestamp_ns)
-                for frame in batch.frames:
-                    image = decoders.decode(frame.camera_index, frame.payload)
-                    if image.size != (batch.width, batch.height):
-                        raise StructuralExtractionError(
-                            f"decoded camera[{frame.camera_index}] dimensions differ from schema"
-                        )
-                    if selected_target is None:
-                        continue
-                    staged = stage_jpeg(
-                        self.staging_root,
-                        _recording_id(path),
-                        frame.camera_index,
-                        frame.camera_name,
-                        frame.camera_timestamp_ns,
-                        image,
-                        (batch.width, batch.height),
-                    )
-                    samples.append(
-                        ExtractedCameraSample(
-                            selected_target,
-                            batch.rec_timestamp_ns,
-                            frame.camera_timestamp_ns,
+        try:
+            with CameraDecoderSet(len(first_batch.frames), self.decoder_factory) as decoders:
+                for batch in recording.camera_batches:
+                    selected_target = target_by_batch.get(batch.rec_timestamp_ns)
+                    for frame in batch.frames:
+                        image = decoders.decode(frame.camera_index, frame.payload)
+                        if image.size != (batch.width, batch.height):
+                            raise StructuralExtractionError(
+                                f"decoded camera[{frame.camera_index}] dimensions "
+                                "differ from schema"
+                            )
+                        if selected_target is None:
+                            continue
+                        staged = stage_jpeg(
+                            self.staging_root,
+                            recording_id,
                             frame.camera_index,
                             frame.camera_name,
-                            staged,
-                            pose_for(frame.camera_timestamp_ns),
+                            frame.camera_timestamp_ns,
+                            image,
+                            (batch.width, batch.height),
                         )
-                    )
+                        staged_filenames.append(staged.path.name)
+                        samples.append(
+                            ExtractedCameraSample(
+                                selected_target,
+                                batch.rec_timestamp_ns,
+                                frame.camera_timestamp_ns,
+                                frame.camera_index,
+                                frame.camera_name,
+                                staged,
+                                pose_for(frame.camera_timestamp_ns),
+                            )
+                        )
+        except Exception:
+            for filename in reversed(staged_filenames):
+                with suppress(StructuralExtractionError):
+                    remove_staged_jpeg(self.staging_root, recording_id, filename)
+            raise
         return RecordingExtractionResult(
             path.resolve(),
             recording.camera_batches,

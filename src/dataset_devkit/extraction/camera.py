@@ -107,7 +107,15 @@ class CameraDecoderSet:
     def __init__(self, camera_count: int, factory: Callable[[], HevcDecoder]) -> None:
         if camera_count <= 0:
             raise ValueError("camera_count must be positive")
-        self._decoders = [factory() for _ in range(camera_count)]
+        self._decoders: list[HevcDecoder] = []
+        try:
+            for _ in range(camera_count):
+                self._decoders.append(factory())
+        except Exception:
+            for decoder in self._decoders:
+                with suppress(Exception):
+                    decoder.close()
+            raise
         self._closed = False
 
     def decode(self, camera_index: int, payload: bytes) -> Image.Image:

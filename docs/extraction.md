@@ -13,6 +13,10 @@ encoding and MCAP schemas whose `encoding` is `protobuf`; schema data must be a 
 resolved before dependants and `google.protobuf.Timestamp` supplied as a well-known dependency.
 No generated source files are required.
 
+The camera descriptor is checked before message decoding for exact field numbers, scalar/message
+types, repeated-versus-singular cardinality, Timestamp types, and intrinsic/extrinsic nested
+shapes. A same-named but wire-incompatible lookalike schema is a structural failure.
+
 The camera schema name is exactly `autonome.CompressedVideos`. The extractor requires exact
 `format == "h265"`, positive shared dimensions, a positive `number_of_cameras`, and index-aligned
 `data`, `name`, `camera_timestamp`, `camera_intrinsic`, and `camera_extrinsic` arrays. Names are
@@ -24,7 +28,9 @@ The GNSS protobuf type name may vary. Its descriptor must expose `timestamp`, `r
 `is_valid`, `lat_lon_ht`, `orientation`, `position_error`, and `orientation_error` with the required
 field shape. GNSS is indexed by protobuf `timestamp`; duplicate timestamps are structurally
 ambiguous. Unknown top-level identifiers and dynamically shaped orientation uncertainty remain
-serializable in the result.
+serializable in the result. GNSS scalar and nested descriptor types are validated before payload
+decoding. Every message must contain both timestamps and all four required nested messages; a
+nested numeric value is also required when its protobuf descriptor exposes field presence.
 
 ## Selection, decode, and pose output
 
@@ -39,6 +45,11 @@ Every access unit must produce exactly one frame. Selected frames are converted 
 written as JPEG quality 95 under the recording staging directory, and independently reopened with
 Pillow to verify JPEG format, RGB mode, complete decode, and dimensions. The POSIX writer rejects
 unsafe recording identifiers, symlink directories/targets, and hard-linked overwrite targets.
+Every staging ancestor is traversed relative to no-follow directory descriptors and its device/
+inode identity is rechecked around publication and verification. Verification reads through the
+trusted directory descriptor, requires the exact encoded byte sequence and digest, then decodes
+those same bytes with Pillow. A substituted file is removed without following or modifying its
+outside target.
 
 Every staged candidate keeps three distinct times: grid target, chosen batch `rec_timestamp`, and
 its real camera timestamp. Ego poses are keyed by the real camera timestamp. GNSS values are
@@ -55,6 +66,8 @@ descriptors, absent required streams, wrong schema/format, invalid protobuf time
 or changing camera arrays/calibration, corrupt HEVC, decoder frame-count violations, unsafe JPEG
 staging, duplicate grid batch times, or duplicate GNSS times. Decoder contexts are closed on both
 success and failure.
+If decoding fails after earlier frames were staged, this extraction invocation removes its staged
+JPEG leaves through the same no-follow directory traversal before propagating the failure.
 
 Backward or gapped but otherwise valid camera timestamps are not a structural failure. The result
 contains per-stream timestamp deltas so the later validity stage can apply the configured policy.

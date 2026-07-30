@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +106,34 @@ def test_decoder_is_persistent_and_cleanup_occurs_on_failure() -> None:
     assert created[0].closed
 
 
+def test_decoder_construction_failure_closes_every_created_context_once() -> None:
+    close_counts: list[int] = []
+
+    class ConstructionDecoder:
+        def __init__(self) -> None:
+            close_counts.append(0)
+            self.index = len(close_counts) - 1
+
+        def decode(self, payload: bytes) -> list[Image.Image]:
+            return [Image.new("RGB", (4, 3))]
+
+        def close(self) -> None:
+            close_counts[self.index] += 1
+
+    calls = 0
+
+    def factory() -> ConstructionDecoder:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("construction failed")
+        return ConstructionDecoder()
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        CameraDecoderSet(3, factory)
+    assert close_counts == [1, 1]
+
+
 def test_stage_jpeg_uses_quality_95_atomic_replace_and_reopens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -150,3 +179,110 @@ def test_stage_jpeg_rejects_escape_symlink_and_hardlink_targets(tmp_path: Path) 
     os.link(outside, target)
     with pytest.raises(StructuralExtractionError, match="unsafe existing staging target"):
         stage_jpeg(tmp_path, "recording", 0, "cam", 1, image, (4, 3))
+
+
+def test_stage_jpeg_rejects_symlink_in_staging_ancestor(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_ancestor = tmp_path / "linked"
+    linked_ancestor.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(StructuralExtractionError, match="staging.*ancestor|directory"):
+        stage_jpeg(
+            linked_ancestor / "staging",
+            "recording",
+            0,
+            "cam",
+            1,
+            Image.new("RGB", (4, 3)),
+            (4, 3),
+        )
+    assert not (outside / "staging").exists()
+
+
+def test_stage_jpeg_rejects_same_dimension_content_swap_and_removes_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alternate_stream = BytesIO()
+    Image.new("RGB", (4, 3), (200, 1, 2)).save(
+        alternate_stream, format="JPEG", quality=95
+    )
+    alternate = alternate_stream.getvalue()
+    original_replace = os.replace
+
+    def replace_then_substitute(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        original_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        target_fd = os.open(destination, os.O_WRONLY | os.O_TRUNC, dir_fd=dst_dir_fd)
+        try:
+            os.write(target_fd, alternate)
+            os.fsync(target_fd)
+        finally:
+            os.close(target_fd)
+
+    monkeypatch.setattr(os, "replace", replace_then_substitute)
+    with pytest.raises(StructuralExtractionError, match="content.*changed|identity"):
+        stage_jpeg(
+            tmp_path,
+            "recording",
+            0,
+            "cam",
+            1,
+            Image.new("RGB", (4, 3), (1, 2, 3)),
+            (4, 3),
+        )
+    assert not (tmp_path / "recording" / "000-cam-1.jpg").exists()
+
+
+def test_stage_jpeg_detects_ancestor_swap_without_touching_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    recording_dir = staging_root / "recording"
+    moved_dir = staging_root / "recording-original"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_target = outside / "000-cam-1.jpg"
+    Image.new("RGB", (4, 3), (220, 5, 6)).save(outside_target, format="JPEG", quality=95)
+    outside_bytes = outside_target.read_bytes()
+    original_replace = os.replace
+
+    def replace_then_swap_ancestor(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        original_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        recording_dir.rename(moved_dir)
+        recording_dir.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(os, "replace", replace_then_swap_ancestor)
+    with pytest.raises(StructuralExtractionError, match="ancestor.*changed|directory"):
+        stage_jpeg(
+            staging_root,
+            "recording",
+            0,
+            "cam",
+            1,
+            Image.new("RGB", (4, 3), (1, 2, 3)),
+            (4, 3),
+        )
+    assert outside_target.read_bytes() == outside_bytes
+    assert not list(moved_dir.glob("*.jpg"))

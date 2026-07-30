@@ -43,8 +43,8 @@ def descriptor_set_bytes() -> bytes:
     ):
         _field(intrinsic, name, number, F.TYPE_DOUBLE)
     _field(intrinsic, "distortion_coeffs", 7, F.TYPE_DOUBLE, repeated=True)
-    _field(intrinsic, "width", 8, F.TYPE_UINT32)
-    _field(intrinsic, "height", 9, F.TYPE_UINT32)
+    _field(intrinsic, "width", 8, F.TYPE_INT32)
+    _field(intrinsic, "height", 9, F.TYPE_INT32)
     extrinsic = calibration.message_type.add(name="CameraExtrinsic")
     _field(extrinsic, "rotation_vector", 1, F.TYPE_DOUBLE, repeated=True)
     _field(extrinsic, "translation_vector", 2, F.TYPE_DOUBLE, repeated=True)
@@ -73,9 +73,9 @@ def descriptor_set_bytes() -> bytes:
     _field(camera, "frame_id", 5, F.TYPE_INT64)
     _field(camera, "data", 6, F.TYPE_BYTES, repeated=True)
     _field(camera, "name", 7, F.TYPE_STRING, repeated=True)
-    _field(camera, "width", 8, F.TYPE_UINT32)
-    _field(camera, "height", 9, F.TYPE_UINT32)
-    _field(camera, "number_of_cameras", 10, F.TYPE_UINT32)
+    _field(camera, "width", 8, F.TYPE_INT32)
+    _field(camera, "height", 9, F.TYPE_INT32)
+    _field(camera, "number_of_cameras", 10, F.TYPE_INT32)
     _field(
         camera,
         "camera_intrinsic",
@@ -121,8 +121,10 @@ def descriptor_set_bytes() -> bytes:
     return file_set.SerializeToString()
 
 
-def message_classes() -> tuple[type[Any], type[Any]]:
-    files = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
+def message_classes(descriptor_data: bytes | None = None) -> tuple[type[Any], type[Any]]:
+    files = descriptor_pb2.FileDescriptorSet.FromString(
+        descriptor_data or descriptor_set_bytes()
+    )
     pool = descriptor_pool.DescriptorPool()
     pool.AddSerializedFile(timestamp_pb2.DESCRIPTOR.serialized_pb)  # type: ignore[no-untyped-call]
     pool.Add(files.file[1])  # type: ignore[no-untyped-call]
@@ -147,6 +149,8 @@ def camera_message(
     camera_timestamps_ns: tuple[int, ...] = (1_000_000_010, 1_000_000_020),
     *,
     format_name: str = "h265",
+    payloads: tuple[bytes, ...] | None = None,
+    dimensions: tuple[int, int] = (4, 3),
 ) -> bytes:
     camera_type, _ = message_classes()
     message = camera_type()
@@ -155,11 +159,11 @@ def camera_message(
     _timestamp(message.rec_timestamp, rec_timestamp_ns)
     _timestamp(message.timestamp, rec_timestamp_ns + 5)
     message.format = format_name
-    message.width = 4
-    message.height = 3
+    message.width, message.height = dimensions
     message.number_of_cameras = 2
+    frame_payloads = payloads or tuple(HEVC_AU for _ in camera_timestamps_ns)
     for index, timestamp_ns in enumerate(camera_timestamps_ns):
-        message.data.append(HEVC_AU)
+        message.data.append(frame_payloads[index])
         message.name.append(f"cam_{index}")
         _timestamp(message.camera_timestamp.add(), timestamp_ns)
         intrinsic = message.camera_intrinsic.add(
@@ -167,8 +171,8 @@ def camera_message(
             focal_length_y=1,
             optical_center_x=2,
             optical_center_y=2,
-            width=4,
-            height=3,
+            width=dimensions[0],
+            height=dimensions[1],
         )
         intrinsic.distortion_coeffs.extend([0.1, 0.2])
         extrinsic = message.camera_extrinsic.add()
@@ -202,20 +206,27 @@ def write_mcap(
     camera_payloads: tuple[bytes, ...] | None = None,
     include_camera: bool = True,
     include_gnss: bool = True,
+    descriptor_data: bytes | None = None,
+    gnss_payloads: tuple[bytes, ...] | None = None,
 ) -> None:
-    descriptor_data = descriptor_set_bytes()
+    schema_data = descriptor_data or descriptor_set_bytes()
     with path.open("wb") as stream:
         writer = Writer(stream)
         writer.start()
         if include_camera:
-            schema = writer.register_schema(camera_schema_name, camera_encoding, descriptor_data)
+            schema = writer.register_schema(camera_schema_name, camera_encoding, schema_data)
             channel = writer.register_channel("rec_cameras", "protobuf", schema)
             payloads = camera_payloads or (camera_message(),)
             for index, payload in enumerate(payloads):
                 writer.add_message(channel, (index + 1) * 100, payload, (index + 1) * 100)
         if include_gnss:
-            schema = writer.register_schema("autonome.GnssFix", "protobuf", descriptor_data)
+            schema = writer.register_schema("autonome.GnssFix", "protobuf", schema_data)
             channel = writer.register_channel("gnss", "protobuf", schema)
-            writer.add_message(channel, 50, gnss_message(900_000_000, 0), 50)
-            writer.add_message(channel, 250, gnss_message(2_100_000_000, 2), 250)
+            payloads = gnss_payloads or (
+                gnss_message(900_000_000, 0),
+                gnss_message(2_100_000_000, 2),
+            )
+            for index, payload in enumerate(payloads):
+                log_time = 50 + index * 200
+                writer.add_message(channel, log_time, payload, log_time)
         writer.finish()
