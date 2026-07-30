@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -166,3 +167,15 @@ def test_extraction_manifest_symlink_is_a_miss_and_completion_replaces_link(
     assert extraction_cache_reusable(
         link, acquisition.source, acquisition.requested_extraction_config_hash
     )
+
+
+def test_manifest_hard_link_is_a_cache_miss(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    outside = tmp_path / "outside-manifest"
+    write_manifest(outside, manifest)
+    outside_content = outside.read_bytes()
+    link = tmp_path / "manifest.json"
+    os.link(outside, link)
+
+    assert load_manifest(link) is None
+    assert outside.read_bytes() == outside_content

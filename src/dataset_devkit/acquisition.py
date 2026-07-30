@@ -91,37 +91,70 @@ class AcquisitionResult:
     manifest: AcquisitionManifest
 
 
+@dataclass(frozen=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    size: int
+    link_count: int
+
+
+@dataclass(frozen=True)
+class _VerifiedFile:
+    identity: _FileIdentity
+    sha256: str
+    md5: bytes
+
+
+def _identity(file_stat: os.stat_result) -> _FileIdentity | None:
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+        return None
+    return _FileIdentity(
+        device=file_stat.st_dev,
+        inode=file_stat.st_ino,
+        size=file_stat.st_size,
+        link_count=file_stat.st_nlink,
+    )
+
+
+def _owned_file_identity(path: Path) -> _FileIdentity | None:
+    try:
+        return _identity(path.lstat())
+    except FileNotFoundError:
+        return None
+
+
 def _open_regular_for_read(path: Path) -> IO[bytes]:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+    if _identity(os.fstat(descriptor)) is None:
         os.close(descriptor)
         raise AcquisitionError(f"cache path is not a regular file: {path}")
     return os.fdopen(descriptor, "rb")
 
 
 def _regular_file_size(path: Path) -> int | None:
-    try:
-        file_stat = path.lstat()
-    except FileNotFoundError:
-        return None
-    return file_stat.st_size if stat.S_ISREG(file_stat.st_mode) else None
+    identity = _owned_file_identity(path)
+    return identity.size if identity is not None else None
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with _open_regular_for_read(path) as stream:
+def _verify_owned_file(path: Path) -> _VerifiedFile:
+    sha256_digest = hashlib.sha256()
+    md5_digest = hashlib.md5(usedforsecurity=False)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    before = _identity(os.fstat(descriptor))
+    if before is None:
+        os.close(descriptor)
+        raise AcquisitionError(f"cache path is not an owned regular file: {path}")
+    with os.fdopen(descriptor, "rb") as stream:
         while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _md5_file(path: Path) -> bytes:
-    digest = hashlib.md5(usedforsecurity=False)
-    with _open_regular_for_read(path) as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.digest()
+            sha256_digest.update(chunk)
+            md5_digest.update(chunk)
+        after = _identity(os.fstat(stream.fileno()))
+    if after != before or _owned_file_identity(path) != before:
+        raise AcquisitionError(f"cache file identity changed during verification: {path}")
+    return _VerifiedFile(before, sha256_digest.hexdigest(), md5_digest.digest())
 
 
 def _content_md5(properties: BlobPropertiesProtocol) -> bytes | None:
@@ -141,6 +174,19 @@ def _atomic_write_text(path: Path, content: str) -> None:
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _create_owned_empty_file(path: Path) -> None:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise AcquisitionError(f"failed to create exclusive cache file: {path}") from error
+    try:
+        if _identity(os.fstat(descriptor)) is None:
+            raise AcquisitionError(f"new cache file is not exclusively owned: {path}")
+    finally:
+        os.close(descriptor)
 
 
 class AzureBlobAcquirer:
@@ -241,10 +287,17 @@ class AzureBlobAcquirer:
         source: SourceFingerprint,
         properties: BlobPropertiesProtocol,
     ) -> AcquisitionManifest | None:
-        final_size = _regular_file_size(paths.final)
+        try:
+            verified_final = (
+                _verify_owned_file(paths.final)
+                if _owned_file_identity(paths.final) is not None
+                else None
+            )
+        except (OSError, AcquisitionError):
+            verified_final = None
         manifest = (
             load_manifest(paths.manifest)
-            if _regular_file_size(paths.manifest) is not None and final_size is not None
+            if _regular_file_size(paths.manifest) is not None and verified_final is not None
             else None
         )
         expected_relative = paths.final.relative_to(self.cache_dir).as_posix()
@@ -253,12 +306,14 @@ class AzureBlobAcquirer:
             and manifest.source == source
             and manifest.artifact.cache_relative_path == expected_relative
             and manifest.artifact.size == source.size
-            and final_size == source.size
-            and _sha256_file(paths.final) == manifest.artifact.sha256
+            and verified_final is not None
+            and verified_final.identity.size == source.size
+            and verified_final.sha256 == manifest.artifact.sha256
         )
         expected_md5 = _content_md5(properties)
         if valid and expected_md5 is not None:
-            valid = _md5_file(paths.final) == expected_md5
+            assert verified_final is not None
+            valid = verified_final.md5 == expected_md5
         if not valid:
             paths.final.unlink(missing_ok=True)
             paths.manifest.unlink(missing_ok=True)
@@ -272,29 +327,38 @@ class AzureBlobAcquirer:
         source: SourceFingerprint,
         before: BlobPropertiesProtocol,
         after: BlobPropertiesProtocol,
-    ) -> IntegrityVerification:
+    ) -> tuple[IntegrityVerification, _VerifiedFile]:
         after_source = self.fingerprint_for(source.blob_path, after)
         before_md5 = _content_md5(before)
         after_md5 = _content_md5(after)
         if after_source != source or before_md5 != after_md5:
             raise BlobChangedError(f"Azure blob changed while downloading {source.blob_path!r}")
-        actual_size = _regular_file_size(paths.partial)
-        if actual_size is None:
-            raise IntegrityError(f"download partial is not a regular file: {source.blob_path!r}")
-        if actual_size != source.size:
+        try:
+            verified = _verify_owned_file(paths.partial)
+        except (OSError, AcquisitionError) as error:
+            raise IntegrityError(
+                f"download partial is not an owned regular file: {source.blob_path!r}"
+            ) from error
+        if verified.identity.size != source.size:
             raise IntegrityError(
                 f"downloaded size mismatch for {source.blob_path!r}: "
-                f"expected {source.size}, got {actual_size}"
+                f"expected {source.size}, got {verified.identity.size}"
             )
         if after_md5 is not None:
-            if _md5_file(paths.partial) != after_md5:
+            if verified.md5 != after_md5:
                 raise IntegrityError(f"content MD5 mismatch for {source.blob_path!r}")
-            return IntegrityVerification(
-                method="content_md5",
-                verified=True,
-                content_md5=base64.b64encode(after_md5).decode("ascii"),
+            return (
+                IntegrityVerification(
+                    method="content_md5",
+                    verified=True,
+                    content_md5=base64.b64encode(after_md5).decode("ascii"),
+                ),
+                verified,
             )
-        return IntegrityVerification(method="size_etag", verified=True, content_md5=None)
+        return (
+            IntegrityVerification(method="size_etag", verified=True, content_md5=None),
+            verified,
+        )
 
     def acquire(self, blob_path: str) -> AcquisitionResult:
         """Acquire one exact blob, resuming only an identity-compatible partial."""
@@ -335,14 +399,16 @@ class AzureBlobAcquirer:
         if not compatible:
             self._discard_partial(paths)
             _atomic_write_text(paths.partial_sidecar, canonical_json(source.to_dict()) + "\n")
+            _create_owned_empty_file(paths.partial)
         offset = _regular_file_size(paths.partial) or 0
         resumed = offset > 0
 
         try:
             if offset < source.size:
-                flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+                flags = os.O_APPEND | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
                 descriptor = os.open(paths.partial, flags, 0o600)
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                partial_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(partial_stat.st_mode) or partial_stat.st_nlink != 1:
                     os.close(descriptor)
                     raise AcquisitionError("download partial must be a regular file")
                 with os.fdopen(descriptor, "ab") as stream:
@@ -360,7 +426,7 @@ class AzureBlobAcquirer:
 
         after = self._properties(client, blob_path)
         try:
-            integrity = self._verify_download(paths, source, before, after)
+            integrity, verified_partial = self._verify_download(paths, source, before, after)
         except IntegrityError:
             self._discard_partial(paths)
             raise
@@ -368,7 +434,7 @@ class AzureBlobAcquirer:
         artifact = ArtifactIdentity(
             cache_relative_path=paths.final.relative_to(self.cache_dir).as_posix(),
             size=source.size,
-            sha256=_sha256_file(paths.partial),
+            sha256=verified_partial.sha256,
         )
         manifest = AcquisitionManifest(
             source=source,
@@ -378,14 +444,20 @@ class AzureBlobAcquirer:
             requested_extraction_config_hash=self.extraction_config_hash,
         )
         try:
-            if _regular_file_size(paths.partial) != source.size:
+            if _owned_file_identity(paths.partial) != verified_partial.identity:
                 raise AcquisitionError("refusing to finalize an unsafe download partial")
             os.replace(paths.partial, paths.final)
-            if _regular_file_size(paths.final) != source.size:
-                raise AcquisitionError("final cache artifact is not a regular file")
+            if _owned_file_identity(paths.final) != verified_partial.identity:
+                raise AcquisitionError("final cache artifact has the wrong file identity")
+            verified_final = _verify_owned_file(paths.final)
+            if verified_final != verified_partial:
+                raise AcquisitionError("final cache artifact failed integrity re-verification")
             write_manifest(paths.manifest, manifest)
+            if _owned_file_identity(paths.manifest) is None:
+                raise AcquisitionError("acquisition manifest is not an owned regular file")
         except (OSError, AcquisitionError) as error:
             paths.final.unlink(missing_ok=True)
+            paths.manifest.unlink(missing_ok=True)
             message = f"failed to finalize cache artifact for {blob_path!r}"
             raise AcquisitionError(message) from error
         finally:

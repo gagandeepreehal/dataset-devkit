@@ -103,8 +103,12 @@ extraction-config hash pair. Acquisition cache hits can update acquisition reque
 provenance but never write or replace extraction-completion provenance. Missing, malformed, or
 symlinked completion manifests are cache misses.
 
-Cache artifacts, partials, sidecars, and manifests are required to be regular files within the
-configured cache. Unsafe symlinks are never followed or promoted into final cache objects.
+Cache artifacts, partials, sidecars, and manifests are required to be single-link regular files
+within the configured cache. Unsafe symbolic or hard links are never followed, modified, or
+promoted into final cache objects. Download verification is bound to the partial file's device
+and inode; finalization checks that same inode before and after rename and then repeats full-file
+integrity verification before writing the acquisition manifest. Empty source blobs follow the
+same checks using an exclusively created zero-length partial.
 
 ## Managed-identity smoke check
 

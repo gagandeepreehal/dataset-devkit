@@ -236,11 +236,12 @@ def write_manifest(path: Path, manifest: AcquisitionManifest) -> None:
 
 def _load_manifest_value(path: Path) -> object:
     file_stat = path.lstat()
-    if not stat.S_ISREG(file_stat.st_mode):
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
         raise ValueError("manifest is not a regular file")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+    opened_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
         os.close(descriptor)
         raise ValueError("manifest is not a regular file")
     with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
