@@ -244,6 +244,36 @@ class OwnedDirectoryAuthority:
         finally:
             os.close(parent_fd)
 
+    def is_bound(self) -> bool:
+        """Reopen without following links and verify this authority still names its root."""
+        try:
+            parent_fd, chain = _open_directory_chain(self.parent, create=False)
+        except (OSError, ValueError):
+            return False
+        try:
+            if (
+                chain != self.parent_chain
+                or _identity(os.fstat(parent_fd)) != self.parent_identity
+            ):
+                return False
+            try:
+                root_fd = os.open(self.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            except OSError:
+                return False
+            try:
+                listed = os.stat(self.name, dir_fd=parent_fd, follow_symlinks=False)
+                return (
+                    stat.S_ISDIR(listed.st_mode)
+                    and _identity(listed) == self.root_identity
+                    and _identity(os.fstat(root_fd)) == self.root_identity
+                )
+            finally:
+                os.close(root_fd)
+        except (OSError, ValueError):
+            return False
+        finally:
+            os.close(parent_fd)
+
     def cleanup_failure(self) -> OwnedDirectoryCleanupFailure:
         """Return serializable identity evidence for a failed cleanup."""
         return OwnedDirectoryCleanupFailure(

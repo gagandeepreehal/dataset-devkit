@@ -53,6 +53,14 @@ class _SubmissionMetadata:
     selected_target_ns: int | None
 
 
+@dataclass(frozen=True)
+class OwnedRecordingExtraction:
+    """A successful extraction paired with its pre-established cleanup authority."""
+
+    result: RecordingExtractionResult
+    authority: OwnedDirectoryAuthority
+
+
 class RecordingExtractor:
     """Read one local MCAP, decode its stream in order, and stage selected JPEGs."""
 
@@ -80,6 +88,10 @@ class RecordingExtractor:
         self.decoder_factory = decoder_factory
 
     def extract(self, path: Path) -> RecordingExtractionResult:
+        return self.extract_owned(path).result
+
+    def extract_owned(self, path: Path) -> OwnedRecordingExtraction:
+        """Extract and retain the invocation authority for transactional handoff."""
         recording = read_recording(path, self.camera_topic, self.gnss_topic)
         selection = select_camera_grid(
             [batch.rec_timestamp_ns for batch in recording.camera_batches],
@@ -95,7 +107,10 @@ class RecordingExtractor:
         samples: list[tuple[int, ExtractedCameraSample]] = []
         recording_id = _recording_id(path)
         invocation = create_staging_invocation(self.staging_root, recording_id)
-        working_authority = OwnedDirectoryAuthority.capture(invocation.path)
+        working_authority = invocation.authority
+        if working_authority is None:
+            rollback_staging_invocation(invocation)
+            raise StructuralExtractionError("staging invocation authority was not established")
 
         def pose_for(timestamp_ns: int) -> EgoPose:
             existing = poses.get(timestamp_ns)
@@ -186,15 +201,18 @@ class RecordingExtractor:
             ordered_samples = tuple(
                 sample for _, sample in sorted(samples, key=lambda item: item[0])
             )
-            return RecordingExtractionResult(
-                path.resolve(),
-                invocation.path,
-                recording.camera_batches,
-                tuple(recording.gnss_samples),
-                selection,
-                ordered_samples,
-                poses,
-                recording.timestamp_observations,
+            return OwnedRecordingExtraction(
+                RecordingExtractionResult(
+                    path.resolve(),
+                    invocation.path,
+                    recording.camera_batches,
+                    tuple(recording.gnss_samples),
+                    selection,
+                    ordered_samples,
+                    poses,
+                    recording.timestamp_observations,
+                ),
+                working_authority,
             )
         except Exception as extraction_error:
             try:

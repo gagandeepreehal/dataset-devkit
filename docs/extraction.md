@@ -91,6 +91,12 @@ control/format/surrogate/private-use categories are rejected. Accepted Unicode s
 preserved exactly; names are not normalized or sanitized into a different identity. Successful
 results expose the invocation root plus immutable relative-path, directory-chain, device/inode,
 byte-size, SHA-256, dimensions, and staged-path evidence for later publication and reverification.
+Invocation creation is itself transactional: the parent and new child remain pinned until child
+identity, parent durability, and a closed cleanup authority record are established. A setup or
+registry-handoff failure removes only that identity; if safe removal cannot be proven, a structured
+cleanup-debt error carries the recorded ancestor/path/device/inode evidence and blocks publication.
+Fresh extraction and cache materialization pass this pre-established authority to the build
+registry, so neither performs a late path-based authority capture after producing images.
 
 Every staged candidate keeps three distinct times: grid target, chosen batch `rec_timestamp`, and
 its real camera timestamp. Ego poses are keyed by the real camera timestamp. GNSS values are

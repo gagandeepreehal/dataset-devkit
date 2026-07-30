@@ -120,7 +120,11 @@ def test_working_registry_uses_bounded_descriptors_for_many_recordings(
                 RecordingExtractionResult,
                 SimpleNamespace(staging_root=root),
             )
-            registry.register(f"recording-{index:06d}", result)
+            registry.register(
+                f"recording-{index:06d}",
+                result,
+                OwnedDirectoryAuthority.capture(root),
+            )
         registry.cleanup_all()
     finally:
         resource.setrlimit(resource.RLIMIT_NOFILE, original_limit)
@@ -138,6 +142,7 @@ def test_working_registry_surfaces_cleanup_failure_and_preserves_replacement(
     registry.register(
         "recording-000000",
         cast(RecordingExtractionResult, SimpleNamespace(staging_root=owned)),
+        OwnedDirectoryAuthority.capture(owned),
     )
     displaced = tmp_path / "displaced"
     owned.rename(displaced)
@@ -151,6 +156,59 @@ def test_working_registry_surfaces_cleanup_failure_and_preserves_replacement(
     assert captured.value.failures[0].path == owned
     assert sentinel.read_bytes() == b"unrelated"
     assert (displaced / "payload").read_bytes() == b"owned"
+
+
+def test_working_registry_handoff_failure_is_transactionally_cleaned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = _WorkingExtractionRegistry()
+    owned = tmp_path / "owned-handoff"
+    owned.mkdir()
+    (owned / "payload").write_bytes(b"owned")
+    authority = OwnedDirectoryAuthority.capture(owned)
+    result = cast(RecordingExtractionResult, SimpleNamespace(staging_root=owned))
+
+    def fail_handoff(
+        _result: RecordingExtractionResult, _authority: OwnedDirectoryAuthority
+    ) -> None:
+        raise ValueError("injected registry handoff failure")
+
+    monkeypatch.setattr(
+        _WorkingExtractionRegistry, "_validate_handoff", staticmethod(fail_handoff)
+    )
+
+    with pytest.raises(ValueError, match="injected registry handoff failure"):
+        registry.register("recording-000000", result, authority)
+
+    assert not owned.exists()
+
+
+def test_working_registry_handoff_cleanup_failure_surfaces_identity_debt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = _WorkingExtractionRegistry()
+    owned = tmp_path / "owned-handoff-debt"
+    owned.mkdir()
+    (owned / "payload").write_bytes(b"owned")
+    authority = OwnedDirectoryAuthority.capture(owned)
+    result = cast(RecordingExtractionResult, SimpleNamespace(staging_root=owned))
+
+    def fail_handoff(
+        _result: RecordingExtractionResult, _authority: OwnedDirectoryAuthority
+    ) -> None:
+        raise ValueError("injected registry handoff failure")
+
+    monkeypatch.setattr(
+        _WorkingExtractionRegistry, "_validate_handoff", staticmethod(fail_handoff)
+    )
+    monkeypatch.setattr(OwnedDirectoryAuthority, "cleanup", lambda _self: False)
+
+    with pytest.raises(OwnedDirectoryCleanupError) as captured:
+        registry.register("recording-000000", result, authority)
+
+    assert isinstance(captured.value.__cause__, ValueError)
+    assert captured.value.failures[0].path == owned
+    assert owned.is_dir()
 
 
 def test_displaced_validated_staging_replacement_is_never_published(

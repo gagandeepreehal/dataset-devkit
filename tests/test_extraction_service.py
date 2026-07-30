@@ -17,7 +17,7 @@ from dataset_devkit.extraction.camera import (
 )
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.service import RecordingExtractor
-from dataset_devkit.publication import OwnedDirectoryCleanupError
+from dataset_devkit.publication import OwnedDirectoryAuthority, OwnedDirectoryCleanupError
 from mcap_fixture import HEVC_AU, camera_message, write_mcap
 
 
@@ -497,3 +497,35 @@ def test_fresh_extraction_rollback_failure_preserves_original_and_authority(
     assert failure.expected_inode > 0
     assert failure.expected_parent_chain
     assert failure.path.is_dir()
+
+
+def test_fresh_extraction_uses_transactionally_preestablished_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "preestablished.mcap"
+    write_mcap(
+        path,
+        camera_payloads=(
+            camera_message(
+                1_000_000_000,
+                (1_000_000_010, 1_000_000_020),
+                camera_names=("front", "rear"),
+            ),
+        ),
+    )
+
+    def reject_late_capture(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("late authority capture is forbidden")
+
+    monkeypatch.setattr(OwnedDirectoryAuthority, "capture", reject_late_capture)
+    owned = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=Fraction(1, 1),
+        tolerance_ns=0,
+        staging_root=tmp_path / "working",
+        decoder_factory=DeterministicDecoder,
+    ).extract_owned(path)
+
+    assert owned.authority.root == owned.result.staging_root
+    assert owned.authority.is_bound()

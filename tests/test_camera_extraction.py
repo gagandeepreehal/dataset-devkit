@@ -27,6 +27,7 @@ from dataset_devkit.extraction.models import (
     RawCameraFrame,
 )
 from dataset_devkit.extraction.staging import stage_jpeg, verify_staged_image_identity
+from dataset_devkit.publication import OwnedDirectoryCleanupError
 
 HEVC_AU = b"\x00\x00\x00\x01\x26\x01\xaa"  # type 19 VCL NAL
 
@@ -565,6 +566,104 @@ def test_staging_invocations_isolate_reruns_concurrency_and_sanitized_collisions
     assert all(path.is_file() for _, path in pairs)
     assert roots[2].name.startswith("a_b-")
     assert roots[3].name.startswith("a_b-")
+
+
+def test_create_staging_invocation_rolls_back_post_mkdir_stat_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    original_stat = os.stat
+    failed = False
+
+    def fail_created_directory_stat(
+        path: os.PathLike[str] | str | int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal failed
+        if (
+            not failed
+            and dir_fd is not None
+            and isinstance(path, str)
+            and path.startswith("recording-")
+        ):
+            failed = True
+            raise OSError("injected post-mkdir stat failure")
+        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "stat", fail_created_directory_stat)
+
+    with pytest.raises(OSError, match="injected post-mkdir stat failure"):
+        staging_module.create_staging_invocation(staging_root, "recording")
+
+    assert failed
+    assert list(staging_root.iterdir()) == []
+
+
+def test_create_staging_invocation_rolls_back_post_mkdir_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_first_fsync(file_descriptor: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected post-mkdir fsync failure")
+        original_fsync(file_descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_fsync)
+
+    with pytest.raises(OSError, match="injected post-mkdir fsync failure"):
+        staging_module.create_staging_invocation(staging_root, "recording")
+
+    assert failed
+    assert list(staging_root.iterdir()) == []
+
+
+def test_create_staging_invocation_preserves_replacement_when_setup_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    original_stat = os.stat
+    replacement: Path | None = None
+
+    def replace_created_directory_then_fail(
+        path: os.PathLike[str] | str | int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal replacement
+        if replacement is None and dir_fd is not None and isinstance(path, str) and path.startswith(
+            "recording-"
+        ):
+            created = staging_root / path
+            displaced = staging_root / f"{path}.displaced"
+            created.rename(displaced)
+            created.mkdir()
+            replacement = created
+            raise OSError("injected setup failure after replacement")
+        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "stat", replace_created_directory_then_fail)
+
+    with pytest.raises(OwnedDirectoryCleanupError) as captured:
+        staging_module.create_staging_invocation(staging_root, "recording")
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert str(captured.value.__cause__) == "injected setup failure after replacement"
+    assert replacement is not None and replacement.is_dir()
+    failure = captured.value.failures[0]
+    assert failure.path == replacement
+    assert (failure.expected_device, failure.expected_inode) != (
+        replacement.stat().st_dev,
+        replacement.stat().st_ino,
+    )
+    assert failure.expected_parent_chain
 
 
 def test_duplicate_timestamps_are_disambiguated_and_rollback_is_inode_owned(

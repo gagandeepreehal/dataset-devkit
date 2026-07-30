@@ -51,6 +51,14 @@ class CacheStoreResult:
 
 
 @dataclass(frozen=True)
+class MaterializedExtraction:
+    """Caller-owned cache materialization plus its pre-established authority."""
+
+    result: RecordingExtractionResult
+    authority: OwnedDirectoryAuthority
+
+
+@dataclass(frozen=True)
 class _CachedImage:
     path: str
     size: int
@@ -657,6 +665,19 @@ class ExtractionResultCache:
         working_root: Path,
         recording_id: str,
     ) -> RecordingExtractionResult | None:
+        owned = self._materialize_owned(
+            source, config_hash, source_path, working_root, recording_id
+        )
+        return None if owned is None else owned.result
+
+    def _materialize_owned(
+        self,
+        source: SourceFingerprint,
+        config_hash: str,
+        source_path: Path,
+        working_root: Path,
+        recording_id: str,
+    ) -> MaterializedExtraction | None:
         """Copy a verified immutable generation into a unique caller-owned invocation."""
         self.path_for(source, config_hash)
         invocation = None
@@ -696,7 +717,11 @@ class ExtractionResultCache:
                         if generation_identity != cached.generation_identity:
                             raise ValueError("cache generation changed before materialization")
                         invocation = create_staging_invocation(working_root, recording_id)
-                        working_authority = OwnedDirectoryAuthority.capture(invocation.path)
+                        working_authority = invocation.authority
+                        if working_authority is None:
+                            raise ValueError(
+                                "cache staging invocation authority was not established"
+                            )
                         destination_fd = os.open(invocation.path, _DIRECTORY_FLAGS)
                         try:
                             for index, image in enumerate(cached.images):
@@ -753,11 +778,16 @@ class ExtractionResultCache:
                         ),
                     )
                 )
-            return replace(
-                cached.result,
-                source_path=source_path.absolute(),
-                staging_root=invocation.path,
-                samples=tuple(samples),
+            if working_authority is None:
+                raise RuntimeError("cache materialization authority was not established")
+            return MaterializedExtraction(
+                replace(
+                    cached.result,
+                    source_path=source_path.absolute(),
+                    staging_root=invocation.path,
+                    samples=tuple(samples),
+                ),
+                working_authority,
             )
         except Exception as error:
             rollback_after(error)

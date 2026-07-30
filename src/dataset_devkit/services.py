@@ -128,13 +128,32 @@ class _WorkingExtractionRegistry:
         self._lock = Lock()
         self._authorities: dict[str, OwnedDirectoryAuthority] = {}
 
-    def register(self, recording_id: str, result: RecordingExtractionResult) -> None:
-        authority = OwnedDirectoryAuthority.capture(result.staging_root)
-        with self._lock:
-            previous = self._authorities.get(recording_id)
-            if previous is not None:
-                raise ValueError(f"duplicate working extraction: {recording_id}")
-            self._authorities[recording_id] = authority
+    @staticmethod
+    def _validate_handoff(
+        result: RecordingExtractionResult, authority: OwnedDirectoryAuthority
+    ) -> None:
+        if authority.root != result.staging_root.absolute() or not authority.is_bound():
+            raise ValueError("working extraction authority is not bound to its result")
+
+    def register(
+        self,
+        recording_id: str,
+        result: RecordingExtractionResult,
+        authority: OwnedDirectoryAuthority,
+    ) -> None:
+        try:
+            self._validate_handoff(result, authority)
+            with self._lock:
+                previous = self._authorities.get(recording_id)
+                if previous is not None:
+                    raise ValueError(f"duplicate working extraction: {recording_id}")
+                self._authorities[recording_id] = authority
+        except Exception as handoff_error:
+            if not authority.cleanup():
+                raise OwnedDirectoryCleanupError(
+                    (authority.cleanup_failure(),)
+                ) from handoff_error
+            raise
 
     @staticmethod
     def _failure(authority: OwnedDirectoryAuthority) -> OwnedDirectoryCleanupFailure:
@@ -238,7 +257,7 @@ def _build_evidence_owned(
         recording_id = recording_id_by_path[path.resolve()]
         source = acquisition.manifest.source
         if acquirer.extraction_cache_reusable(source, extraction_hash):
-            cached = extraction_cache.materialize(
+            cached = extraction_cache._materialize_owned(
                 source,
                 extraction_hash,
                 path,
@@ -246,10 +265,11 @@ def _build_evidence_owned(
                 recording_id,
             )
             if cached is not None:
-                working.register(recording_id, cached)
-                return cached
-        extracted = extractor.extract(path)
-        working.register(recording_id, extracted)
+                working.register(recording_id, cached.result, cached.authority)
+                return cached.result
+        owned_extraction = extractor.extract_owned(path)
+        extracted = owned_extraction.result
+        working.register(recording_id, extracted, owned_extraction.authority)
         try:
             extraction_cache.store(
                 source,

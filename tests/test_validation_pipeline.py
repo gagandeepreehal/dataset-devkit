@@ -29,11 +29,15 @@ from dataset_devkit.config import (
 )
 from dataset_devkit.dataset import Dataset
 from dataset_devkit.export import export_dataset, preflight_recording_export
-from dataset_devkit.extraction.cache import CacheStoreResult, ExtractionResultCache
+from dataset_devkit.extraction.cache import (
+    CacheStoreResult,
+    ExtractionResultCache,
+    MaterializedExtraction,
+)
 from dataset_devkit.extraction.camera import DecoderOutput
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import RecordingExtractionResult
-from dataset_devkit.extraction.service import RecordingExtractor
+from dataset_devkit.extraction.service import OwnedRecordingExtraction, RecordingExtractor
 from dataset_devkit.features import RecordingFeatureResult, compute_recording_features
 from dataset_devkit.provenance import (
     AcquisitionManifest,
@@ -53,6 +57,7 @@ from dataset_devkit.services import (
     BuildOperationalError,
     BuildResult,
     BuildRuntime,
+    _WorkingExtractionRegistry,
     build_dataset,
     inspect_dataset,
 )
@@ -1202,6 +1207,31 @@ def test_cache_materialization_memory_is_bounded_by_one_image(tmp_path: Path) ->
     assert peak < 6 * 1024 * 1024
 
 
+def test_cache_materialization_uses_transactionally_preestablished_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recording, extracted, source = _cache_security_case(tmp_path)
+    cache = ExtractionResultCache(tmp_path / "cache")
+    config_hash = "a" * 64
+    cache.store(source, config_hash, extracted)
+
+    def reject_late_capture(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("late authority capture is forbidden")
+
+    monkeypatch.setattr(OwnedDirectoryAuthority, "capture", reject_late_capture)
+    owned = cache._materialize_owned(
+        source,
+        config_hash,
+        recording,
+        tmp_path / "working",
+        "recording-000000",
+    )
+
+    assert owned is not None
+    assert owned.authority.root == owned.result.staging_root
+    assert owned.authority.is_bound()
+
+
 def test_cache_materialization_rolls_back_a_partial_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1410,28 +1440,30 @@ def test_partial_pipeline_never_publishes_after_owned_cleanup_failure(
         tolerance_ns=int(config.downsampling.tolerance_ms * 1_000_000),
         staging_root=config.paths.work_dir,
         decoder_factory=DeterministicDecoder,
-    ).extract(good_recording)
+    ).extract_owned(good_recording)
     failed_working = config.paths.work_dir / "bad-owned-invocation"
     failed_working.mkdir()
     (failed_working / "partial.jpg").write_bytes(b"owned")
     failed_authority = OwnedDirectoryAuthority.capture(failed_working)
 
     class CleanupFailingCache:
-        def materialize(
+        def _materialize_owned(
             self,
             source: SourceFingerprint,
             _config_hash: str,
             _source_path: Path,
             _working_root: Path,
             _recording_id: str,
-        ) -> RecordingExtractionResult:
+        ) -> MaterializedExtraction:
             if source.blob_path == bad_blob:
                 original = ValueError("injected cache materialization failure")
                 cleanup = OwnedDirectoryCleanupError(
                     (failed_authority.cleanup_failure(),)
                 )
                 raise cleanup from original
-            return good_extraction
+            return MaterializedExtraction(
+                good_extraction.result, good_extraction.authority
+            )
 
     fake_cache = cast(ExtractionResultCache, CleanupFailingCache())
     runtime = BuildRuntime(
@@ -1487,11 +1519,11 @@ def test_partial_pipeline_blocks_fresh_extraction_rollback_failure(
     acquirer = _FakeAcquirer(
         {good_blob: good_recording, bad_blob: bad_recording}
     )
-    original_extract = RecordingExtractor.extract
+    original_extract_owned = RecordingExtractor.extract_owned
 
     def extract_with_bad_decoder(
         extractor: RecordingExtractor, path: Path
-    ) -> RecordingExtractionResult:
+    ) -> OwnedRecordingExtraction:
         if path == bad_recording:
             failing = RecordingExtractor(
                 camera_topic=extractor.camera_topic,
@@ -1501,13 +1533,15 @@ def test_partial_pipeline_blocks_fresh_extraction_rollback_failure(
                 staging_root=extractor.staging_root,
                 decoder_factory=FailSecondDecode,
             )
-            return original_extract(failing, path)
-        return original_extract(extractor, path)
+            return original_extract_owned(failing, path)
+        return original_extract_owned(extractor, path)
 
     def fail_rollback(_invocation: object) -> None:
         raise StructuralExtractionError("injected fresh rollback failure")
 
-    monkeypatch.setattr(RecordingExtractor, "extract", extract_with_bad_decoder)
+    monkeypatch.setattr(
+        RecordingExtractor, "extract_owned", extract_with_bad_decoder
+    )
     monkeypatch.setattr(
         "dataset_devkit.extraction.service.rollback_staging_invocation",
         fail_rollback,
@@ -1530,6 +1564,75 @@ def test_partial_pipeline_blocks_fresh_extraction_rollback_failure(
     assert details["cleanup_original_cause"] == {
         "exception_type": "StructuralExtractionError",
         "exception_message": "injected fresh extraction failure",
+    }
+
+
+def test_partial_pipeline_blocks_failed_authority_handoff(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    good_recording = tmp_path / "good-handoff.mcap"
+    bad_recording = tmp_path / "bad-handoff.mcap"
+    payloads = tuple(
+        camera_message(
+            timestamp,
+            (timestamp + 10, timestamp + 20),
+            camera_names=("front", "rear"),
+        )
+        for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
+    )
+    write_mcap(good_recording, camera_payloads=payloads)
+    write_mcap(bad_recording, camera_payloads=payloads)
+    good_blob = "mcap-h265/good-handoff.mcap"
+    bad_blob = "mcap-h265/bad-handoff.mcap"
+    config = _pipeline_config(
+        config_factory(), tmp_path, (good_blob, bad_blob), partial=True
+    )
+    acquirer = _FakeAcquirer(
+        {good_blob: good_recording, bad_blob: bad_recording}
+    )
+    bad_roots: set[Path] = set()
+    original_validate = _WorkingExtractionRegistry._validate_handoff
+    original_cleanup = OwnedDirectoryAuthority.cleanup
+
+    def fail_bad_handoff(
+        result: RecordingExtractionResult, authority: OwnedDirectoryAuthority
+    ) -> None:
+        if result.source_path == bad_recording.resolve():
+            bad_roots.add(authority.root)
+            raise ValueError("injected authority handoff failure")
+        original_validate(result, authority)
+
+    def fail_bad_cleanup(authority: OwnedDirectoryAuthority) -> bool:
+        if authority.root in bad_roots:
+            return False
+        return original_cleanup(authority)
+
+    monkeypatch.setattr(
+        _WorkingExtractionRegistry,
+        "_validate_handoff",
+        staticmethod(fail_bad_handoff),
+    )
+    monkeypatch.setattr(OwnedDirectoryAuthority, "cleanup", fail_bad_cleanup)
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: acquirer,
+        decoder_factory=DeterministicDecoder,
+        official_smoke=False,
+    )
+
+    with pytest.raises(BuildOperationalError, match="zero recordings are authorized"):
+        build_dataset(config, runtime=runtime)
+
+    assert not (config.paths.output_dir / config.publication.version).exists()
+    assert len(bad_roots) == 1
+    assert next(iter(bad_roots)).is_dir()
+    reports = tuple(config.quarantine.directory.glob("*.quarantine.json"))
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["artifact_handling"] == "preserved_in_place"
+    assert payload["deterministic_details"]["cleanup_original_cause"] == {
+        "exception_type": "ValueError",
+        "exception_message": "injected authority handoff failure",
     }
 
 
