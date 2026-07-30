@@ -1636,6 +1636,74 @@ def test_partial_pipeline_blocks_failed_authority_handoff(
     }
 
 
+def test_partial_pipeline_blocks_unpinned_fresh_invocation(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    good_recording = tmp_path / "good-preauthority.mcap"
+    bad_recording = tmp_path / "bad-preauthority.mcap"
+    payloads = tuple(
+        camera_message(
+            timestamp,
+            (timestamp + 10, timestamp + 20),
+            camera_names=("front", "rear"),
+        )
+        for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
+    )
+    write_mcap(good_recording, camera_payloads=payloads)
+    write_mcap(bad_recording, camera_payloads=payloads)
+    good_blob = "mcap-h265/good-preauthority.mcap"
+    bad_blob = "mcap-h265/bad-preauthority.mcap"
+    config = _pipeline_config(
+        config_factory(), tmp_path, (good_blob, bad_blob), partial=True
+    )
+    acquirer = _FakeAcquirer(
+        {good_blob: good_recording, bad_blob: bad_recording}
+    )
+    original_open = os.open
+
+    def fail_bad_child_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if (
+            isinstance(path, str)
+            and path.startswith("bad-preauthority-")
+            and dir_fd is not None
+        ):
+            raise OSError("injected child open failure")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.staging.os.open", fail_bad_child_open
+    )
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: acquirer,
+        decoder_factory=DeterministicDecoder,
+        official_smoke=False,
+    )
+
+    with pytest.raises(BuildOperationalError, match="zero recordings are authorized"):
+        build_dataset(config, runtime=runtime)
+
+    assert not (config.paths.output_dir / config.publication.version).exists()
+    unpinned = tuple(config.paths.work_dir.glob("bad-preauthority-*"))
+    assert len(unpinned) == 1
+    reports = tuple(config.quarantine.directory.glob("*.quarantine.json"))
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["artifact_handling"] == "preserved_in_place"
+    details = payload["deterministic_details"]
+    assert details["owned_working_trees"][0]["path"] == str(unpinned[0])
+    assert details["cleanup_original_cause"] == {
+        "exception_type": "OSError",
+        "exception_message": "injected child open failure",
+    }
+
+
 def test_post_export_working_cleanup_failure_blocks_publication(
     tmp_path: Path,
     config_factory: Callable[[], GlobalConfig],

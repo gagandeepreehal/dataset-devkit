@@ -594,7 +594,86 @@ def test_create_staging_invocation_rolls_back_post_mkdir_stat_failure(
 
     monkeypatch.setattr(os, "stat", fail_created_directory_stat)
 
-    with pytest.raises(OSError, match="injected post-mkdir stat failure"):
+    with pytest.raises(OwnedDirectoryCleanupError) as captured:
+        staging_module.create_staging_invocation(staging_root, "recording")
+
+    assert failed
+    assert isinstance(captured.value.__cause__, OSError)
+    assert str(captured.value.__cause__) == "injected post-mkdir stat failure"
+    assert len(list(staging_root.iterdir())) == 1
+    failure = captured.value.failures[0]
+    assert failure.expected_device == -1
+    assert failure.expected_inode == -1
+    assert failure.expected_parent_chain
+
+
+def test_create_staging_invocation_rolls_back_child_open_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    original_open = os.open
+    failed = False
+
+    def fail_first_child_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal failed
+        if (
+            not failed
+            and dir_fd is not None
+            and isinstance(path, str)
+            and path.startswith("recording-")
+        ):
+            failed = True
+            raise OSError("injected child open failure")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", fail_first_child_open)
+
+    with pytest.raises(OSError, match="injected child open failure"):
+        staging_module.create_staging_invocation(staging_root, "recording")
+
+    assert failed
+    assert list(staging_root.iterdir()) == []
+
+
+def test_create_staging_invocation_rolls_back_child_fstat_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    original_open = os.open
+    original_fstat = os.fstat
+    child_fd: int | None = None
+    failed = False
+
+    def record_child_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal child_fd
+        opened = original_open(path, flags, mode, dir_fd=dir_fd)
+        if dir_fd is not None and isinstance(path, str) and path.startswith("recording-"):
+            child_fd = opened
+        return opened
+
+    def fail_first_child_fstat(file_descriptor: int) -> os.stat_result:
+        nonlocal failed
+        if not failed and file_descriptor == child_fd:
+            failed = True
+            raise OSError("injected child fstat failure")
+        return original_fstat(file_descriptor)
+
+    monkeypatch.setattr(os, "open", record_child_open)
+    monkeypatch.setattr(os, "fstat", fail_first_child_fstat)
+
+    with pytest.raises(OSError, match="injected child fstat failure"):
         staging_module.create_staging_invocation(staging_root, "recording")
 
     assert failed
@@ -624,19 +703,20 @@ def test_create_staging_invocation_rolls_back_post_mkdir_fsync_failure(
     assert list(staging_root.iterdir()) == []
 
 
-def test_create_staging_invocation_preserves_replacement_when_setup_cleanup_fails(
+def test_create_staging_invocation_preserves_replacement_before_child_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     staging_root = tmp_path / "staging"
-    original_stat = os.stat
+    original_open = os.open
     replacement: Path | None = None
 
-    def replace_created_directory_then_fail(
-        path: os.PathLike[str] | str | int,
+    def replace_created_directory_then_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
         *,
         dir_fd: int | None = None,
-        follow_symlinks: bool = True,
-    ) -> os.stat_result:
+    ) -> int:
         nonlocal replacement
         if replacement is None and dir_fd is not None and isinstance(path, str) and path.startswith(
             "recording-"
@@ -646,16 +726,14 @@ def test_create_staging_invocation_preserves_replacement_when_setup_cleanup_fail
             created.rename(displaced)
             created.mkdir()
             replacement = created
-            raise OSError("injected setup failure after replacement")
-        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os, "stat", replace_created_directory_then_fail)
+    monkeypatch.setattr(os, "open", replace_created_directory_then_open)
 
     with pytest.raises(OwnedDirectoryCleanupError) as captured:
         staging_module.create_staging_invocation(staging_root, "recording")
 
-    assert isinstance(captured.value.__cause__, OSError)
-    assert str(captured.value.__cause__) == "injected setup failure after replacement"
+    assert isinstance(captured.value.__cause__, StructuralExtractionError)
     assert replacement is not None and replacement.is_dir()
     failure = captured.value.failures[0]
     assert failure.path == replacement
@@ -664,6 +742,58 @@ def test_create_staging_invocation_preserves_replacement_when_setup_cleanup_fail
         replacement.stat().st_ino,
     )
     assert failure.expected_parent_chain
+
+
+def test_create_staging_invocation_preserves_replacement_before_child_fstat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    original_open = os.open
+    original_fstat = os.fstat
+    child_fd: int | None = None
+    replacement: Path | None = None
+
+    def record_child_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal child_fd
+        opened = original_open(path, flags, mode, dir_fd=dir_fd)
+        if dir_fd is not None and isinstance(path, str) and path.startswith("recording-"):
+            child_fd = opened
+        return opened
+
+    def replace_created_directory_then_fstat(file_descriptor: int) -> os.stat_result:
+        nonlocal replacement
+        if replacement is None and file_descriptor == child_fd:
+            assert child_fd is not None
+            child_stat = original_fstat(child_fd)
+            created_name = next(staging_root.iterdir()).name
+            created = staging_root / created_name
+            displaced = staging_root / f"{created_name}.displaced"
+            created.rename(displaced)
+            created.mkdir()
+            replacement = created
+            return child_stat
+        return original_fstat(file_descriptor)
+
+    monkeypatch.setattr(os, "open", record_child_open)
+    monkeypatch.setattr(os, "fstat", replace_created_directory_then_fstat)
+
+    with pytest.raises(OwnedDirectoryCleanupError) as captured:
+        staging_module.create_staging_invocation(staging_root, "recording")
+
+    assert isinstance(captured.value.__cause__, StructuralExtractionError)
+    assert replacement is not None and replacement.is_dir()
+    failure = captured.value.failures[0]
+    assert failure.path == replacement
+    assert (failure.expected_device, failure.expected_inode) != (
+        replacement.stat().st_dev,
+        replacement.stat().st_ino,
+    )
 
 
 def test_duplicate_timestamps_are_disambiguated_and_rollback_is_inode_owned(

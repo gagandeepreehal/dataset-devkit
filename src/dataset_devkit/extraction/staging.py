@@ -21,6 +21,7 @@ from dataset_devkit.identifiers import validate_safe_segment
 from dataset_devkit.publication import (
     OwnedDirectoryAuthority,
     OwnedDirectoryCleanupError,
+    OwnedDirectoryCleanupFailure,
     cleanup_pinned_directory,
 )
 
@@ -167,12 +168,31 @@ def _unlink_if_identity(
         _unlink_relative(directory_fd, filename)
 
 
+def _staging_cleanup_failure(
+    staging_root: Path,
+    directory_name: str,
+    root_chain: tuple[_Identity, ...],
+    root_identity: _Identity,
+    directory_identity: _Identity | None,
+) -> OwnedDirectoryCleanupFailure:
+    expected_device, expected_inode = directory_identity or (-1, -1)
+    return OwnedDirectoryCleanupFailure(
+        staging_root / directory_name,
+        expected_device,
+        expected_inode,
+        root_identity[0],
+        root_identity[1],
+        root_chain,
+    )
+
+
 def create_staging_invocation(staging_root: Path, recording_id: str) -> StagingInvocation:
     """Exclusively create one collision-isolated staging directory."""
     prefix = _recording_slug(recording_id)
     root_fd, root_chain = _open_directory_chain(staging_root, create=True)
     root_identity = _identity(os.fstat(root_fd))
     directory_fd: int | None = None
+    directory_identity: _Identity | None = None
     try:
         while True:
             directory_name = f"{prefix}-{uuid.uuid4().hex}"
@@ -181,41 +201,69 @@ def create_staging_invocation(staging_root: Path, recording_id: str) -> StagingI
                 break
             except FileExistsError:
                 continue
-        directory_fd = os.open(directory_name, _DIRECTORY_FLAGS, dir_fd=root_fd)
-        directory_identity = _identity(os.fstat(directory_fd))
-        authority = OwnedDirectoryAuthority(
-            staging_root / directory_name,
-            staging_root,
-            directory_name,
-            root_chain,
-            root_identity,
-            directory_identity,
-        )
         try:
+            created_stat = os.stat(directory_name, dir_fd=root_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(created_stat.st_mode):
+                raise StructuralExtractionError("new staging invocation is not a directory")
+            directory_identity = _identity(created_stat)
+            authority = OwnedDirectoryAuthority(
+                staging_root / directory_name,
+                staging_root,
+                directory_name,
+                root_chain,
+                root_identity,
+                directory_identity,
+            )
+            directory_fd = os.open(directory_name, _DIRECTORY_FLAGS, dir_fd=root_fd)
+            opened_stat = os.fstat(directory_fd)
             directory_stat = os.stat(directory_name, dir_fd=root_fd, follow_symlinks=False)
             if (
-                not stat.S_ISDIR(directory_stat.st_mode)
+                not stat.S_ISDIR(opened_stat.st_mode)
+                or not stat.S_ISDIR(directory_stat.st_mode)
+                or _identity(opened_stat) != directory_identity
                 or _identity(directory_stat) != directory_identity
             ):
                 raise StructuralExtractionError("new staging invocation identity changed")
             os.fsync(root_fd)
         except Exception as setup_error:
+            cleanup_fd = directory_fd
+            close_cleanup_fd = False
             try:
-                cleaned = cleanup_pinned_directory(
-                    root_fd,
-                    directory_name,
-                    directory_fd,
-                    directory_identity,
-                )
+                if directory_identity is None:
+                    cleaned = False
+                else:
+                    if cleanup_fd is None:
+                        cleanup_fd = os.open(directory_name, _DIRECTORY_FLAGS, dir_fd=root_fd)
+                        close_cleanup_fd = True
+                    cleaned = cleanup_pinned_directory(
+                        root_fd,
+                        directory_name,
+                        cleanup_fd,
+                        directory_identity,
+                    )
             except (OSError, ValueError):
                 cleaned = False
+            finally:
+                if close_cleanup_fd and cleanup_fd is not None:
+                    with suppress(OSError):
+                        os.close(cleanup_fd)
             if not cleaned:
-                raise OwnedDirectoryCleanupError((authority.cleanup_failure(),)) from setup_error
+                failure = _staging_cleanup_failure(
+                    staging_root,
+                    directory_name,
+                    root_chain,
+                    root_identity,
+                    directory_identity,
+                )
+                raise OwnedDirectoryCleanupError((failure,)) from setup_error
             raise
     finally:
         if directory_fd is not None:
-            os.close(directory_fd)
-        os.close(root_fd)
+            with suppress(OSError):
+                os.close(directory_fd)
+        with suppress(OSError):
+            os.close(root_fd)
+    assert directory_identity is not None
     path = staging_root / directory_name
     return StagingInvocation(
         staging_root,
