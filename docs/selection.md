@@ -74,6 +74,8 @@ Rules match computed tags and human labels separately with `required_any_*`, `re
 currently unassigned scenes are ranked by SHA-256 over canonical JSON containing the integer seed,
 rule index/name, scene token, and source fingerprint. Ranking does not use Python hashing, random
 state, input order, filesystem paths, or time.
+Each optional rule filter is compiled once per selection/validation call and reused across all of
+that rule's candidate evaluations.
 
 Each rule selects exactly `quota`. Under the default `strict_quotas: true`, a deficit raises
 `ScenarioQuotaError` with eligible, selected, deficit, and partial deterministic rule audit. A zero

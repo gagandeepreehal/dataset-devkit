@@ -11,7 +11,9 @@ Start with [`examples/dataset_config.json`](../examples/dataset_config.json) and
 validation.
 
 JSON Schema 2020-12 directly enforces Task 6 constraints that it can represent, including the rule
-that `reference_camera_policy: "require"` needs a non-null `reference_camera_channel`. Standard
+that `reference_camera_policy: "require"` needs a non-null `reference_camera_channel`, each
+per-channel coverage value is a finite ratio in `[0, 1]`, and predicate/blacklist items and scenario
+rule names are nonblank with no leading or trailing whitespace (internal spaces are allowed). Standard
 JSON Schema cannot compare arbitrary numeric sibling values, compare matching values in two maps,
 prove arbitrary predicate arrays disjoint, or require unique nested rule names. Each affected
 definition therefore carries deterministic `x-dataset-devkit-runtime-constraints` entries with the

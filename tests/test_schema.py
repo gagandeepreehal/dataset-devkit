@@ -9,7 +9,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from dataset_devkit.config import GlobalConfig, TagsConfig
+from dataset_devkit.config import GlobalConfig, TagsConfig, load_config
 from dataset_devkit.schema import validate_config_schema_and_runtime
 from test_config import minimal_config
 
@@ -260,3 +260,104 @@ def test_combined_schema_and_runtime_validator_is_public_and_authoritative(
     invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
     with pytest.raises(ValidationError, match="min_distance_m"):
         validate_config_schema_and_runtime(invalid_path)
+
+
+@pytest.mark.parametrize("location", ["global", "rule"])
+@pytest.mark.parametrize(
+    "field", ["min_camera_coverage_by_channel", "max_camera_coverage_by_channel"]
+)
+@pytest.mark.parametrize("value", [-1e-12, 1.000000000001])
+def test_per_channel_ratio_bounds_have_schema_and_runtime_parity(
+    tmp_path: Path, location: str, field: str, value: float
+) -> None:
+    data = minimal_config()
+    if location == "global":
+        data["filters"] = {field: {"front": value}}
+    else:
+        data["scenarios"] = {
+            "seed": 1,
+            "rules": [
+                {"name": "Internal Space", "quota": 0, "filters": {field: {"front": value}}}
+            ],
+        }
+
+    assert _schema_errors(data)
+    path = tmp_path / f"{location}-{field}.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_task6_string_item_and_name_schema_constraints_cover_every_field() -> None:
+    definitions = GlobalConfig.model_json_schema()["$defs"]
+    filters = definitions["FiltersConfig"]["properties"]
+    for field in (
+        "required_any_tags",
+        "required_all_tags",
+        "excluded_tags",
+        "required_any_labels",
+        "required_all_labels",
+        "excluded_labels",
+        "blacklisted_scene_tokens",
+        "blacklisted_source_digests",
+        "blacklisted_blob_paths",
+    ):
+        assert filters[field]["items"]["minLength"] == 1
+        assert filters[field]["items"]["pattern"]
+    rule = definitions["ScenarioRuleConfig"]["properties"]
+    assert rule["name"]["minLength"] == 1
+    assert rule["name"]["pattern"]
+    for field in (
+        "required_any_tags",
+        "required_all_tags",
+        "excluded_tags",
+        "required_any_labels",
+        "required_all_labels",
+        "excluded_labels",
+    ):
+        assert rule[field]["items"]["minLength"] == 1
+        assert rule[field]["items"]["pattern"]
+
+
+@pytest.mark.parametrize("value", ["", "   ", " leading", "trailing "])
+@pytest.mark.parametrize(
+    ("location", "field"),
+    [
+        ("filters", "required_all_tags"),
+        ("filters", "required_all_labels"),
+        ("filters", "blacklisted_scene_tokens"),
+        ("filters", "blacklisted_source_digests"),
+        ("filters", "blacklisted_blob_paths"),
+        ("rule", "required_all_tags"),
+        ("rule", "required_all_labels"),
+        ("rule", "name"),
+    ],
+)
+def test_task6_trimmed_nonblank_strings_have_schema_and_load_parity(
+    tmp_path: Path, location: str, field: str, value: str
+) -> None:
+    data = minimal_config()
+    if location == "filters":
+        data["filters"] = {field: [value]}
+    else:
+        rule: dict[str, object] = {"name": "Valid Name", "quota": 0}
+        rule[field] = value if field == "name" else [value]
+        data["scenarios"] = {"seed": 1, "rules": [rule]}
+
+    assert _schema_errors(data)
+    path = tmp_path / f"{location}-{field}-{len(value)}.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_internal_space_scenario_name_passes_schema_and_runtime(tmp_path: Path) -> None:
+    data = minimal_config()
+    data["scenarios"] = {
+        "seed": 1,
+        "rules": [{"name": "Left Turn Urban", "quota": 0}],
+    }
+    assert not _schema_errors(data)
+    path = tmp_path / "internal-space.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert load_config(path).scenarios.rules[0].name == "Left Turn Urban"

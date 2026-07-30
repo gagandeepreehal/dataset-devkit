@@ -131,11 +131,16 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     return first == second or first in second.parents or second in first.parents
 
 
-def _validate_tag_list(values: list[str]) -> list[str]:
-    if any(not value.strip() or value != value.strip() for value in values):
-        raise ValueError("tags must be nonempty and have no surrounding whitespace")
+TrimmedNonBlankString = Annotated[
+    str,
+    Field(min_length=1, pattern=r"^\S(?:[\s\S]*\S)?$"),
+]
+Ratio = Annotated[float, Field(ge=0, le=1)]
+
+
+def _validate_unique_strings(values: list[str]) -> list[str]:
     if len(values) != len(set(values)):
-        raise ValueError("tags must be unique")
+        raise ValueError("values must be unique")
     return values
 
 
@@ -494,40 +499,40 @@ class FiltersConfig(StrictModel):
     max_source_gnss_valid_ratio: float | None = Field(default=None, ge=0, le=1)
     min_camera_coverage_ratio: float | None = Field(default=None, ge=0, le=1)
     max_camera_coverage_ratio: float | None = Field(default=None, ge=0, le=1)
-    min_camera_coverage_by_channel: dict[SafeSegment, float] = Field(
+    min_camera_coverage_by_channel: dict[SafeSegment, Ratio] = Field(
         default_factory=dict, json_schema_extra={"additionalProperties": False}
     )
-    max_camera_coverage_by_channel: dict[SafeSegment, float] = Field(
+    max_camera_coverage_by_channel: dict[SafeSegment, Ratio] = Field(
         default_factory=dict, json_schema_extra={"additionalProperties": False}
     )
     max_sync_error_ms: float | None = Field(default=None, ge=0)
     min_distance_m: float | None = Field(default=None, ge=0)
     max_distance_m: float | None = Field(default=None, ge=0)
-    required_any_tags: list[str] = Field(
+    required_any_tags: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    required_all_tags: list[str] = Field(
+    required_all_tags: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    excluded_tags: list[str] = Field(
+    excluded_tags: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    required_any_labels: list[str] = Field(
+    required_any_labels: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    required_all_labels: list[str] = Field(
+    required_all_labels: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    excluded_labels: list[str] = Field(
+    excluded_labels: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    blacklisted_scene_tokens: list[str] = Field(
+    blacklisted_scene_tokens: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    blacklisted_source_digests: list[str] = Field(
+    blacklisted_source_digests: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    blacklisted_blob_paths: list[str] = Field(
+    blacklisted_blob_paths: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
 
@@ -544,11 +549,13 @@ class FiltersConfig(StrictModel):
     )
     @classmethod
     def validate_string_lists(cls, values: list[str]) -> list[str]:
-        return _validate_tag_list(values)
+        return _validate_unique_strings(values)
 
     @field_validator("min_camera_coverage_by_channel", "max_camera_coverage_by_channel")
     @classmethod
-    def validate_channel_ratios(cls, values: dict[SafeSegment, float]) -> dict[SafeSegment, float]:
+    def validate_channel_ratios(
+        cls, values: dict[SafeSegment, Ratio]
+    ) -> dict[SafeSegment, Ratio]:
         if any(not math.isfinite(value) or not 0 <= value <= 1 for value in values.values()):
             raise ValueError("per-channel camera coverage ratios must be finite in [0, 1]")
         return values
@@ -604,34 +611,27 @@ class ScenarioRuleConfig(StrictModel):
             ]
         }
     )
-    name: str = Field(min_length=1)
+    name: TrimmedNonBlankString
     quota: int = Field(ge=0)
-    required_any_tags: list[str] = Field(
+    required_any_tags: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    required_all_tags: list[str] = Field(
+    required_all_tags: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    excluded_tags: list[str] = Field(
+    excluded_tags: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    required_any_labels: list[str] = Field(
+    required_any_labels: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    required_all_labels: list[str] = Field(
+    required_all_labels: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    excluded_labels: list[str] = Field(
+    excluded_labels: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
     filters: FiltersConfig | None = None
-
-    @field_validator("name")
-    @classmethod
-    def validate_rule_name(cls, value: str) -> str:
-        if not value.strip() or value != value.strip():
-            raise ValueError("rule name must be nonblank with no surrounding whitespace")
-        return value
 
     @field_validator(
         "required_any_tags",
@@ -643,7 +643,7 @@ class ScenarioRuleConfig(StrictModel):
     )
     @classmethod
     def validate_tags(cls, values: list[str]) -> list[str]:
-        return _validate_tag_list(values)
+        return _validate_unique_strings(values)
 
     @model_validator(mode="after")
     def validate_tag_sets_do_not_overlap(self) -> ScenarioRuleConfig:

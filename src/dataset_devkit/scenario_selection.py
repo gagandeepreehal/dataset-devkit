@@ -7,9 +7,9 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from typing import Literal, Protocol
 
+import dataset_devkit.filtering as filtering_module
 from dataset_devkit.config import ScenarioRuleConfig, ScenariosConfig
 from dataset_devkit.features import SceneFeatures
-from dataset_devkit.filtering import filter_scenes
 from dataset_devkit.provenance import canonical_hash, canonical_json
 
 
@@ -97,6 +97,15 @@ def validate_scenario_selection(
     config: ScenariosConfig,
 ) -> None:
     """Recompute and validate the complete immutable selection contract."""
+    _validate_scenario_selection(result, features, config, _compile_rule_filters(config))
+
+
+def _validate_scenario_selection(
+    result: ScenarioSelectionResult,
+    features: tuple[SceneFeatures, ...] | list[SceneFeatures],
+    config: ScenariosConfig,
+    compiled_rule_filters: tuple[filtering_module._CompiledFilter | None, ...],
+) -> None:
     accepted = {_identity(feature): feature for feature in features}
     if len(accepted) != len(features):
         raise ValueError("scenario input contains duplicate scene/source identities")
@@ -118,8 +127,14 @@ def validate_scenario_selection(
     expected_selected: list[SceneFeatures] = []
     expected_audits: list[RuleAudit] = []
     matching_names: dict[tuple[str, str], list[str]] = {key: [] for key in accepted}
-    for rule_index, rule in enumerate(config.rules):
-        matched = tuple(feature for feature in ordered_features if _matches(feature, rule))
+    for rule_index, (rule, compiled_filter) in enumerate(
+        zip(config.rules, compiled_rule_filters, strict=True)
+    ):
+        matched = tuple(
+            feature
+            for feature in ordered_features
+            if _matches(feature, rule, compiled_filter)
+        )
         for feature in matched:
             matching_names[_identity(feature)].append(rule.name)
         all_ranked = tuple(
@@ -199,7 +214,11 @@ def validate_scenario_selection(
         raise ValueError("scenario unselected quota/no-match partition differs")
 
 
-def _matches(feature: SceneFeatures, rule: ScenarioRuleConfig) -> bool:
+def _matches(
+    feature: SceneFeatures,
+    rule: ScenarioRuleConfig,
+    compiled_filter: filtering_module._CompiledFilter | None,
+) -> bool:
     tags = set(feature.computed_tags)
     labels = set(feature.human_labels)
     for kind, present in (("tags", tags), ("labels", labels)):
@@ -210,7 +229,20 @@ def _matches(feature: SceneFeatures, rule: ScenarioRuleConfig) -> bool:
             return False
         if not required_all <= present or excluded & present:
             return False
-    return rule.filters is None or bool(filter_scenes((feature,), rule.filters).accepted)
+    return (
+        rule.filters is None
+        or compiled_filter is not None
+        and not filtering_module._evaluate(feature, rule.filters, compiled_filter)
+    )
+
+
+def _compile_rule_filters(
+    config: ScenariosConfig,
+) -> tuple[filtering_module._CompiledFilter | None, ...]:
+    return tuple(
+        None if rule.filters is None else filtering_module._compile_filter(rule.filters)
+        for rule in config.rules
+    )
 
 
 def _identity(feature: SceneFeatures) -> tuple[str, str]:
@@ -291,14 +323,21 @@ def select_scenarios(
     by_identity = {_identity(feature): feature for feature in features}
     if len(by_identity) != len(features):
         raise ValueError("scenario input contains duplicate scene/source identities")
+    compiled_rule_filters = _compile_rule_filters(config)
     ordered_features = tuple(by_identity[key] for key in sorted(by_identity))
     assigned: set[tuple[str, str]] = set()
     assignments: list[ScenarioAssignment] = []
     selected_features: list[SceneFeatures] = []
     audits: list[RuleAudit] = []
     matching_names: dict[tuple[str, str], list[str]] = {key: [] for key in by_identity}
-    for rule_index, rule in enumerate(config.rules):
-        matched = tuple(feature for feature in ordered_features if _matches(feature, rule))
+    for rule_index, (rule, compiled_filter) in enumerate(
+        zip(config.rules, compiled_rule_filters, strict=True)
+    ):
+        matched = tuple(
+            feature
+            for feature in ordered_features
+            if _matches(feature, rule, compiled_filter)
+        )
         for feature in matched:
             matching_names[_identity(feature)].append(rule.name)
         all_ranked = tuple(
@@ -381,5 +420,5 @@ def select_scenarios(
         _candidate_fingerprint(features),
         config.strict_quotas,
     )
-    validate_scenario_selection(result, features, config)
+    _validate_scenario_selection(result, features, config, compiled_rule_filters)
     return result

@@ -114,6 +114,39 @@ def test_candidate_fingerprint_streams_each_many_candidate_record_once(
     assert visits == 2 * len(features)
 
 
+def test_optional_rule_filter_compiles_once_for_entire_selection_call(
+    feature_factory: FeatureFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    features = tuple(
+        feature_factory(scene_token=f"scene-{index:03d}", computed_tags=("moving",))
+        for index in range(100)
+    )
+    config = ScenariosConfig(
+        seed=8,
+        rules=[
+            ScenarioRuleConfig(
+                name="Moving Filtered",
+                quota=1,
+                required_all_tags=["moving"],
+                filters=FiltersConfig(min_distance_m=0.0),
+            )
+        ],
+    )
+    calls = 0
+    original = filtering_module._compile_filter
+
+    def counted_compile(filters: FiltersConfig):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return original(filters)
+
+    monkeypatch.setattr(filtering_module, "_compile_filter", counted_compile)
+    result = select_scenarios(features, config)
+
+    assert len(result.selected_scenes) == 1
+    assert calls == 1
+
+
 def test_strict_exact_quota_deficit_has_deterministic_partial_audit(
     feature_factory: FeatureFactory,
 ) -> None:

@@ -104,6 +104,8 @@
       "properties": {
         "blacklisted_blob_paths": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Blacklisted Blob Paths",
@@ -112,6 +114,8 @@
         },
         "blacklisted_scene_tokens": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Blacklisted Scene Tokens",
@@ -120,6 +124,8 @@
         },
         "blacklisted_source_digests": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Blacklisted Source Digests",
@@ -128,6 +134,8 @@
         },
         "excluded_labels": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Excluded Labels",
@@ -136,6 +144,8 @@
         },
         "excluded_tags": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Excluded Tags",
@@ -146,6 +156,8 @@
           "additionalProperties": false,
           "patternProperties": {
             "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$": {
+              "maximum": 1,
+              "minimum": 0,
               "type": "number"
             }
           },
@@ -240,6 +252,8 @@
           "additionalProperties": false,
           "patternProperties": {
             "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$": {
+              "maximum": 1,
+              "minimum": 0,
               "type": "number"
             }
           },
@@ -319,6 +333,8 @@
         },
         "required_all_labels": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Required All Labels",
@@ -327,6 +343,8 @@
         },
         "required_all_tags": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Required All Tags",
@@ -335,6 +353,8 @@
         },
         "required_any_labels": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Required Any Labels",
@@ -343,6 +363,8 @@
         },
         "required_any_tags": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Required Any Tags",
@@ -674,6 +696,8 @@
       "properties": {
         "excluded_labels": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Excluded Labels",
@@ -682,6 +706,8 @@
         },
         "excluded_tags": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Excluded Tags",
@@ -701,6 +727,7 @@
         },
         "name": {
           "minLength": 1,
+          "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
           "title": "Name",
           "type": "string"
         },
@@ -711,6 +738,8 @@
         },
         "required_all_labels": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Required All Labels",
@@ -719,6 +748,8 @@
         },
         "required_all_tags": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Required All Tags",
@@ -727,6 +758,8 @@
         },
         "required_any_labels": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Required Any Labels",
@@ -735,6 +768,8 @@
         },
         "required_any_tags": {
           "items": {
+            "minLength": 1,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
           "title": "Required Any Tags",
