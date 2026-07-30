@@ -47,6 +47,13 @@ rename. Existing final dataroots are never overwritten. An invocation-owned stag
 removed after an ordinary failure; if identity-safe cleanup cannot be proven, it is deliberately
 left for operator recovery instead of deleting an ambiguous path.
 
+Published dataroots are read-only artifacts: use `validate`, `inspect`, or the read-only `Dataset`
+SDK, and rebuild into an absent destination instead of editing a published tree. Publication
+detects accidental or cooperative concurrent mutation and identity/path substitution, but it is
+not an isolation boundary against a non-cooperating process running as the same user. See the
+[publication threat model](docs/export.md#publication-threat-model-and-read-only-contract) for the
+exact guarantees and deployment requirements for untrusted writers.
+
 The secure cache backend is supported on POSIX platforms only. It requires POSIX file locks and
 descriptor-relative, no-follow filesystem operations; Windows is not a supported runtime.
 

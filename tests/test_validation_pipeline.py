@@ -605,7 +605,9 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     first_cached = extraction_cache.load(source, extraction_hash, recording)
     assert first_cached is not None
     first_cache_identity = first_cached.samples[0].staged_image.path.stat().st_ino
-    archived = tmp_path / "first-published"
+    # A sealed dataroot is read/execute-only; same-parent rename avoids changing
+    # its POSIX `..` entry while preserving the first result for comparison.
+    archived = first.dataroot.with_name("first-published")
     first.dataroot.rename(archived)
     second = build_dataset(config, runtime=runtime)
 
@@ -619,7 +621,7 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     assert second_cached is not None
     assert second_cached.samples[0].staged_image.path.stat().st_ino == first_cache_identity
 
-    second.dataroot.rename(tmp_path / "second-published")
+    second.dataroot.rename(second.dataroot.with_name("second-published"))
     acquirer.completed.clear()
     third = build_dataset(config, runtime=runtime)
     refreshed = extraction_cache.load(source, extraction_hash, recording)

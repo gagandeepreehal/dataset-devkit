@@ -67,6 +67,31 @@ renamed atomically from its sibling directory. `publication.version` must be
 `95` in the v1 contract. Existing destinations, symlinks, and unsafe directory replacements are
 rejected rather than overwritten.
 
+### Publication threat model and read-only contract
+
+A published dataroot is a read-only artifact. Before final verification and rename, the publisher
+sets every regular file to owner-read-only mode `0400` and every directory to owner-read/execute
+mode `0500`. Supported consumers use `validate`, `inspect`, or the read-only `Dataset` SDK; there
+is no supported in-place update operation. Changing a published file makes its content manifest
+invalid. To change dataset content, run a new build into an absent final destination rather than
+editing or replacing the existing tree.
+
+Publication is designed to fail closed against accidental mutation and cooperative concurrent
+writers. It pins directory and file identities with no-follow descriptors, rejects path, inode,
+hard-link, and symlink substitution, and hashes the complete tree with descriptor use bounded by
+tree depth while comparing each opened file before and after its read. It also rechecks the
+authorized manifest around flushing and immediately after the final rename. A content or metadata
+change observed during those checks prevents publication. If the post-rename check fails, the
+publisher moves the same identity-bound tree out of the final name.
+An existing final path is never overwritten.
+
+These checks and read-only permissions are integrity safeguards, not a security boundary against
+a non-cooperating same-UID actor. Such an actor can reverse the publisher's `chmod`, retain
+writable descriptors, or ignore advisory `flock` coordination, and is outside the supported threat
+model. If writers are not trusted to cooperate, run the pipeline under a dedicated UID with private
+directories, or publish through filesystem snapshots or storage that enforces immutability
+independently of the producing process.
+
 Run validation and deterministic read-only inspection with:
 
 ```bash

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import stat
 import sys
+import threading
 import uuid
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from ctypes import CDLL, c_char_p, c_int, get_errno
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -69,6 +72,8 @@ class StagingLease:
     parent_identity: tuple[int, int]
     root_identity: tuple[int, int]
     _closed: bool = False
+    _guard_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    _guard_depth: int = field(default=0, repr=False)
 
     @classmethod
     def create(cls, output: str | Path, prefix: str) -> StagingLease:
@@ -123,15 +128,34 @@ class StagingLease:
         self.assert_bound()
         return os.dup(self._root_fd)
 
+    @contextmanager
+    def mutation_guard(self, *, require_bound: bool = True) -> Iterator[None]:
+        """Serialize cooperative staging mutations and publication sealing."""
+        with self._guard_lock:
+            if self._guard_depth == 0:
+                if require_bound:
+                    self.assert_bound()
+                elif self._closed:
+                    raise ValueError("staging lease is closed")
+                fcntl.flock(self._root_fd, fcntl.LOCK_EX)
+            self._guard_depth += 1
+            try:
+                yield
+            finally:
+                self._guard_depth -= 1
+                if self._guard_depth == 0:
+                    fcntl.flock(self._root_fd, fcntl.LOCK_UN)
+
     def cleanup(self) -> bool:
         """Boundedly clean this invocation through retained authoritative descriptors."""
         try:
-            return cleanup_pinned_directory(
-                self._parent_fd,
-                self.name,
-                self._root_fd,
-                self.root_identity,
-            )
+            with self.mutation_guard(require_bound=False):
+                return cleanup_pinned_directory(
+                    self._parent_fd,
+                    self.name,
+                    self._root_fd,
+                    self.root_identity,
+                )
         except (OSError, ValueError):
             return False
 
@@ -142,96 +166,112 @@ class StagingLease:
             self._closed = True
 
 
-def _open_tree_snapshot(
+def _hash_directory_fd(
     directory_fd: int,
-    *,
     prefix: str,
-    files: list[tuple[str, str, int, int, os.stat_result, os.stat_result]],
-    directories: list[tuple[str, str, int, int, os.stat_result, os.stat_result]],
+    excluded: frozenset[str],
+    entries: dict[str, tuple[int, str]],
 ) -> None:
+    import hashlib
+
+    directory_before = os.fstat(directory_fd)
     for name in sorted(os.listdir(directory_fd)):
         relative = f"{prefix}/{name}" if prefix else name
         listed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISDIR(listed.st_mode):
             child = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
-            opened = os.fstat(child)
-            if _identity(opened) != _identity(listed):
+            try:
+                opened = os.fstat(child)
+                if _stable_identity(opened) != _stable_identity(listed):
+                    raise ValueError(f"directory changed while walking: {relative}")
+                _hash_directory_fd(child, relative, excluded, entries)
+                after = os.fstat(child)
+                relisted = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not (
+                    _stable_identity(listed)
+                    == _stable_identity(opened)
+                    == _stable_identity(after)
+                    == _stable_identity(relisted)
+                ):
+                    raise ValueError(f"directory changed while walking: {relative}")
+            finally:
                 os.close(child)
-                raise ValueError(f"directory changed while walking: {relative}")
-            directories.append((relative, name, directory_fd, child, listed, opened))
-            _open_tree_snapshot(
-                child,
-                prefix=relative,
-                files=files,
-                directories=directories,
-            )
         elif stat.S_ISREG(listed.st_mode) and listed.st_nlink == 1:
             descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_fd)
-            opened = os.fstat(descriptor)
-            if _stable_identity(opened) != _stable_identity(listed):
+            try:
+                opened = os.fstat(descriptor)
+                digest = hashlib.sha256()
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    digest.update(chunk)
+                after = os.fstat(descriptor)
+                relisted = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            finally:
                 os.close(descriptor)
+            if not (
+                _stable_identity(listed)
+                == _stable_identity(opened)
+                == _stable_identity(after)
+                == _stable_identity(relisted)
+            ):
                 raise ValueError(f"path changed while hashing: {relative}")
-            files.append((relative, name, directory_fd, descriptor, listed, opened))
+            if relative not in excluded:
+                entries[relative] = (opened.st_size, digest.hexdigest())
         else:
             raise ValueError(f"symlink or unsafe hardlink: {relative}")
+    directory_after = os.fstat(directory_fd)
+    if _stable_identity(directory_before) != _stable_identity(directory_after):
+        raise ValueError(f"directory changed while walking: {prefix or '.'}")
 
 
 def hash_regular_files_fd(
     root_fd: int, *, excluded: frozenset[str] = frozenset()
 ) -> dict[str, tuple[int, str]]:
-    """Hash one whole pinned-tree snapshot, retaining every descriptor until recheck."""
-    import hashlib
-
-    root_before = os.fstat(root_fd)
-    files: list[tuple[str, str, int, int, os.stat_result, os.stat_result]] = []
-    directories: list[tuple[str, str, int, int, os.stat_result, os.stat_result]] = []
+    """Hash a pinned tree with descriptors bounded by tree depth plus one file."""
     entries: dict[str, tuple[int, str]] = {}
-    try:
-        _open_tree_snapshot(
-            root_fd,
-            prefix="",
-            files=files,
-            directories=directories,
-        )
-        for relative, _, _, descriptor, _, opened in files:
-            digest = hashlib.sha256()
-            while chunk := os.read(descriptor, 1024 * 1024):
-                digest.update(chunk)
-            if relative not in excluded:
-                entries[relative] = (opened.st_size, digest.hexdigest())
+    _hash_directory_fd(root_fd, "", excluded, entries)
+    return entries
 
-        for relative, name, parent_fd, descriptor, listed, opened in files:
-            after = os.fstat(descriptor)
-            relisted = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if not (
-                _stable_identity(listed)
-                == _stable_identity(opened)
-                == _stable_identity(after)
-                == _stable_identity(relisted)
-            ):
-                raise ValueError(f"path changed while hashing: {relative}")
-        for relative, name, parent_fd, descriptor, listed, opened in reversed(directories):
-            after = os.fstat(descriptor)
-            relisted = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if not (
-                _stable_identity(listed)
-                == _stable_identity(opened)
-                == _stable_identity(after)
-                == _stable_identity(relisted)
-            ):
-                raise ValueError(f"directory changed while walking: {relative}")
-        if _stable_identity(root_before) != _stable_identity(os.fstat(root_fd)):
-            raise ValueError("directory changed while walking: .")
-        return entries
-    finally:
-        for _, _, _, descriptor, _, _ in files:
-            os.close(descriptor)
-        for _, _, _, descriptor, _, _ in reversed(directories):
-            os.close(descriptor)
+
+def _seal_tree_fd(directory_fd: int) -> None:
+    """Remove write permission from one invocation-owned tree without path following."""
+    for name in sorted(os.listdir(directory_fd)):
+        listed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(listed.st_mode):
+            child = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            try:
+                if _identity(os.fstat(child)) != _identity(listed):
+                    raise ValueError("staging directory changed while sealing")
+                _seal_tree_fd(child)
+                os.fchmod(child, 0o500)
+                relisted = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if _identity(os.fstat(child)) != _identity(relisted):
+                    raise ValueError("staging directory changed while sealing")
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(listed.st_mode) and listed.st_nlink == 1:
+            descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_fd)
+            try:
+                if _identity(os.fstat(descriptor)) != _identity(listed):
+                    raise ValueError("staging file changed while sealing")
+                os.fchmod(descriptor, 0o400)
+                after = os.fstat(descriptor)
+                relisted = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(after.st_mode)
+                    or after.st_nlink != 1
+                    or _identity(after) != _identity(relisted)
+                ):
+                    raise ValueError("staging file changed while sealing")
+            finally:
+                os.close(descriptor)
+        else:
+            raise ValueError("staging contains a symlink or unsafe hardlink")
+    os.fchmod(directory_fd, 0o500)
 
 
 def _cleanup_contents_fd(directory_fd: int) -> None:
     """Recursively remove entries below one already-open authoritative directory."""
+    os.fchmod(directory_fd, 0o700)
     for name in sorted(os.listdir(directory_fd)):
         listed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         identity = _identity(listed)
@@ -240,6 +280,7 @@ def _cleanup_contents_fd(directory_fd: int) -> None:
             try:
                 if _identity(os.fstat(child)) != identity:
                     raise ValueError("cleanup child identity changed")
+                os.fchmod(child, 0o700)
                 _cleanup_contents_fd(child)
                 current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 if stat.S_ISDIR(current.st_mode) and _identity(current) == identity:
@@ -389,7 +430,7 @@ def fsync_tree(root: Path, *, expected_identity: tuple[int, int] | None = None) 
         os.close(descriptor)
 
 
-def publish_staging(
+def _publish_staging_locked(
     staging: str | Path | StagingLease,
     final: str | Path,
     *,
@@ -436,6 +477,7 @@ def publish_staging(
 
             if expected_content_hash is None:
                 raise ValueError("leased publication requires an expected content hash")
+            _seal_tree_fd(lease._root_fd)
             verify_publication_manifest(lease, expected_content_hash)
             _fsync_tree_fd(lease._root_fd)
             verify_publication_manifest(lease, expected_content_hash)
@@ -472,3 +514,27 @@ def publish_staging(
     finally:
         os.close(parent_fd)
     return destination
+
+
+def publish_staging(
+    staging: str | Path | StagingLease,
+    final: str | Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+    expected_content_hash: str | None = None,
+) -> Path:
+    """Seal and atomically publish staging under its cooperative mutation guard."""
+    if isinstance(staging, StagingLease):
+        with staging.mutation_guard():
+            return _publish_staging_locked(
+                staging,
+                final,
+                expected_identity=expected_identity,
+                expected_content_hash=expected_content_hash,
+            )
+    return _publish_staging_locked(
+        staging,
+        final,
+        expected_identity=expected_identity,
+        expected_content_hash=expected_content_hash,
+    )

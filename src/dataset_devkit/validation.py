@@ -2309,7 +2309,7 @@ def _atomic_json(
         os.close(directory_fd)
 
 
-def finalize_dataset(
+def _finalize_dataset_locked(
     dataroot: str | Path,
     version: str = NUSCENES_VERSION,
     *,
@@ -2368,3 +2368,27 @@ def finalize_dataset(
         )
         raise DatasetValidationError(failed)
     return final
+
+
+def finalize_dataset(
+    dataroot: str | Path,
+    version: str = NUSCENES_VERSION,
+    *,
+    official_smoke: bool = True,
+    lease: StagingLease | None = None,
+) -> ValidationReport:
+    """Finalize staging while excluding cooperative concurrent mutation."""
+    if lease is not None:
+        with lease.mutation_guard():
+            return _finalize_dataset_locked(
+                dataroot,
+                version,
+                official_smoke=official_smoke,
+                lease=lease,
+            )
+    return _finalize_dataset_locked(
+        dataroot,
+        version,
+        official_smoke=official_smoke,
+        lease=None,
+    )

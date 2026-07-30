@@ -8,7 +8,7 @@ import os
 import stat
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from contextlib import AbstractContextManager, suppress
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from io import BytesIO
 from pathlib import Path
@@ -105,6 +105,7 @@ class _SafeDatarootWriter:
     def __init__(self, root: str | Path, *, lease: StagingLease | None = None) -> None:
         self.root = Path(root).absolute()
         self._lease = lease
+        self._guard_context: AbstractContextManager[None] | None = None
         if lease is not None:
             if self.root != lease.root:
                 raise ValueError("staging writer root differs from staging lease")
@@ -128,6 +129,14 @@ class _SafeDatarootWriter:
             self.close()
             raise FileExistsError("staging dataroot must be empty; refusing overwrite")
         self._root_identity = _identity(os.fstat(self._root_fd))
+        if lease is not None:
+            guard_context = lease.mutation_guard()
+            try:
+                guard_context.__enter__()
+            except Exception:
+                self.close()
+                raise
+            self._guard_context = guard_context
 
     def __enter__(self) -> _SafeDatarootWriter:
         return self
@@ -139,6 +148,9 @@ class _SafeDatarootWriter:
         if not self._closed:
             os.close(self._root_fd)
             self._closed = True
+            if self._guard_context is not None:
+                self._guard_context.__exit__(None, None, None)
+                self._guard_context = None
 
     def _assert_root_unchanged(self) -> None:
         if self._closed:

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import os
+import resource
+import stat
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -149,41 +154,130 @@ def test_hash_walker_rejects_same_size_rewrite_during_read(
         os.close(root_fd)
 
 
-def test_hash_snapshot_rejects_rewrite_of_earlier_file_while_later_file_is_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_hash_walker_uses_bounded_descriptors_under_low_nofile_limit(
+    tmp_path: Path,
 ) -> None:
+    if not hasattr(resource, "RLIMIT_NOFILE"):
+        pytest.skip("platform has no RLIMIT_NOFILE")
     root = tmp_path / "root"
     root.mkdir()
-    earlier = root / "a.bin"
-    later = root / "b.bin"
-    earlier.write_bytes(b"a" * (2 * 1024 * 1024))
-    later.write_bytes(b"b" * (2 * 1024 * 1024))
-    earlier_identity = (earlier.stat().st_dev, earlier.stat().st_ino)
+    for index in range(96):
+        (root / f"{index:03d}.bin").write_bytes(str(index).encode())
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    original_read = os.read
-    rewritten = False
-
-    def racing_read(descriptor: int, size: int) -> bytes:
-        nonlocal rewritten
-        chunk = original_read(descriptor, size)
-        current = os.fstat(descriptor)
-        if chunk and not rewritten and (current.st_dev, current.st_ino) != earlier_identity:
-            rewritten = True
-            writer = os.open(earlier, os.O_WRONLY)
-            try:
-                os.pwrite(writer, b"z", 0)
-                os.fsync(writer)
-            finally:
-                os.close(writer)
-        return chunk
-
-    monkeypatch.setattr("dataset_devkit.publication.os.read", racing_read)
-    try:
-        with pytest.raises(ValueError, match="changed while hashing: a.bin"):
-            hash_regular_files_fd(root_fd)
-        assert rewritten
-    finally:
+    original_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    soft, hard = original_limit
+    limited_soft = 64 if soft == resource.RLIM_INFINITY else min(soft, 64)
+    if limited_soft < 16:
         os.close(root_fd)
+        pytest.skip("existing file-descriptor limit is too low for the regression")
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limited_soft, hard))
+        entries = hash_regular_files_fd(root_fd)
+        assert len(entries) == 96
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, original_limit)
+        os.close(root_fd)
+
+
+def test_staging_mutation_guard_serializes_cooperative_writers(tmp_path: Path) -> None:
+    lease = StagingLease.create(tmp_path / "output", ".dataset.staging-")
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def first_writer() -> None:
+        with lease.mutation_guard():
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+
+    def second_writer() -> None:
+        with lease.mutation_guard():
+            second_entered.set()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(first_writer)
+            assert first_entered.wait(timeout=5)
+            second = pool.submit(second_writer)
+            assert not second_entered.wait(timeout=0.1)
+            release_first.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+        assert second_entered.is_set()
+    finally:
+        lease.cleanup()
+        lease.close()
+
+
+def test_staging_mutation_guard_serializes_independent_directory_lock(
+    tmp_path: Path,
+) -> None:
+    lease = StagingLease.create(tmp_path / "output", ".dataset.staging-")
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def lease_writer() -> None:
+        with lease.mutation_guard():
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+
+    def independent_writer() -> None:
+        descriptor = os.open(lease.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            second_entered.set()
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(lease_writer)
+            assert first_entered.wait(timeout=5)
+            second = pool.submit(independent_writer)
+            assert not second_entered.wait(timeout=0.1)
+            release_first.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+        assert second_entered.is_set()
+    finally:
+        lease.cleanup()
+        lease.close()
+
+
+def test_publication_seal_denies_ordinary_same_size_rewrite(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    feature_factory: FeatureFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, content_hash = _finalized_lease(tmp_path, config_factory, feature_factory)
+    final = lease.parent / "v1.0-trainval"
+    target = lease.root / "mz_extensions/tags.json"
+    from dataset_devkit import validation as validation_module
+
+    original_verify = validation_module.verify_publication_manifest
+    attempted = False
+
+    def attempt_rewrite(sealed_lease: StagingLease, expected_hash: str) -> None:
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            with pytest.raises(PermissionError):
+                os.open(target, os.O_WRONLY)
+        original_verify(sealed_lease, expected_hash)
+
+    monkeypatch.setattr(validation_module, "verify_publication_manifest", attempt_rewrite)
+    try:
+        assert publish_staging(
+            lease, final, expected_content_hash=content_hash
+        ) == final
+        assert attempted
+        assert stat.S_IMODE((final / "mz_extensions/tags.json").stat().st_mode) == 0o400
+        assert stat.S_IMODE((final / "mz_extensions").stat().st_mode) == 0o500
+    finally:
+        lease.close()
 
 
 def test_post_rename_rewrite_is_rejected_and_final_name_is_rolled_back(
@@ -203,6 +297,7 @@ def test_post_rename_rewrite_is_rejected_and_final_name_is_rolled_back(
         if destination != final.name:
             return
         target = final / "mz_extensions/tags.json"
+        target.chmod(0o600)
         original = target.read_bytes()
         changed = bytes([original[0] ^ 1]) + original[1:]
         assert len(changed) == len(original)
