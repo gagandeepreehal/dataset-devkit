@@ -19,9 +19,12 @@ credential chain can then use the Azure CLI session.
 Never place account keys, SAS tokens, connection strings, client secrets, passwords, bearer
 tokens, private keys, JWTs, or other credentials in JSON. The loader rejects explicit
 credential-bearing field names and structured secret values before configuration is accepted.
-`account_url` must not contain URL userinfo and must not include a SAS query string. Ordinary
-URLs, paths, source identifiers, and non-secret strings are not treated as credentials merely
-because their text contains words such as `bearer` or `secret`.
+`account_url` must not contain URL userinfo or credential-bearing query parameters. Credential
+query keys and Azure SAS parameters are also rejected in other URL values, while ordinary query
+parameters remain valid. Opaque bearer tokens are recognized only when the complete value uses
+the bearer scheme followed by a conservative token-shaped payload. Ordinary URLs, paths, source
+identifiers, and prose are not treated as credentials merely because their text contains words
+such as `bearer` or `secret`.
 
 ## Sections
 

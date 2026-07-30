@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -17,6 +17,7 @@ _JWT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}"
     r"\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?![A-Za-z0-9_-])"
 )
+_BEARER_TOKEN_PATTERN = re.compile(r"^bearer[ \t]+(?P<token>[A-Za-z0-9_-]{32,})$", re.IGNORECASE)
 _CREDENTIAL_KEY_NAMES = {
     "auth",
     "authentication",
@@ -44,6 +45,31 @@ _CREDENTIAL_KEY_NAMES = {
     "signingkey",
     "storagekey",
 }
+_CREDENTIAL_QUERY_KEYS = _CREDENTIAL_KEY_NAMES | {
+    "sig",
+    "signature",
+    # Azure service and user-delegation SAS parameters.
+    "sv",
+    "ss",
+    "srt",
+    "sp",
+    "se",
+    "st",
+    "spr",
+    "sip",
+    "sr",
+    "skoid",
+    "sktid",
+    "skt",
+    "ske",
+    "sks",
+    "skv",
+    "rscc",
+    "rscd",
+    "rsce",
+    "rscl",
+    "rsct",
+}
 
 
 def _is_credential_key(key: object) -> bool:
@@ -69,6 +95,29 @@ def _is_credential_key(key: object) -> bool:
     )
 
 
+def _has_credential_url_query(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return False
+    return any(
+        query_value and re.sub(r"[^a-z0-9]", "", query_key.lower()) in _CREDENTIAL_QUERY_KEYS
+        for query_key, query_value in parse_qsl(parsed.query, keep_blank_values=True)
+    )
+
+
+def _looks_like_opaque_bearer_token(value: str) -> bool:
+    match = _BEARER_TOKEN_PATTERN.fullmatch(value.strip())
+    if match is None:
+        return False
+    token = match.group("token")
+    return any(character.isalpha() for character in token) and any(
+        character.isdigit() for character in token
+    )
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
@@ -84,6 +133,8 @@ class AzureConfig(StrictModel):
         parsed = urlsplit(value)
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("account_url must not contain credential userinfo")
+        if _has_credential_url_query(value):
+            raise ValueError("account_url must not contain credential query parameters")
         return value
 
 
@@ -256,7 +307,6 @@ class GlobalConfig(StrictModel):
                     inspect(nested, f"{location}[{index}]")
             elif isinstance(item, str):
                 lowered = item.lower()
-                has_sas_signature = "sig=" in lowered and ("sv=" in lowered or "se=" in lowered)
                 has_secret_assignment = any(
                     marker in lowered
                     for marker in (
@@ -267,8 +317,9 @@ class GlobalConfig(StrictModel):
                     )
                 )
                 if (
-                    has_sas_signature
-                    or has_secret_assignment
+                    has_secret_assignment
+                    or _has_credential_url_query(item)
+                    or _looks_like_opaque_bearer_token(item)
                     or _AZURE_ACCOUNT_KEY_PATTERN.search(item) is not None
                     or _JWT_PATTERN.search(item) is not None
                     or re.fullmatch(r"sk-[A-Za-z0-9_-]{20,}", item) is not None

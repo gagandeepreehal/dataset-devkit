@@ -257,11 +257,64 @@ def test_bearer_prefixed_ordinary_strings_and_paths_are_allowed(tmp_path: Path) 
     data = minimal_config()
     set_nested(data, "azure.container", "bearer recordings")
     set_nested(data, "annotations.path", "bearer archive/annotations.jsonl")
+    set_nested(data, "publication.version", "bearer migration archive for July recordings")
 
     config = load_config(write_config(tmp_path, data))
 
     assert config.azure.container == "bearer recordings"
     assert config.annotations.path.name == "annotations.jsonl"
+    assert config.publication.version == "bearer migration archive for July recordings"
+
+
+@pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER"])
+def test_opaque_bearer_tokens_are_rejected(tmp_path: Path, scheme: str) -> None:
+    data = minimal_config()
+    set_nested(
+        data,
+        "publication.version",
+        f"{scheme} abcdefghijklmnopqrstuvwxyz123456",
+    )
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("field", "url"),
+    [
+        (
+            "azure.account_url",
+            "https://example.blob.core.windows.net?password=embedded",
+        ),
+        (
+            "publication.version",
+            "https://example.test/data?access_token=embedded",
+        ),
+        (
+            "azure.account_url",
+            "https://example.blob.core.windows.net/container?sv=2024-11-04&sp=r&se=2030-01-01&sig=embedded",
+        ),
+    ],
+)
+def test_credential_bearing_url_queries_are_rejected(tmp_path: Path, field: str, url: str) -> None:
+    data = minimal_config()
+    set_nested(data, field, url)
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_ordinary_url_query_parameters_are_allowed(tmp_path: Path) -> None:
+    data = minimal_config()
+    set_nested(
+        data,
+        "azure.account_url",
+        "https://example.blob.core.windows.net?api-version=2023-11-03&comp=list",
+    )
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert "api-version=2023-11-03" in config.azure.account_url
 
 
 def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> None:
