@@ -56,6 +56,11 @@ exact guarantees and deployment requirements for untrusted writers.
 
 The secure cache backend is supported on POSIX platforms only. It requires POSIX file locks and
 descriptor-relative, no-follow filesystem operations; Windows is not a supported runtime.
+Verified extraction generations are immutable cache evidence, never mutable build staging. Every
+reuse copies JPEGs into a fresh per-build directory below `paths.work_dir`; concurrent builds
+therefore receive independent inodes. Owned working trees are removed after export has copied the
+images, and on safe failure paths, while artifacts explicitly reported as preserved quarantine
+evidence remain in place.
 
 ## Azure acquisition
 

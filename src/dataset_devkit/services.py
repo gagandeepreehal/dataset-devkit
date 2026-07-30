@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
+from threading import Lock
 from typing import Protocol
 
 from dataset_devkit.acquisition import AcquisitionResult, AzureBlobAcquirer
@@ -36,7 +37,7 @@ from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.features import SceneFeatures, compute_recording_features
 from dataset_devkit.filtering import filter_scenes
 from dataset_devkit.provenance import SourceFingerprint, canonical_hash, extraction_config_hash
-from dataset_devkit.publication import StagingLease, publish_staging
+from dataset_devkit.publication import PinnedDirectoryLease, StagingLease, publish_staging
 from dataset_devkit.quarantine import write_rejection_manifest
 from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scenes import build_recording_scenes
@@ -114,8 +115,65 @@ class InspectionSummary:
         }
 
 
+class _WorkingExtractionRegistry:
+    """Own per-build extraction trees until export has copied their JPEGs."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._leases: dict[str, PinnedDirectoryLease] = {}
+
+    def register(self, recording_id: str, result: RecordingExtractionResult) -> None:
+        lease = PinnedDirectoryLease.capture(result.staging_root)
+        with self._lock:
+            previous = self._leases.get(recording_id)
+            if previous is not None:
+                lease.close()
+                raise ValueError(f"duplicate working extraction: {recording_id}")
+            self._leases[recording_id] = lease
+
+    def cleanup(self, recording_id: str) -> None:
+        with self._lock:
+            lease = self._leases.pop(recording_id, None)
+        if lease is not None:
+            try:
+                lease.cleanup()
+            finally:
+                lease.close()
+
+    def preserve(self, recording_id: str) -> None:
+        """Release cleanup authority for an intentionally quarantined tree."""
+        with self._lock:
+            lease = self._leases.pop(recording_id, None)
+        if lease is not None:
+            lease.close()
+
+    def cleanup_all(self) -> None:
+        with self._lock:
+            leases = tuple(self._leases.values())
+            self._leases.clear()
+        for lease in leases:
+            try:
+                lease.cleanup()
+            finally:
+                lease.close()
+
+
 def _build_evidence(
     config: GlobalConfig, runtime: BuildRuntime
+) -> tuple[ExportEvidence, tuple[str, ...], _WorkingExtractionRegistry]:
+    working = _WorkingExtractionRegistry()
+    try:
+        evidence, failures = _build_evidence_owned(config, runtime, working)
+    except Exception:
+        working.cleanup_all()
+        raise
+    return evidence, failures, working
+
+
+def _build_evidence_owned(
+    config: GlobalConfig,
+    runtime: BuildRuntime,
+    working: _WorkingExtractionRegistry,
 ) -> tuple[ExportEvidence, tuple[str, ...]]:
     blobs = parse_blob_list(config.azure.blob_list)
     if not blobs:
@@ -153,23 +211,40 @@ def _build_evidence(
         item.artifact_path.resolve(): item for _, _, item in acquired
     }
     extraction_cache = runtime.extraction_cache_factory(config.paths.cache_dir)
+    recording_id_by_path = {
+        item.artifact_path.resolve(): f"recording-{index:06d}"
+        for index, _, item in acquired
+    }
 
     def extract_cached(path: Path) -> RecordingExtractionResult:
         acquisition = acquisition_by_path[path.resolve()]
+        recording_id = recording_id_by_path[path.resolve()]
         source = acquisition.manifest.source
         if acquirer.extraction_cache_reusable(source, extraction_hash):
-            cached = extraction_cache.load(source, extraction_hash, path)
+            cached = extraction_cache.materialize(
+                source,
+                extraction_hash,
+                path,
+                config.paths.work_dir,
+                recording_id,
+            )
             if cached is not None:
+                working.register(recording_id, cached)
                 return cached
         extracted = extractor.extract(path)
-        cached = extraction_cache.store(
-            source,
-            extraction_hash,
-            extracted,
-            force_refresh=True,
-        )
-        acquirer.record_extraction_complete(source, extraction_hash)
-        return cached
+        working.register(recording_id, extracted)
+        try:
+            extraction_cache.store(
+                source,
+                extraction_hash,
+                extracted,
+                force_refresh=True,
+            )
+            acquirer.record_extraction_complete(source, extraction_hash)
+        except Exception:
+            working.cleanup(recording_id)
+            raise
+        return extracted
 
     coordinator = RecordingCoordinator(config=config, extractor=extract_cached)
     source_config_hash = canonical_hash(config.azure.model_dump(mode="json"))
@@ -310,6 +385,12 @@ def _build_evidence(
             key=lambda item: item.recording_id,
         )
     )
+    for failure in all_failures:
+        if (
+            failure.quarantine is not None
+            and failure.quarantine.report.artifact_handling == "preserved_in_place"
+        ):
+            working.preserve(failure.recording_id)
     quarantine_complete = all(item.quarantine_persisted for item in all_failures)
     if all_failures and quarantine_complete:
         try:
@@ -411,11 +492,16 @@ def build_dataset(config: GlobalConfig, *, runtime: BuildRuntime | None = None) 
     final = output / config.publication.version
     if final.exists() or final.is_symlink():
         raise FileExistsError(f"refusing to overwrite existing final dataset: {final}")
-    evidence, failures = _build_evidence(config, selected_runtime)
-    lease = StagingLease.create(output, f".{config.publication.version}.staging-")
+    evidence, failures, working = _build_evidence(config, selected_runtime)
+    try:
+        lease = StagingLease.create(output, f".{config.publication.version}.staging-")
+    except Exception:
+        working.cleanup_all()
+        raise
     staging = lease.root
     try:
         exported = export_dataset(staging, evidence, lease=lease)
+        working.cleanup_all()
         report = finalize_dataset(
             staging,
             config.publication.version,
@@ -430,6 +516,7 @@ def build_dataset(config: GlobalConfig, *, runtime: BuildRuntime | None = None) 
             expected_content_hash=report.content_hash,
         )
     except Exception:
+        working.cleanup_all()
         lease.cleanup()
         raise
     finally:

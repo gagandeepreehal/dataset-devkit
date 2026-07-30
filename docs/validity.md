@@ -49,6 +49,8 @@ With `drop`, invalid logical sample objects are omitted from that collection whi
 records and counts remain. Each owned staged JPEG is removed only after its direct invocation
 parent, regular-file type, single-link count, and stored device/inode identity re-verify. Changed,
 linked, prior, external, cache, source-MCAP, and other-invocation files are never deleted.
+Cached JPEGs are not working images: cache reuse first materializes a unique owned invocation, so
+`drop` cannot mutate the immutable cache generation or race another build's validity pass.
 
 Multi-image drop is transactional. After one complete preflight, each owned image is hard-linked
 to an exclusive UUID tombstone in the same trusted directory, verified as the same two-link inode,

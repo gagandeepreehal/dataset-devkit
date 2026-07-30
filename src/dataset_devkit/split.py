@@ -226,8 +226,35 @@ def _upstream_fingerprint(
 
 
 def _graph_fingerprint(graphs: Sequence[RecordingSceneResult]) -> str:
+    volatile_staging_keys = frozenset(
+        {
+            "path",
+            "device",
+            "inode",
+            "invocation_root",
+            "root_relative_path",
+            "directory_device",
+            "directory_inode",
+            "directory_chain_identities",
+        }
+    )
+
+    def stable_value(value: object, *, staged_image: bool = False) -> object:
+        if isinstance(value, dict):
+            return {
+                key: stable_value(item, staged_image=key == "staged_image")
+                for key, item in value.items()
+                if not staged_image or key not in volatile_staging_keys
+            }
+        if isinstance(value, list):
+            return [stable_value(item, staged_image=staged_image) for item in value]
+        return value
+
     return canonical_hash(
-        [graph.to_dict() for graph in sorted(graphs, key=lambda item: item.source.digest)]
+        [
+            stable_value(graph.to_dict())
+            for graph in sorted(graphs, key=lambda item: item.source.digest)
+        ]
     )
 
 

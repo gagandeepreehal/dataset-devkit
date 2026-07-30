@@ -166,6 +166,65 @@ class StagingLease:
             self._closed = True
 
 
+@dataclass
+class PinnedDirectoryLease:
+    """Retained inode authority for bounded cleanup of an existing owned directory."""
+
+    root: Path
+    name: str
+    _parent_fd: int
+    _root_fd: int
+    root_identity: tuple[int, int]
+    _closed: bool = False
+
+    @classmethod
+    def capture(cls, root: str | Path) -> PinnedDirectoryLease:
+        absolute = Path(root).absolute()
+        parent_fd, _ = _open_directory_chain(absolute.parent, create=False)
+        try:
+            root_fd = os.open(absolute.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            opened = os.fstat(root_fd)
+            listed = os.stat(
+                absolute.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(listed.st_mode)
+                or _identity(opened) != _identity(listed)
+            ):
+                os.close(root_fd)
+                raise ValueError("owned directory identity changed during capture")
+            return cls(
+                absolute,
+                absolute.name,
+                parent_fd,
+                root_fd,
+                _identity(opened),
+            )
+        except Exception:
+            os.close(parent_fd)
+            raise
+
+    def cleanup(self) -> bool:
+        if self._closed:
+            return False
+        try:
+            return cleanup_pinned_directory(
+                self._parent_fd,
+                self.name,
+                self._root_fd,
+                self.root_identity,
+            )
+        except (OSError, ValueError):
+            return False
+
+    def close(self) -> None:
+        if not self._closed:
+            os.close(self._root_fd)
+            os.close(self._parent_fd)
+            self._closed = True
+
+
 def _hash_directory_fd(
     directory_fd: int,
     prefix: str,

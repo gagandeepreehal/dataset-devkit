@@ -4,8 +4,9 @@ import hashlib
 import json
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -27,6 +28,7 @@ from dataset_devkit.dataset import Dataset
 from dataset_devkit.export import export_dataset, preflight_recording_export
 from dataset_devkit.extraction.cache import ExtractionResultCache
 from dataset_devkit.extraction.errors import StructuralExtractionError
+from dataset_devkit.extraction.models import RecordingExtractionResult
 from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.features import RecordingFeatureResult, compute_recording_features
 from dataset_devkit.provenance import (
@@ -52,6 +54,7 @@ from dataset_devkit.validation import (
     finalize_dataset,
     validate_dataset,
 )
+from dataset_devkit.validity import evaluate_validity
 from mcap_fixture import camera_message, encode_hevc_access_units, write_mcap
 from test_export_dataset import _evidence
 from test_extraction_service import DeterministicDecoder
@@ -616,6 +619,7 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     )
 
     first = build_dataset(config, runtime=runtime)
+    assert not config.paths.work_dir.exists() or not tuple(config.paths.work_dir.iterdir())
     first_hash = first.content_hash
     first_decoder_creations = decoder_creations
     assert first_decoder_creations > 0
@@ -631,6 +635,7 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     archived = first.dataroot.with_name("first-published")
     first.dataroot.rename(archived)
     second = build_dataset(config, runtime=runtime)
+    assert not tuple(config.paths.work_dir.iterdir())
 
     assert second.content_hash == first_hash
     assert decoder_creations == first_decoder_creations
@@ -645,6 +650,7 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     second.dataroot.rename(second.dataroot.with_name("second-published"))
     acquirer.completed.clear()
     third = build_dataset(config, runtime=runtime)
+    assert not tuple(config.paths.work_dir.iterdir())
     refreshed = extraction_cache.load(source, extraction_hash, recording)
     assert decoder_creations > first_decoder_creations
     assert refreshed is not None
@@ -1046,18 +1052,201 @@ def test_extraction_result_cache_is_materialized_and_tamper_evident(
 
     stored = cache.store(source, config_hash, extracted)
     loaded = cache.load(source, config_hash, recording)
+    materialized = cache.materialize(
+        source,
+        config_hash,
+        recording,
+        tmp_path / "working",
+        "recording-000000",
+    )
 
     assert loaded is not None
+    assert materialized is not None
     assert loaded.camera_batches == extracted.camera_batches
     assert loaded.selected_grid == extracted.selected_grid
     assert len(loaded.samples) == len(extracted.samples)
     assert all(item.staged_image.path.is_file() for item in stored.samples)
+    assert materialized.staging_root != stored.staging_root
+    assert materialized.samples[0].staged_image.inode != stored.samples[0].staged_image.inode
+    assert (
+        materialized.samples[0].staged_image.sha256
+        == stored.samples[0].staged_image.sha256
+    )
     assert cache.load(source, "b" * 64, recording) is None
     changed_source = replace(source, etag='"changed"')
     assert cache.load(changed_source, config_hash, recording) is None
 
-    stored.samples[0].staged_image.path.write_bytes(b"corrupt")
+    stored_path = stored.samples[0].staged_image.path
+    assert stored_path.stat().st_mode & 0o222 == 0
+    stored_path.chmod(0o600)
+    stored_path.write_bytes(b"corrupt")
     assert cache.load(source, config_hash, recording) is None
+
+
+def _cache_security_case(
+    tmp_path: Path,
+) -> tuple[Path, RecordingExtractionResult, SourceFingerprint]:
+    recording = tmp_path / "security-recording.mcap"
+    write_mcap(
+        recording,
+        camera_payloads=(
+            camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
+        ),
+    )
+    extracted = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=1,
+        tolerance_ns=0,
+        staging_root=tmp_path / "security-staging",
+        decoder_factory=DeterministicDecoder,
+    ).extract(recording)
+    source = SourceFingerprint(
+        "https://example.blob.core.windows.net",
+        "recordings",
+        "mcap-h265/security-recording.mcap",
+        '"etag"',
+        recording.stat().st_size,
+    )
+    return recording, extracted, source
+
+
+def test_cache_hit_drop_uses_independent_working_trees_and_preserves_cache(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+) -> None:
+    recording, extracted, source = _cache_security_case(tmp_path)
+    cache = ExtractionResultCache(tmp_path / "cache")
+    config_hash = "a" * 64
+    cache.store(source, config_hash, extracted)
+    first = cache.materialize(
+        source, config_hash, recording, tmp_path / "work", "recording-000000"
+    )
+    second = cache.materialize(
+        source, config_hash, recording, tmp_path / "work", "recording-000000"
+    )
+    assert first is not None
+    assert second is not None
+    assert first.staging_root != second.staging_root
+    assert first.samples[0].staged_image.inode != second.samples[0].staged_image.inode
+    base = config_factory()
+    config = base.model_copy(
+        update={
+            "frame_validity": base.frame_validity.model_copy(
+                update={"invalid_sample_policy": "drop"}
+            )
+        }
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reports = tuple(executor.map(lambda item: evaluate_validity(item, config), (first, second)))
+
+    assert all(report.observations for report in reports)
+    assert cache.load(source, config_hash, recording) is not None
+    third = cache.materialize(
+        source, config_hash, recording, tmp_path / "work", "recording-000000"
+    )
+    assert third is not None
+    assert all(sample.staged_image.path.is_file() for sample in third.samples)
+
+
+@pytest.mark.parametrize("failure_point", ["store", "marker"])
+def test_failed_cache_completion_cleans_owned_working_extraction(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    recording = tmp_path / "recording.mcap"
+    write_mcap(
+        recording,
+        camera_payloads=(
+            camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
+        ),
+    )
+    blob = "mcap-h265/recording.mcap"
+    config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
+    acquirer = _FakeAcquirer({blob: recording})
+    cache = ExtractionResultCache(config.paths.cache_dir)
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(f"injected {failure_point} failure")
+
+    if failure_point == "store":
+        monkeypatch.setattr(cache, "store", fail)
+    else:
+        monkeypatch.setattr(acquirer, "record_extraction_complete", fail)
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: acquirer,
+        decoder_factory=DeterministicDecoder,
+        extraction_cache_factory=lambda _path: cache,
+        official_smoke=False,
+    )
+
+    with pytest.raises(BuildOperationalError, match="publication blocked"):
+        build_dataset(config, runtime=runtime)
+
+    assert not config.paths.work_dir.exists() or not tuple(config.paths.work_dir.iterdir())
+
+
+@pytest.mark.parametrize("unsafe_component", ["ancestor", "root", "generation"])
+def test_extraction_result_cache_rejects_symlinked_directory_components(
+    tmp_path: Path,
+    unsafe_component: str,
+) -> None:
+    _, extracted, source = _cache_security_case(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    config_hash = "a" * 64
+    if unsafe_component == "ancestor":
+        link = tmp_path / "cache-link"
+        link.symlink_to(outside, target_is_directory=True)
+        cache = ExtractionResultCache(link / "cache")
+    else:
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        if unsafe_component == "root":
+            (cache_dir / "extraction-results").symlink_to(
+                outside, target_is_directory=True
+            )
+        else:
+            source_root = cache_dir / "extraction-results" / source.digest
+            source_root.mkdir(parents=True)
+            (source_root / config_hash).symlink_to(outside, target_is_directory=True)
+        cache = ExtractionResultCache(cache_dir)
+
+    with pytest.raises((OSError, ValueError)):
+        cache.store(source, config_hash, extracted)
+
+    assert tuple(outside.iterdir()) == ()
+
+
+def test_extraction_result_cache_detects_root_replacement_without_escaping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, extracted, source = _cache_security_case(tmp_path)
+    cache = ExtractionResultCache(tmp_path / "cache")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    displaced = tmp_path / "displaced-extraction-results"
+    from dataset_devkit.extraction import cache as cache_module
+
+    original_lock = cache_module._cache_lock
+
+    @contextmanager
+    def replace_root(parent_fd: int, name: str) -> Iterator[None]:
+        with original_lock(parent_fd, name):
+            cache.root.rename(displaced)
+            cache.root.symlink_to(outside, target_is_directory=True)
+            yield
+
+    monkeypatch.setattr(cache_module, "_cache_lock", replace_root)
+
+    with pytest.raises(ValueError, match="cache directory binding changed"):
+        cache.store(source, "a" * 64, extracted)
+
+    assert tuple(outside.iterdir()) == ()
 
 
 def test_extraction_result_cache_force_refresh_replaces_an_existing_generation(

@@ -152,6 +152,21 @@ following symbolic links, and leaf operations remain relative to those trusted d
 This secure cache backend is POSIX-only because it requires `flock`, directory-relative file
 operations, and no-follow opens. Windows is not a supported runtime.
 
+Extraction results use a separate, source-and-config-hash-keyed generation below
+`extraction-results`. The complete configured cache path, extraction root, source directory, and
+generation are opened through retained directory descriptors with no-follow checks and binding
+revalidation. A symbolic-link component or directory-replacement race fails closed; cache writes
+cannot be redirected outside `paths.cache_dir`.
+
+Published extraction generations are immutable evidence. A cache hit verifies the generation and
+copies each JPEG into a unique invocation below `paths.work_dir`, with fresh ownership metadata;
+it never returns a cache path to validity or scene processing. A cache miss likewise keeps the
+extractor's invocation as the build-owned working result while storing a separate cache copy.
+After dataset export has copied all selected images, the pipeline removes its exact pinned working
+trees. It also performs bounded cleanup after cache-store, completion-marker, staging, export, or
+validation failures. Same-name replacements are never removed. Only working artifacts whose
+durable quarantine report says `preserved_in_place` intentionally survive cleanup.
+
 ## Managed-identity smoke check
 
 After assigning the VM identity Blob Data Reader access and placing one valid path in the

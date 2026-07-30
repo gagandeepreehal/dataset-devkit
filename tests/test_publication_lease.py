@@ -15,7 +15,12 @@ import dataset_devkit.publication as publication
 from conftest import FeatureFactory
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.export import export_dataset
-from dataset_devkit.publication import StagingLease, hash_regular_files_fd, publish_staging
+from dataset_devkit.publication import (
+    PinnedDirectoryLease,
+    StagingLease,
+    hash_regular_files_fd,
+    publish_staging,
+)
 from dataset_devkit.validation import DatasetValidationError, finalize_dataset
 from test_export_dataset import _evidence
 
@@ -59,6 +64,27 @@ def test_staging_lease_cleanup_never_removes_same_name_replacement(
     lease.root.rename(displaced)
     lease.root.mkdir()
     sentinel = lease.root / "keep"
+    sentinel.write_bytes(b"unrelated")
+
+    try:
+        assert not lease.cleanup()
+        assert sentinel.read_bytes() == b"unrelated"
+        assert tuple(displaced.iterdir()) == ()
+    finally:
+        lease.close()
+
+
+def test_pinned_directory_cleanup_never_removes_same_name_replacement(
+    tmp_path: Path,
+) -> None:
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    (owned / "payload").write_bytes(b"owned")
+    lease = PinnedDirectoryLease.capture(owned)
+    displaced = tmp_path / "displaced"
+    owned.rename(displaced)
+    owned.mkdir()
+    sentinel = owned / "keep"
     sentinel.write_bytes(b"unrelated")
 
     try:
