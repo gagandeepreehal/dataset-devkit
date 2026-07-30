@@ -576,6 +576,45 @@ def test_gnss_nested_orientation_error_nonfinite_value_is_structural(
         read_recording(path, "rec_cameras", "gnss")
 
 
+def test_deep_protobuf_descriptor_shape_is_bounded_structurally() -> None:
+    file_proto = descriptor_pb2.FileDescriptorProto(
+        name="deep.proto", package="deep", syntax="proto3"
+    )
+    current = file_proto.message_type.add(name="Root")
+    for index in range(33):
+        current = current.nested_type.add(name=f"Level{index}")
+    file_set = descriptor_pb2.FileDescriptorSet()
+    file_set.file.add().CopyFrom(file_proto)
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match=r"deep\.Root(?:\.Level\d+)+.*maximum depth 32",
+    ):
+        build_message_classes(file_set.SerializeToString())
+
+
+def test_wide_repeated_protobuf_uncertainty_is_bounded_structurally(
+    tmp_path: Path,
+) -> None:
+    descriptor_data = descriptor_with_field_change(
+        "OrientationError",
+        "yaw_variance",
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+    )
+    _, gnss_type = message_classes(descriptor_data)
+    message = gnss_type.FromString(gnss_message(900_000_000, 0))
+    message.orientation_error.yaw_variance.extend(float(index) for index in range(8_001))
+    path = tmp_path / "wide-orientation-error.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        gnss_payloads=(bytes(message.SerializeToString()),),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="maximum leaves 8000"):
+        read_recording(path, "rec_cameras", "gnss")
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

@@ -13,6 +13,7 @@ from pyproj import Transformer
 
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import GnssInterpolation, GnssSample
+from dataset_devkit.extraction.uncertainty import bounded_leaf_items
 
 Quaternion = tuple[float, float, float, float]
 _WEB_MERCATOR = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
@@ -131,23 +132,11 @@ def parse_numeric_uncertainty_leaf(value: object) -> float | None:
 
 
 def _numeric_paths(value: object, path: str) -> tuple[str, ...]:
-    if parse_numeric_uncertainty_leaf(value) is not None:
-        return (path,)
-    if isinstance(value, Mapping):
-        return tuple(
-            nested
-            for key in sorted(value, key=str)
-            for nested in _numeric_paths(
-                value[key], f"{path}.{key}" if path else str(key)
-            )
-        )
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return tuple(
-            nested
-            for index, item in enumerate(value)
-            for nested in _numeric_paths(item, f"{path}[{index}]")
-        )
-    return ()
+    return tuple(
+        leaf_path
+        for leaf_path, leaf in bounded_leaf_items(value, root_path=path)
+        if parse_numeric_uncertainty_leaf(leaf) is not None
+    )
 
 
 def _interpolate_uncertainty_value(
@@ -229,6 +218,8 @@ def _interpolate_uncertainty_value(
 def _numeric_interpolation(
     first: Mapping[str, object], second: Mapping[str, object], fraction: float
 ) -> tuple[dict[str, object], tuple[str, ...]]:
+    bounded_leaf_items(first, root_path="")
+    bounded_leaf_items(second, root_path="")
     uninterpolated: set[str] = set()
     result = _interpolate_uncertainty_value(
         first, second, fraction, "", uninterpolated

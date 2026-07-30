@@ -39,6 +39,12 @@ numeric fields; nonnumeric/recursive shapes and any present nonfinite numeric va
 failures. Every message must contain both timestamps and all four required nested messages; a
 nested numeric value is also required when its protobuf descriptor exposes field presence.
 
+All uncertainty descriptor, protobuf-value, interpolation, immutable-copy, and policy traversals
+share one deterministic bound: maximum container depth 32, 10,000 visited nodes, 8,000 scalar
+leaves, and 200,000 path/work units. Python container cycles and exceeded limits are structural
+failures with the stable offending flattened path and reason; they cannot escape as a
+`RecursionError` or unbounded walk. Boundary-depth structures remain accepted.
+
 ## Selection, decode, and pose output
 
 The target grid is anchored at the first camera batch `rec_timestamp`. Its period is rational,
@@ -96,6 +102,12 @@ shortest-path quaternion SLERP. Longitude/latitude are projected from EPSG:4326 
 uninterpolated numeric paths, and both synchronization gaps remain available for audit and later
 policy. Result mappings are defensive, read-only copies; nested mapping/list/set values are
 recursively frozen.
+
+Before validity policy runs, selected entries and misses must form one auditable target partition:
+target timestamps are unique, disjoint, and ordered within their streams; selected batches are
+unique source batches; and the unique unused-batch tuple exactly equals every source batch not
+selected. Contradictions are structural failures. Combined selected/miss audit output is always
+sorted by target timestamp.
 
 ## Structural failures
 

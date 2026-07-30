@@ -50,6 +50,14 @@ records and counts remain. Each owned staged JPEG is removed only after its dire
 parent, regular-file type, single-link count, and stored device/inode identity re-verify. Changed,
 linked, prior, external, cache, source-MCAP, and other-invocation files are never deleted.
 
+Multi-image drop is transactional. After one complete preflight, every owned image is renamed in
+the same trusted directory to a unique inode-verified tombstone. A move or commit-directory-fsync
+failure rolls every moved name back before a structural error is raised, so original sample names
+are not partially deleted. Only after all tombstone names are durably committed are they unlinked.
+A post-commit cleanup failure raises a dedicated retryable structural error carrying all remaining
+owned tombstone paths; coordinator handling quarantines that recording and reports those preserved
+artifacts explicitly.
+
 ## Nonstructural sanity
 
 Each typed check has an independent `error`, `warn`, or `off` policy. `off` skips evaluation and
@@ -81,9 +89,12 @@ context (measurements, thresholds, raw details, timestamps, camera, and enabled 
 available source/extraction config hashes, and `artifact_handling`. Deterministic content has no
 wall-clock field. Runtime logging may add time separately, but it is not part of this report.
 
-Reports use collision-resistant exclusive leaf creation below an absolute no-follow directory
-chain, never overwrite, and are reopened to verify their same single-link inode and exact bytes.
-Concurrent identical failures therefore have separate paths with identical canonical content.
+Reports use a collision-resistant, exclusively created private temporary inode below an absolute
+no-follow directory chain. Canonical bytes are written, file-fsynced, reread, and verified before a
+no-replace hard link atomically exposes the final name; the private name is then unlinked and the
+directory is fsynced. Every newly created directory component fsyncs its parent immediately. Final
+names therefore never expose partial bytes or overwrite collisions. Concurrent identical failures
+have separate paths with identical canonical content.
 Failed-invocation artifacts, when available, are reported as preserved in place; no acquisition
 cache object or source MCAP is moved or modified. A report is still written when no artifacts
 exist.
@@ -95,9 +106,18 @@ identities before work begins. It processes every accepted recording independent
 outcomes, successes, failures, policy reports, and quarantine artifacts in input order. This task
 does not publish.
 
+Quarantine persistence is isolated from the original recording exception. A persistence failure
+cannot abort later recordings or replace the original category/type/message. `RecordingFailure`
+records whether quarantine persisted, its optional final report path, and an explicit persistence
+error type/message/details. Any incomplete quarantine blocks all publication authorization—even
+when partial export was requested—and the aggregate blocked result retains successes plus both
+failure layers. Nested report details are defensively deep-frozen before canonical serialization.
+
 After all recordings finish, any failure with `allow_partial_export=false` raises
 `PublicationBlockedError`. The exception carries every success/failure but explicitly authorizes
 zero recording identities. With `allow_partial_export=true`, the returned result authorizes only
-successful recording identities; failed recordings remain quarantined and unauthorized. With no
-failures, every successful input is authorized. Scene/tag/split construction and nuScenes export
-or publication are outside this boundary.
+successful recording identities when every failure report persisted; failed recordings remain
+quarantined and unauthorized. An incomplete quarantine persistence forces the blocked exception
+and zero authorization regardless of that flag. With no failures, every successful input is
+authorized. Scene/tag/split construction and nuScenes export or publication are outside this
+boundary.

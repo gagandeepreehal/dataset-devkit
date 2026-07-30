@@ -199,3 +199,61 @@ def test_incompatible_uncertainty_sequences_are_explicitly_endpoint_only() -> No
         "history[1]",
     )
     assert result.before is before and result.after is after
+
+
+def _nested_uncertainty(depth: int) -> dict[str, object]:
+    root: dict[str, object] = {}
+    current = root
+    for _ in range(depth):
+        child: dict[str, object] = {}
+        current["nested"] = child
+        current = child
+    current["value"] = 1.0
+    return root
+
+
+def test_uncertainty_depth_boundary_is_bounded_and_structural() -> None:
+    allowed = replace(
+        sample(0, lon=0, yaw=0),
+        orientation_uncertainty=_nested_uncertainty(32),
+    )
+    assert allowed.orientation_uncertainty
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match=r"orientation_uncertainty(?:\.nested)+.*maximum depth 32",
+    ):
+        replace(
+            sample(0, lon=0, yaw=0),
+            orientation_uncertainty=_nested_uncertainty(33),
+        )
+
+
+def test_uncertainty_cycle_is_structural_with_stable_path() -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match=r"orientation_uncertainty\.self.*cycle",
+    ):
+        replace(sample(0, lon=0, yaw=0), orientation_uncertainty=cyclic)
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ([{} for _ in range(10_001)], "maximum nodes 10000"),
+        ([float(index) for index in range(8_001)], "maximum leaves 8000"),
+        ({("x" * 2_100) + str(index): index for index in range(100)},
+         "maximum work 200000"),
+    ],
+)
+def test_uncertainty_node_leaf_and_work_limits_are_structural(
+    value: object, reason: str
+) -> None:
+    with pytest.raises(StructuralExtractionError, match=reason):
+        replace(
+            sample(0, lon=0, yaw=0),
+            orientation_uncertainty={"value": value},
+        )

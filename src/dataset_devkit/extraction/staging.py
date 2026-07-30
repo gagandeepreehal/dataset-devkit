@@ -26,6 +26,18 @@ _FILE_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _Identity = tuple[int, int]
 
 
+class StagedImageCleanupError(StructuralExtractionError):
+    """A committed drop has owned tombstones that require cleanup/retry."""
+
+    def __init__(self, staging_root: Path, owned_tombstones: tuple[Path, ...]) -> None:
+        self.staging_root = staging_root
+        self.owned_tombstones = owned_tombstones
+        super().__init__(
+            "committed staged-image drop requires tombstone cleanup; "
+            f"{len(owned_tombstones)} owned tombstone(s) remain"
+        )
+
+
 @dataclass
 class StagingInvocation:
     staging_root: Path
@@ -248,23 +260,142 @@ def verify_owned_staged_images(
 def remove_owned_staged_images(
     staging_root: Path, images: tuple[StagedImage, ...]
 ) -> None:
-    """Preflight, then remove only still-identical single-link invocation JPEGs."""
+    """Transactionally hide verified images, then clean committed tombstones."""
     directory_fd, verified = _open_verified_owned_images(staging_root, images)
+    moved: list[tuple[str, str, _Identity]] = []
     try:
-        for filename, expected in verified:
-            current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or current.st_nlink != 1
-                or _identity(current) != expected
-            ):
-                raise StructuralExtractionError(
-                    "refusing to remove changed or linked staged image"
+        try:
+            for filename, expected in verified:
+                current = os.stat(
+                    filename, dir_fd=directory_fd, follow_symlinks=False
                 )
-            os.unlink(filename, dir_fd=directory_fd)
-        os.fsync(directory_fd)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or _identity(current) != expected
+                ):
+                    raise StructuralExtractionError(
+                        "refusing to move changed or linked staged image"
+                    )
+                while True:
+                    tombstone = f".{filename}.drop-{uuid.uuid4().hex}"
+                    try:
+                        os.stat(
+                            tombstone,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        break
+                os.rename(
+                    filename,
+                    tombstone,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                moved.append((filename, tombstone, expected))
+                tombstone_stat = os.stat(
+                    tombstone, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISREG(tombstone_stat.st_mode)
+                    or tombstone_stat.st_nlink != 1
+                    or _identity(tombstone_stat) != expected
+                ):
+                    raise StructuralExtractionError(
+                        "staged image tombstone identity changed"
+                    )
+            os.fsync(directory_fd)
+        except Exception as transaction_error:
+            rollback_error: Exception | None = None
+            for filename, tombstone, expected in reversed(moved):
+                try:
+                    tombstone_stat = os.stat(
+                        tombstone, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        not stat.S_ISREG(tombstone_stat.st_mode)
+                        or tombstone_stat.st_nlink != 1
+                        or _identity(tombstone_stat) != expected
+                    ):
+                        raise StructuralExtractionError(
+                            "cannot roll back changed staged image tombstone"
+                        )
+                    try:
+                        os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise StructuralExtractionError(
+                            "cannot roll back over a replaced staged image name"
+                        )
+                    os.rename(
+                        tombstone,
+                        filename,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                    restored = os.stat(
+                        filename, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if _identity(restored) != expected:
+                        raise StructuralExtractionError(
+                            "rolled-back staged image identity changed"
+                        )
+                except Exception as error:
+                    rollback_error = rollback_error or error
+            try:
+                os.fsync(directory_fd)
+            except Exception as error:
+                rollback_error = rollback_error or error
+            if rollback_error is not None:
+                raise StructuralExtractionError(
+                    "staged image drop transaction rollback failed"
+                ) from rollback_error
+            raise StructuralExtractionError(
+                "staged image drop transaction rolled back before commit"
+            ) from transaction_error
+
+        remaining = {tombstone: expected for _, tombstone, expected in moved}
+        try:
+            for _, tombstone, expected in moved:
+                current = os.stat(
+                    tombstone, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or _identity(current) != expected
+                ):
+                    raise StructuralExtractionError(
+                        "committed staged image tombstone identity changed"
+                    )
+                os.unlink(tombstone, dir_fd=directory_fd)
+                remaining.pop(tombstone)
+            os.fsync(directory_fd)
+        except Exception as cleanup_error:
+            owned_paths = tuple(
+                staging_root / tombstone
+                for tombstone, expected in remaining.items()
+                if _relative_identity_matches(directory_fd, tombstone, expected)
+            )
+            raise StagedImageCleanupError(staging_root, owned_paths) from cleanup_error
     finally:
         os.close(directory_fd)
+
+
+def _relative_identity_matches(
+    directory_fd: int, filename: str, expected: _Identity
+) -> bool:
+    try:
+        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(current.st_mode)
+        and current.st_nlink == 1
+        and _identity(current) == expected
+    )
 
 
 def stage_jpeg(

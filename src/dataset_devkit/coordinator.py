@@ -6,10 +6,12 @@ import hashlib
 import json
 import re
 import stat
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from types import MappingProxyType
+from typing import Any, Literal
 
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.extraction.errors import (
@@ -17,6 +19,7 @@ from dataset_devkit.extraction.errors import (
     StructuralExtractionError,
 )
 from dataset_devkit.extraction.models import RecordingExtractionResult
+from dataset_devkit.extraction.staging import StagedImageCleanupError
 from dataset_devkit.quarantine import (
     FailureCategory,
     QuarantineArtifact,
@@ -52,13 +55,26 @@ class RecordingSuccess:
 
 
 @dataclass(frozen=True)
+class QuarantinePersistenceFailure:
+    exception_type: str
+    exception_message: str
+    details: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
+
+
+@dataclass(frozen=True)
 class RecordingFailure:
     recording_id: str
     category: FailureCategory
     stage: str
     exception_type: str
     exception_message: str
-    quarantine: QuarantineArtifact
+    quarantine: QuarantineArtifact | None
+    quarantine_persisted: bool
+    quarantine_report_path: Path | None
+    quarantine_error: QuarantinePersistenceFailure | None
 
 
 RecordingOutcome = RecordingSuccess | RecordingFailure
@@ -120,7 +136,14 @@ def _observed_context(
     return tuple(context)
 
 
-def _has_owned_artifacts(extraction: RecordingExtractionResult | None) -> bool:
+def _has_owned_artifacts(
+    extraction: RecordingExtractionResult | None,
+    error: Exception,
+) -> bool:
+    if isinstance(error, StagedImageCleanupError) and any(
+        path.is_file() for path in error.owned_tombstones
+    ):
+        return True
     if extraction is None:
         return False
     for sample in extraction.samples:
@@ -195,30 +218,51 @@ class RecordingCoordinator:
                 }
             )
         artifact_handling: Literal["no_owned_artifacts", "preserved_in_place"] = (
-            "preserved_in_place" if _has_owned_artifacts(extraction) else "no_owned_artifacts"
+            "preserved_in_place"
+            if _has_owned_artifacts(extraction, error)
+            else "no_owned_artifacts"
         )
-        report = QuarantineReport(
+        if isinstance(error, StagedImageCleanupError):
+            source_details["owned_tombstones"] = tuple(
+                str(path) for path in error.owned_tombstones
+            )
+        artifact: QuarantineArtifact | None = None
+        quarantine_error: QuarantinePersistenceFailure | None = None
+        try:
+            report = QuarantineReport(
+                recording_id=request.recording_id,
+                source_path=str(request.source_path),
+                status="quarantined",
+                category=category,
+                exception_type=type(error).__name__,
+                exception_message=str(error),
+                stage=stage,
+                deterministic_details=source_details,
+                observed_context=_observed_context(validity, error),
+                source_config_hash=request.source_config_hash,
+                extraction_config_hash=request.extraction_config_hash or self._config_hash,
+                artifact_handling=artifact_handling,
+            )
+            artifact = write_quarantine_report(self.quarantine_directory, report)
+        except Exception as persistence_error:
+            quarantine_error = QuarantinePersistenceFailure(
+                type(persistence_error).__name__,
+                str(persistence_error),
+                {
+                    "stage": "quarantine_persistence",
+                    "directory": str(self.quarantine_directory),
+                },
+            )
+        return RecordingFailure(
             recording_id=request.recording_id,
-            source_path=str(request.source_path),
-            status="quarantined",
             category=category,
+            stage=stage,
             exception_type=type(error).__name__,
             exception_message=str(error),
-            stage=stage,
-            deterministic_details=source_details,
-            observed_context=_observed_context(validity, error),
-            source_config_hash=request.source_config_hash,
-            extraction_config_hash=request.extraction_config_hash or self._config_hash,
-            artifact_handling=artifact_handling,
-        )
-        artifact = write_quarantine_report(self.quarantine_directory, report)
-        return RecordingFailure(
-            request.recording_id,
-            category,
-            stage,
-            type(error).__name__,
-            str(error),
-            artifact,
+            quarantine=artifact,
+            quarantine_persisted=artifact is not None,
+            quarantine_report_path=None if artifact is None else artifact.path,
+            quarantine_error=quarantine_error,
         )
 
     def process(
@@ -230,7 +274,9 @@ class RecordingCoordinator:
         if not requests:
             raise CoordinatorInputError("at least one recording is required")
         identities = [request.recording_id for request in requests]
-        duplicates = sorted({item for item in identities if identities.count(item) > 1})
+        duplicates = sorted(
+            identity for identity, count in Counter(identities).items() if count > 1
+        )
         if duplicates:
             raise CoordinatorInputError(f"duplicate recording identity: {duplicates[0]}")
         outcomes: list[RecordingOutcome] = []
@@ -267,7 +313,8 @@ class RecordingCoordinator:
             if allow_partial_export is None
             else allow_partial_export
         )
-        if failures and not partial:
+        quarantine_incomplete = any(not failure.quarantine_persisted for failure in failures)
+        if failures and (not partial or quarantine_incomplete):
             blocked = CoordinatorResult(tuple(outcomes), successes, failures, False, ())
             raise PublicationBlockedError(blocked)
         return CoordinatorResult(

@@ -33,6 +33,7 @@ from dataset_devkit.extraction.models import (
     SourceIdentity,
     TimestampObservation,
 )
+from dataset_devkit.extraction.uncertainty import TraversalBudget, bounded_freeze
 
 CAMERA_SCHEMA_NAME = "autonome.CompressedVideos"
 _GNSS_NUMERIC_FIELDS = {
@@ -58,16 +59,20 @@ _PROTOBUF_NUMERIC_TYPES = {
 
 def _message_names(
     file_proto: descriptor_pb2.FileDescriptorProto,
+    *,
+    budget: TraversalBudget,
 ) -> list[str]:
     names: list[str] = []
 
-    def visit(messages: Any, prefix: str) -> None:
+    def visit(messages: Any, prefix: str, depth: int) -> None:
         for message in messages:
             full_name = f"{prefix}.{message.name}" if prefix else message.name
+            budget.check_depth(full_name, depth)
+            budget.visit(full_name, leaf=False, work=len(message.name))
             names.append(full_name)
-            visit(message.nested_type, full_name)
+            visit(message.nested_type, full_name, depth + 1)
 
-    visit(file_proto.message_type, file_proto.package)
+    visit(file_proto.message_type, file_proto.package, 0)
     return names
 
 
@@ -82,6 +87,13 @@ def build_message_classes(data: bytes) -> dict[str, type[Message]]:
         ) from error
     if not file_set.file:
         raise StructuralExtractionError("protobuf FileDescriptorSet contains no files")
+
+    name_budget = TraversalBudget()
+    declared_names = tuple(
+        name
+        for file_proto in file_set.file
+        for name in _message_names(file_proto, budget=name_budget)
+    )
 
     pool = descriptor_pool.DescriptorPool()
     pool.AddSerializedFile(Timestamp.DESCRIPTOR.file.serialized_pb)  # type: ignore[no-untyped-call]
@@ -118,15 +130,14 @@ def build_message_classes(data: bytes) -> dict[str, type[Message]]:
             )
 
     classes: dict[str, type[Message]] = {}
-    for file_proto in file_set.file:
-        for name in _message_names(file_proto):
-            try:
-                descriptor = pool.FindMessageTypeByName(name)  # type: ignore[no-untyped-call]
-            except KeyError as error:
-                raise StructuralExtractionError(
-                    f"protobuf descriptor does not define declared message {name!r}"
-                ) from error
-            classes[name] = message_factory.GetMessageClass(descriptor)
+    for name in declared_names:
+        try:
+            descriptor = pool.FindMessageTypeByName(name)  # type: ignore[no-untyped-call]
+        except KeyError as error:
+            raise StructuralExtractionError(
+                f"protobuf descriptor does not define declared message {name!r}"
+            ) from error
+        classes[name] = message_factory.GetMessageClass(descriptor)
     return classes
 
 
@@ -448,12 +459,21 @@ def _validate_gnss_schema(descriptor: Descriptor) -> None:
         cast(Descriptor, orientation_error.message_type),
         path="orientation_error",
         ancestors=frozenset(),
+        depth=0,
+        budget=TraversalBudget(),
     )
 
 
 def _validate_orientation_error_schema(
-    descriptor: Descriptor, *, path: str, ancestors: frozenset[str]
+    descriptor: Descriptor,
+    *,
+    path: str,
+    ancestors: frozenset[str],
+    depth: int,
+    budget: TraversalBudget,
 ) -> None:
+    budget.check_depth(path, depth)
+    budget.visit(path, leaf=False, work=len(descriptor.fields))
     if descriptor.full_name in ancestors:
         raise StructuralExtractionError(
             f"GNSS schema field {path!r} has a recursive message shape"
@@ -470,6 +490,8 @@ def _validate_orientation_error_schema(
                 cast(Descriptor, field.message_type),
                 path=field_path,
                 ancestors=nested_ancestors,
+                depth=depth + 1,
+                budget=budget,
             )
         elif field.type not in _PROTOBUF_NUMERIC_TYPES:
             raise StructuralExtractionError(
@@ -477,27 +499,49 @@ def _validate_orientation_error_schema(
             )
 
 
-def _validate_orientation_error_values(message: Message, *, path: str) -> None:
+def _validate_orientation_error_values(
+    message: Message,
+    *,
+    path: str,
+    depth: int = 0,
+    budget: TraversalBudget | None = None,
+) -> None:
+    active_budget = TraversalBudget() if budget is None else budget
+    active_budget.check_depth(path, depth)
+    active_budget.visit(path, leaf=False, work=len(message.ListFields()))
     for field, value in message.ListFields():
         field_path = f"{path}.{field.name}"
         values = value if field.is_repeated else (value,)
         if field.type == FieldDescriptor.TYPE_MESSAGE:
             for nested in values:
-                _validate_orientation_error_values(cast(Message, nested), path=field_path)
+                _validate_orientation_error_values(
+                    cast(Message, nested),
+                    path=field_path,
+                    depth=depth + 1,
+                    budget=active_budget,
+                )
             continue
-        for numeric in values:
+        for index, numeric in enumerate(values):
+            numeric_path = f"{field_path}[{index}]" if field.is_repeated else field_path
+            active_budget.visit(
+                numeric_path,
+                leaf=True,
+                work=len(field.name) + (len(str(index)) + 2 if field.is_repeated else 0),
+            )
             if not math.isfinite(float(numeric)):
                 raise StructuralExtractionError(
-                    f"GNSS {field_path} numeric value must be finite"
+                    f"GNSS {numeric_path} numeric value must be finite"
                 )
 
 
-def _message_dict(message: Message) -> dict[str, Any]:
-    return json_format.MessageToDict(
+def _message_dict(message: Message, *, root_path: str) -> dict[str, Any]:
+    converted = json_format.MessageToDict(
         message,
         preserving_proto_field_name=True,
         always_print_fields_with_no_presence=True,
     )
+    frozen = bounded_freeze(converted, root_path=root_path)
+    return dict(cast(dict[str, Any], frozen))
 
 
 def _parse_gnss(message: Message) -> GnssSample:
@@ -539,7 +583,7 @@ def _parse_gnss(message: Message) -> GnssSample:
         )
         if not all(math.isfinite(value) for value in numeric_values):
             raise StructuralExtractionError("GNSS message contains non-finite required values")
-        raw = _message_dict(message)
+        raw = _message_dict(message, root_path="gnss")
         for known in (
             "timestamp",
             "rec_timestamp",
@@ -553,7 +597,9 @@ def _parse_gnss(message: Message) -> GnssSample:
         _validate_orientation_error_values(
             cast(Message, dynamic.orientation_error), path="orientation_error"
         )
-        orientation_uncertainty = _message_dict(dynamic.orientation_error)
+        orientation_uncertainty = _message_dict(
+            dynamic.orientation_error, root_path="orientation_error"
+        )
         return GnssSample(
             timestamp_ns=_timestamp_ns(message, "timestamp", "GNSS message"),
             rec_timestamp_ns=_timestamp_ns(message, "rec_timestamp", "GNSS message"),

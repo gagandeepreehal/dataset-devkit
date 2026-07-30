@@ -10,10 +10,10 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Literal
 
 from dataset_devkit.extraction.errors import StructuralExtractionError
+from dataset_devkit.extraction.uncertainty import bounded_freeze
 
 FailureCategory = Literal["structural", "sanity", "unexpected"]
 ArtifactHandling = Literal["no_owned_artifacts", "preserved_in_place"]
@@ -49,12 +49,16 @@ class QuarantineReport:
 
     def __post_init__(self) -> None:
         object.__setattr__(
-            self, "deterministic_details", MappingProxyType(dict(self.deterministic_details))
+            self,
+            "deterministic_details",
+            bounded_freeze(
+                self.deterministic_details, root_path="deterministic_details"
+            ),
         )
         object.__setattr__(
             self,
             "observed_context",
-            tuple(MappingProxyType(dict(item)) for item in self.observed_context),
+            bounded_freeze(self.observed_context, root_path="observed_context"),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -89,8 +93,14 @@ def _open_directory(path: Path) -> int:
         for component in path.parts[1:]:
             if not component or component == ".":
                 continue
-            with suppress(FileExistsError):
+            created = False
+            try:
                 os.mkdir(component, 0o700, dir_fd=current)
+                created = True
+            except FileExistsError:
+                pass
+            if created:
+                os.fsync(current)
             try:
                 child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
             except OSError as error:
@@ -118,8 +128,31 @@ def _write_all(file_descriptor: int, content: bytes) -> None:
         offset += written
 
 
+def _read_all(file_descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while chunk := os.read(file_descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _unlink_if_identity(
+    directory_fd: int,
+    filename: str,
+    expected: tuple[int, int] | None,
+) -> None:
+    if expected is None:
+        return
+    try:
+        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) == expected:
+        with suppress(OSError):
+            os.unlink(filename, dir_fd=directory_fd)
+
+
 def write_quarantine_report(directory: Path, report: QuarantineReport) -> QuarantineArtifact:
-    """Exclusively write one inode-bound canonical report below a no-follow root."""
+    """Durably publish complete canonical bytes below a no-follow root."""
     content = (
         json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         + "\n"
@@ -128,50 +161,91 @@ def write_quarantine_report(directory: Path, report: QuarantineReport) -> Quaran
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", report.recording_id).strip("._-") or "recording"
     try:
         while True:
-            filename = f"{slug}-{uuid.uuid4().hex}.quarantine.json"
+            token = uuid.uuid4().hex
+            filename = f"{slug}-{token}.quarantine.json"
+            temporary_name = f".{slug}-{token}.quarantine.tmp"
             try:
                 file_descriptor = os.open(
-                    filename,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_NOFOLLOW,
+                    temporary_name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | _FILE_NOFOLLOW,
                     0o600,
                     dir_fd=directory_fd,
                 )
-                break
             except FileExistsError:
                 continue
-        try:
-            opened = os.fstat(file_descriptor)
-            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-                raise StructuralExtractionError("unsafe quarantine report inode")
-            _write_all(file_descriptor, content)
-            os.fsync(file_descriptor)
-        finally:
-            os.close(file_descriptor)
-        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(current.st_mode)
-            or current.st_nlink != 1
-            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
-        ):
-            raise StructuralExtractionError("quarantine report identity changed")
-        check_fd = os.open(filename, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd)
-        try:
-            chunks: list[bytes] = []
-            while chunk := os.read(check_fd, 1024 * 1024):
-                chunks.append(chunk)
-            if b"".join(chunks) != content:
-                raise StructuralExtractionError("quarantine report verification failed")
-        finally:
-            os.close(check_fd)
-        os.fsync(directory_fd)
-    except Exception:
-        try:
-            current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-            if (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino):
-                os.unlink(filename, dir_fd=directory_fd)
-        except (FileNotFoundError, UnboundLocalError):
-            pass
-        raise
+            identity: tuple[int, int] | None = None
+            published = False
+            collision = False
+            try:
+                opened = os.fstat(file_descriptor)
+                if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                    raise StructuralExtractionError("unsafe quarantine report inode")
+                identity = opened.st_dev, opened.st_ino
+                _write_all(file_descriptor, content)
+                os.fsync(file_descriptor)
+                os.lseek(file_descriptor, 0, os.SEEK_SET)
+                if _read_all(file_descriptor) != content:
+                    raise StructuralExtractionError(
+                        "quarantine report verification failed"
+                    )
+                current = os.stat(
+                    temporary_name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino) != identity
+                ):
+                    raise StructuralExtractionError(
+                        "quarantine temporary report identity changed"
+                    )
+                try:
+                    os.link(
+                        temporary_name,
+                        filename,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    collision = True
+                else:
+                    published = True
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                    final = os.stat(
+                        filename, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        not stat.S_ISREG(final.st_mode)
+                        or final.st_nlink != 1
+                        or (final.st_dev, final.st_ino) != identity
+                    ):
+                        raise StructuralExtractionError(
+                            "quarantine report identity changed"
+                        )
+            except Exception:
+                if published:
+                    _unlink_if_identity(directory_fd, filename, identity)
+                _unlink_if_identity(directory_fd, temporary_name, identity)
+                raise
+            finally:
+                os.close(file_descriptor)
+            if collision:
+                temporary = os.stat(
+                    temporary_name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISREG(temporary.st_mode)
+                    or temporary.st_nlink != 1
+                    or (temporary.st_dev, temporary.st_ino) != identity
+                ):
+                    raise StructuralExtractionError(
+                        "quarantine collision cleanup identity changed"
+                    )
+                os.unlink(temporary_name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+                continue
+            return QuarantineArtifact(report, directory / filename)
     finally:
         os.close(directory_fd)
-    return QuarantineArtifact(report, directory / filename)

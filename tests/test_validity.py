@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import dataset_devkit.validity as validity_module
 from dataset_devkit.config import GlobalConfig, InvalidationRulesConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.gnss import interpolate_gnss
@@ -21,6 +24,7 @@ from dataset_devkit.extraction.models import (
     RecordingExtractionResult,
     StagedImage,
 )
+from dataset_devkit.extraction.staging import remove_owned_staged_images
 from dataset_devkit.validity import INVALIDITY_CODES, evaluate_validity
 
 
@@ -220,7 +224,14 @@ def test_unselected_camera_timeline_violations_remain_in_recording_audit(
             RawCameraFrame(2, "extra", 2_000_000_200, calibration),
         ),
     )
-    result = replace(result, camera_batches=(*result.camera_batches, unselected))
+    result = replace(
+        result,
+        camera_batches=(*result.camera_batches, unselected),
+        selected_grid=replace(
+            result.selected_grid,
+            unused_batch_timestamps_ns=(100, unselected_timestamp),
+        ),
+    )
 
     report = evaluate_validity(result, config_factory())  # type: ignore[operator]
 
@@ -341,6 +352,172 @@ def test_inconsistent_final_reference_is_mandatory_structural_failure(
         evaluate_validity(result, config_factory())  # type: ignore[operator]
 
 
+@pytest.mark.parametrize(
+    ("selection", "message"),
+    [
+        (
+            GridSelection(
+                (SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),),
+                (GridMiss(3_000_000_000), GridMiss(3_000_000_000)),
+                (100,),
+            ),
+            "duplicate.*target",
+        ),
+        (
+            GridSelection(
+                (SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),),
+                (GridMiss(2_000_000_000),),
+                (100,),
+            ),
+            "entry.*miss|disjoint",
+        ),
+        (
+            GridSelection(
+                (SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),),
+                (GridMiss(3_000_000_000), GridMiss(2_500_000_000)),
+                (100,),
+            ),
+            "ordered",
+        ),
+        (
+            GridSelection(
+                (SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),),
+                (GridMiss(3_000_000_000),),
+                (),
+            ),
+            "unused",
+        ),
+        (
+            GridSelection(
+                (
+                    SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),
+                    SelectedGridEntry(2_500_000_000, 2_000_000_100, -499_999_900, 499_999_900),
+                ),
+                (GridMiss(3_000_000_000),),
+                (100,),
+            ),
+            "duplicate batch",
+        ),
+    ],
+)
+def test_grid_selection_partition_contradictions_are_structural(
+    tmp_path: Path,
+    config_factory: object,
+    selection: GridSelection,
+    message: str,
+) -> None:
+    result = replace(_result(tmp_path), selected_grid=selection)
+
+    with pytest.raises(StructuralExtractionError, match=message):
+        evaluate_validity(result, config_factory())  # type: ignore[operator]
+
+
+def test_grid_audits_are_emitted_in_combined_target_order(
+    tmp_path: Path, config_factory: object
+) -> None:
+    result = _result(tmp_path)
+    result = replace(
+        result,
+        selected_grid=GridSelection(
+            result.selected_grid.entries,
+            (GridMiss(1_000_000_000), GridMiss(3_000_000_000)),
+            result.selected_grid.unused_batch_timestamps_ns,
+        ),
+    )
+
+    report = evaluate_validity(result, _configured(config_factory()))  # type: ignore[operator]
+
+    assert tuple(item.grid_target_timestamp_ns for item in report.grid_audits) == (
+        1_000_000_000,
+        2_000_000_000,
+        3_000_000_000,
+    )
+
+
+class _CountingTuple(tuple[object, ...]):
+    yielded = 0
+    maximum_yields = 20_000
+
+    def __iter__(self) -> Iterator[object]:
+        for item in super().__iter__():
+            type(self).yielded += 1
+            if type(self).yielded > type(self).maximum_yields:
+                raise AssertionError("camera batch sequence was scanned quadratically")
+            yield item
+
+
+def test_large_result_validation_builds_batch_indexes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _result(tmp_path)
+    count = 2_000
+    template_batch = base.camera_batches[0]
+    template_sample = base.samples[0]
+    batches: list[RawCameraBatch] = []
+    entries: list[SelectedGridEntry] = []
+    samples: list[ExtractedCameraSample] = []
+    poses: dict[int, EgoPose] = {}
+    for timestamp in range(1, count + 1):
+        frame = replace(
+            template_batch.frames[0],
+            camera_timestamp_ns=timestamp,
+        )
+        batch = replace(
+            template_batch,
+            rec_timestamp_ns=timestamp,
+            recorded_timestamp_ns=timestamp,
+            frame_id=timestamp,
+            rec_frame_id=timestamp,
+            frames=(frame,),
+        )
+        interpolation = replace(
+            template_sample.ego_pose.interpolation,
+            timestamp_ns=timestamp,
+        )
+        pose = replace(
+            template_sample.ego_pose,
+            timestamp_ns=timestamp,
+            interpolation=interpolation,
+        )
+        staged = replace(
+            template_sample.staged_image,
+            camera_index=frame.camera_index,
+            camera_name=frame.camera_name,
+            timestamp_ns=timestamp,
+            path=base.staging_root / f"{timestamp}.jpg",
+            inode=timestamp,
+        )
+        sample = replace(
+            template_sample,
+            grid_target_timestamp_ns=timestamp,
+            batch_timestamp_ns=timestamp,
+            camera_timestamp_ns=timestamp,
+            camera_index=frame.camera_index,
+            camera_name=frame.camera_name,
+            staged_image=staged,
+            ego_pose=pose,
+        )
+        batches.append(batch)
+        entries.append(SelectedGridEntry(timestamp, timestamp, 0, 0))
+        samples.append(sample)
+        poses[timestamp] = pose
+    result = replace(
+        base,
+        camera_batches=tuple(batches),
+        selected_grid=GridSelection(tuple(entries), (), ()),
+        samples=tuple(samples),
+        ego_poses_by_timestamp=poses,
+    )
+    counting = _CountingTuple(result.camera_batches)
+    _CountingTuple.yielded = 0
+    object.__setattr__(result, "camera_batches", counting)
+    monkeypatch.setattr(validity_module, "verify_owned_staged_images", lambda *_: None)
+
+    validity_module._validate_result(result)
+
+    assert _CountingTuple.yielded <= count * 3
+
+
 def test_drop_refuses_ancestor_symlink_without_deleting_owned_inodes(
     tmp_path: Path, config_factory: object
 ) -> None:
@@ -365,6 +542,125 @@ def test_drop_refuses_ancestor_symlink_without_deleting_owned_inodes(
         (moved_root / "recording-owned" / path.name).is_file()
         for path in original_paths
     )
+
+
+def test_transactional_drop_rolls_back_after_first_tombstone_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_rename = os.rename
+    calls = 0
+
+    def fail_second_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second move")
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.rename", fail_second_rename)
+
+    with pytest.raises(StructuralExtractionError, match="tombstone|transaction"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+    assert not list(result.staging_root.glob(".*.drop-*"))
+
+
+def test_transactional_drop_rolls_back_when_commit_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_first_fsync(file_descriptor: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected commit fsync")
+        original_fsync(file_descriptor)
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.fsync", fail_first_fsync)
+
+    with pytest.raises(StructuralExtractionError, match="transaction|commit"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+    assert not list(result.staging_root.glob(".*.drop-*"))
+
+
+def test_transactional_drop_rolls_back_when_post_move_identity_check_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_stat = os.stat
+    failed = False
+
+    def fail_first_tombstone_stat(
+        path: str,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal failed
+        value = original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if not failed and ".drop-" in path:
+            failed = True
+            raise OSError("injected post-move stat")
+        return value
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.stat", fail_first_tombstone_stat)
+
+    with pytest.raises(StructuralExtractionError, match="transaction"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+    assert not list(result.staging_root.glob(".*.drop-*"))
+
+
+def test_post_commit_tombstone_cleanup_failure_is_explicit_and_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    external = result.staging_root / "external.jpg"
+    external.write_bytes(b"external")
+    original_unlink = os.unlink
+    failed = False
+
+    def fail_first_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected tombstone cleanup")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.unlink", fail_first_unlink)
+
+    with pytest.raises(StructuralExtractionError) as caught:
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert "cleanup" in str(caught.value)
+    tombstones = caught.value.owned_tombstones  # type: ignore[attr-defined]
+    assert tombstones
+    assert all(path.is_file() for path in tombstones)
+    assert all(not image.path.exists() for image in images)
+    assert external.read_bytes() == b"external"
 
 
 def _nested_orientation_result(tmp_path: Path) -> RecordingExtractionResult:

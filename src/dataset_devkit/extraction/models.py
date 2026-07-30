@@ -9,16 +9,7 @@ from types import MappingProxyType
 from typing import Any
 
 from dataset_devkit.extraction.grid import GridSelection
-
-
-def _freeze_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze_value(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_value(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return frozenset(_freeze_value(item) for item in value)
-    return value
+from dataset_devkit.extraction.uncertainty import bounded_freeze
 
 
 @dataclass(frozen=True)
@@ -135,11 +126,25 @@ class GnssSample:
     raw_identifiers: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "position_uncertainty", _freeze_value(self.position_uncertainty))
         object.__setattr__(
-            self, "orientation_uncertainty", _freeze_value(self.orientation_uncertainty)
+            self,
+            "position_uncertainty",
+            bounded_freeze(
+                self.position_uncertainty, root_path="position_uncertainty"
+            ),
         )
-        object.__setattr__(self, "raw_identifiers", _freeze_value(self.raw_identifiers))
+        object.__setattr__(
+            self,
+            "orientation_uncertainty",
+            bounded_freeze(
+                self.orientation_uncertainty, root_path="orientation_uncertainty"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "raw_identifiers",
+            bounded_freeze(self.raw_identifiers, root_path="raw_identifiers"),
+        )
 
 
 @dataclass(frozen=True)
@@ -164,9 +169,19 @@ class GnssInterpolation:
     orientation_uncertainty_uninterpolated_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "position_uncertainty", _freeze_value(self.position_uncertainty))
         object.__setattr__(
-            self, "orientation_uncertainty", _freeze_value(self.orientation_uncertainty)
+            self,
+            "position_uncertainty",
+            bounded_freeze(
+                self.position_uncertainty, root_path="position_uncertainty"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "orientation_uncertainty",
+            bounded_freeze(
+                self.orientation_uncertainty, root_path="orientation_uncertainty"
+            ),
         )
 
 

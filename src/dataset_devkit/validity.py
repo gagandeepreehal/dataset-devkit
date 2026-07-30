@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -12,11 +12,17 @@ from typing import Any, Literal, cast
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.gnss import parse_numeric_uncertainty_leaf
-from dataset_devkit.extraction.models import ExtractedCameraSample, RecordingExtractionResult
+from dataset_devkit.extraction.grid import SelectedGridEntry
+from dataset_devkit.extraction.models import (
+    ExtractedCameraSample,
+    RawCameraBatch,
+    RecordingExtractionResult,
+)
 from dataset_devkit.extraction.staging import (
     remove_owned_staged_images,
     verify_owned_staged_images,
 )
+from dataset_devkit.extraction.uncertainty import bounded_leaf_items
 
 type InvalidityCode = Literal[
     "gnss_source_invalid",
@@ -119,49 +125,43 @@ def _observation(
 
 def _numeric_orientation_values(value: Mapping[str, Any]) -> dict[str, float]:
     found: dict[str, float] = {}
-
-    def visit(item: object, prefix: str) -> None:
+    for path, item in bounded_leaf_items(value):
         number = parse_numeric_uncertainty_leaf(item)
         if number is not None:
-            found[prefix] = number
-            return
-        if isinstance(item, Mapping):
-            for key in sorted(item, key=str):
-                name = f"{prefix}.{key}" if prefix else str(key)
-                visit(item[key], name)
-        elif isinstance(item, Sequence) and not isinstance(
-            item, (str, bytes, bytearray)
-        ):
-            for index, nested in enumerate(item):
-                visit(nested, f"{prefix}[{index}]")
-
-    visit(value, "")
+            found[path] = number
     return found
 
 
+type _FrameReference = tuple[int, str, int]
+
+
+@dataclass(frozen=True)
+class _ResultIndexes:
+    batches_by_timestamp: Mapping[int, RawCameraBatch]
+    entries_by_batch: Mapping[int, SelectedGridEntry]
+    frames_by_batch: Mapping[int, frozenset[_FrameReference]]
+    samples_by_batch: Mapping[int, tuple[ExtractedCameraSample, ...]]
+
+
 def _assert_sample_reference(
-    result: RecordingExtractionResult, sample: ExtractedCameraSample
+    result: RecordingExtractionResult,
+    sample: ExtractedCameraSample,
+    indexes: _ResultIndexes,
 ) -> None:
-    if sample.batch_timestamp_ns not in {
-        entry.batch_timestamp_ns for entry in result.selected_grid.entries
-    }:
+    matching_entry = indexes.entries_by_batch.get(sample.batch_timestamp_ns)
+    if matching_entry is None:
         raise StructuralExtractionError("sample references an unselected camera batch")
-    matching_entry = next(
-        entry for entry in result.selected_grid.entries
-        if entry.batch_timestamp_ns == sample.batch_timestamp_ns
-    )
     if matching_entry.target_timestamp_ns != sample.grid_target_timestamp_ns:
         raise StructuralExtractionError("sample grid target reference is inconsistent")
-    matching_batch = next(
-        (batch for batch in result.camera_batches
-         if batch.rec_timestamp_ns == sample.batch_timestamp_ns),
-        None,
+    matching_batch = indexes.batches_by_timestamp.get(sample.batch_timestamp_ns)
+    frame_reference = (
+        sample.camera_index,
+        sample.camera_name,
+        sample.camera_timestamp_ns,
     )
-    if matching_batch is None or not any(
-        frame.camera_index == sample.camera_index
-        and frame.camera_name == sample.camera_name
-        and frame.camera_timestamp_ns == sample.camera_timestamp_ns
-        for frame in matching_batch.frames
+    if (
+        matching_batch is None
+        or frame_reference not in indexes.frames_by_batch[sample.batch_timestamp_ns]
     ):
         raise StructuralExtractionError("sample camera reference is inconsistent")
     staged = sample.staged_image
@@ -194,20 +194,80 @@ def _assert_sample_reference(
         raise StructuralExtractionError("unavailable pose contains final pose values")
 
 
-def _validate_result(result: RecordingExtractionResult) -> None:
-    batches = {batch.rec_timestamp_ns: batch for batch in result.camera_batches}
-    if len(batches) != len(result.camera_batches):
-        raise StructuralExtractionError("recording contains duplicate camera batch references")
-    selected_batches = [entry.batch_timestamp_ns for entry in result.selected_grid.entries]
-    selected_targets = [entry.target_timestamp_ns for entry in result.selected_grid.entries]
+def _build_result_indexes(result: RecordingExtractionResult) -> _ResultIndexes:
+    batches: dict[int, RawCameraBatch] = {}
+    frames_by_batch: dict[int, frozenset[_FrameReference]] = {}
+    for batch in result.camera_batches:
+        if batch.rec_timestamp_ns in batches:
+            raise StructuralExtractionError(
+                "recording contains duplicate camera batch references"
+            )
+        batches[batch.rec_timestamp_ns] = batch
+        frame_references = tuple(
+            (frame.camera_index, frame.camera_name, frame.camera_timestamp_ns)
+            for frame in batch.frames
+        )
+        if len(frame_references) != len(set(frame_references)):
+            raise StructuralExtractionError(
+                "camera batch contains duplicate frame references"
+            )
+        frames_by_batch[batch.rec_timestamp_ns] = frozenset(frame_references)
+
+    entries = result.selected_grid.entries
+    selected_targets = tuple(entry.target_timestamp_ns for entry in entries)
+    selected_batches = tuple(entry.batch_timestamp_ns for entry in entries)
     if len(set(selected_batches)) != len(selected_batches):
         raise StructuralExtractionError("selected grid contains duplicate batch references")
     if len(set(selected_targets)) != len(selected_targets):
         raise StructuralExtractionError("selected grid contains duplicate target references")
+    if any(
+        current <= previous
+        for previous, current in zip(
+            selected_targets, selected_targets[1:], strict=False
+        )
+    ):
+        raise StructuralExtractionError("selected grid targets are not strictly ordered")
+    if any(timestamp not in batches for timestamp in selected_batches):
+        raise StructuralExtractionError("selected grid references a missing camera batch")
+
+    miss_targets = tuple(miss.target_timestamp_ns for miss in result.selected_grid.misses)
+    if len(set(miss_targets)) != len(miss_targets):
+        raise StructuralExtractionError("grid misses contain duplicate target references")
+    if any(
+        current <= previous
+        for previous, current in zip(miss_targets, miss_targets[1:], strict=False)
+    ):
+        raise StructuralExtractionError("grid miss targets are not strictly ordered")
+    if set(selected_targets) & set(miss_targets):
+        raise StructuralExtractionError(
+            "selected grid entry and miss targets are not disjoint"
+        )
+
+    unused = result.selected_grid.unused_batch_timestamps_ns
+    if len(unused) != len(set(unused)):
+        raise StructuralExtractionError("unused camera batch timestamps are not unique")
+    expected_unused = tuple(sorted(set(batches) - set(selected_batches)))
+    if unused != expected_unused:
+        raise StructuralExtractionError(
+            "unused camera batch timestamps do not exactly match the source partition"
+        )
+
+    entries_by_batch = {entry.batch_timestamp_ns: entry for entry in entries}
     samples_by_batch: dict[int, list[ExtractedCameraSample]] = {}
     for sample in result.samples:
-        _assert_sample_reference(result, sample)
         samples_by_batch.setdefault(sample.batch_timestamp_ns, []).append(sample)
+    return _ResultIndexes(
+        batches,
+        entries_by_batch,
+        frames_by_batch,
+        {timestamp: tuple(samples) for timestamp, samples in samples_by_batch.items()},
+    )
+
+
+def _validate_result(result: RecordingExtractionResult) -> _ResultIndexes:
+    indexes = _build_result_indexes(result)
+    for sample in result.samples:
+        _assert_sample_reference(result, sample, indexes)
         mapped_pose = result.ego_poses_by_timestamp.get(sample.camera_timestamp_ns)
         if mapped_pose != sample.ego_pose:
             raise StructuralExtractionError("sample pose map reference is inconsistent")
@@ -221,20 +281,18 @@ def _validate_result(result: RecordingExtractionResult) -> None:
         sample.camera_timestamp_ns for sample in result.samples
     }:
         raise StructuralExtractionError("pose map contains missing or unreferenced poses")
-    for batch_timestamp in selected_batches:
-        batch = batches.get(batch_timestamp)
-        if batch is None:
-            raise StructuralExtractionError("selected grid references a missing camera batch")
-        expected = {
-            (frame.camera_index, frame.camera_name, frame.camera_timestamp_ns)
-            for frame in batch.frames
-        }
+    for batch_timestamp in indexes.entries_by_batch:
+        expected = indexes.frames_by_batch[batch_timestamp]
         actual = {
             (sample.camera_index, sample.camera_name, sample.camera_timestamp_ns)
-            for sample in samples_by_batch.get(batch_timestamp, ())
+            for sample in indexes.samples_by_batch.get(batch_timestamp, ())
         }
-        if expected != actual or len(actual) != len(samples_by_batch.get(batch_timestamp, ())):
+        if (
+            expected != actual
+            or len(actual) != len(indexes.samples_by_batch.get(batch_timestamp, ()))
+        ):
             raise StructuralExtractionError("selected batch sample references are inconsistent")
+    return indexes
 
 
 def _camera_timeline_observations(
@@ -437,17 +495,14 @@ def evaluate_validity(
     result: RecordingExtractionResult, config: GlobalConfig
 ) -> ValidityReport:
     """Observe every policy reason, then derive sample and recording validity."""
-    _validate_result(result)
-    samples_by_batch: dict[int, list[ExtractedCameraSample]] = {}
-    for sample in result.samples:
-        samples_by_batch.setdefault(sample.batch_timestamp_ns, []).append(sample)
+    indexes = _validate_result(result)
     timeline_observations, timeline_by_batch = _camera_timeline_observations(result, config)
     all_observations: list[InvalidityObservation] = list(timeline_observations)
     sample_audits: list[LogicalSampleAudit] = []
     grid_audits: list[GridAuditRecord] = []
     required = tuple(config.frame_validity.required_cameras)
     for entry in result.selected_grid.entries:
-        samples = tuple(samples_by_batch.get(entry.batch_timestamp_ns, ()))
+        samples = indexes.samples_by_batch.get(entry.batch_timestamp_ns, ())
         observations = list(timeline_by_batch.get(entry.batch_timestamp_ns, ()))
         timeline_count = len(observations)
         present = {sample.camera_name for sample in samples}
@@ -499,6 +554,7 @@ def evaluate_validity(
             )
         )
         all_observations.append(observation)
+    grid_audits.sort(key=lambda audit: audit.grid_target_timestamp_ns)
     final = tuple(audit for audit in sample_audits if audit.valid)
     invalid = tuple(audit for audit in sample_audits if not audit.valid)
     if config.frame_validity.invalid_sample_policy == "drop":
