@@ -1,0 +1,96 @@
+{
+  "schema_version": "1.0",
+  "azure": {
+    "account_url": "https://roboticsdata.blob.core.windows.net",
+    "container": "recordings",
+    "blob_list": "mcap_blobs.txt"
+  },
+  "paths": {
+    "work_dir": "../var/work",
+    "cache_dir": "../var/cache",
+    "output_dir": "../var/datasets/nuscenes"
+  },
+  "topics": {
+    "camera": "rec_cameras",
+    "gnss": "gnss"
+  },
+  "downsampling": {
+    "target_fps": 2.0,
+    "tolerance_ms": 100.0
+  },
+  "image": {
+    "jpeg_quality": 95
+  },
+  "gnss": {
+    "position_sigma_max_m": 0.5,
+    "orientation_variance_max": 0.1,
+    "sync_gap_max_ms": 30.0
+  },
+  "frame_validity": {
+    "invalid_sample_policy": "retain_for_audit",
+    "invalidate_on": {
+      "missing_camera": true,
+      "invalid_gnss": true,
+      "sync_gap_exceeded": true
+    }
+  },
+  "sanity_checks": {
+    "timestamp_policy": "quarantine",
+    "max_speed_mps": 70.0,
+    "max_position_jump_m": 20.0
+  },
+  "scenes": {
+    "mode": "hybrid",
+    "min_duration_s": 10.0,
+    "max_duration_s": 40.0,
+    "min_samples": 20,
+    "max_sample_gap_ms": 650.0,
+    "skip_between_scenes_s": 0.0
+  },
+  "annotations": {
+    "path": "annotations.jsonl",
+    "match_tolerance_ms": 500.0,
+    "before_s": 20.0,
+    "after_s": 20.0
+  },
+  "tags": {
+    "stationary_speed_mps": 0.2,
+    "turn_angle_deg": 45.0
+  },
+  "filters": {
+    "min_valid_ratio": 0.95,
+    "required_tags": []
+  },
+  "scenarios": {
+    "seed": 42,
+    "rules": [
+      {
+        "name": "turns",
+        "required_tags": ["turn"],
+        "excluded_tags": ["stationary"],
+        "sampling": {
+          "fraction": 0.5,
+          "max_scenes": 100
+        }
+      }
+    ]
+  },
+  "split": {
+    "test_fraction": 0.2,
+    "seed": 42,
+    "stratify": true
+  },
+  "execution": {
+    "workers": 4,
+    "allow_partial_export": false
+  },
+  "quarantine": {
+    "enabled": true,
+    "directory": "../var/quarantine",
+    "manifest_name": "rejected.jsonl"
+  },
+  "publication": {
+    "version": "v1.0-trainval",
+    "refuse_overwrite": true
+  }
+}

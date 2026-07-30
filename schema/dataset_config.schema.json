@@ -1,0 +1,593 @@
+{
+  "$defs": {
+    "AnnotationsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "after_s": {
+          "minimum": 0,
+          "title": "After S",
+          "type": "number"
+        },
+        "before_s": {
+          "minimum": 0,
+          "title": "Before S",
+          "type": "number"
+        },
+        "match_tolerance_ms": {
+          "minimum": 0,
+          "title": "Match Tolerance Ms",
+          "type": "number"
+        },
+        "path": {
+          "format": "path",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "match_tolerance_ms",
+        "before_s",
+        "after_s"
+      ],
+      "title": "AnnotationsConfig",
+      "type": "object"
+    },
+    "AzureConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "account_url": {
+          "title": "Account Url",
+          "type": "string"
+        },
+        "blob_list": {
+          "format": "path",
+          "title": "Blob List",
+          "type": "string"
+        },
+        "container": {
+          "title": "Container",
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_url",
+        "container",
+        "blob_list"
+      ],
+      "title": "AzureConfig",
+      "type": "object"
+    },
+    "DownsamplingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "target_fps": {
+          "exclusiveMinimum": 0,
+          "title": "Target Fps",
+          "type": "number"
+        },
+        "tolerance_ms": {
+          "minimum": 0,
+          "title": "Tolerance Ms",
+          "type": "number"
+        }
+      },
+      "required": [
+        "target_fps",
+        "tolerance_ms"
+      ],
+      "title": "DownsamplingConfig",
+      "type": "object"
+    },
+    "ExecutionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_partial_export": {
+          "title": "Allow Partial Export",
+          "type": "boolean"
+        },
+        "workers": {
+          "minimum": 1,
+          "title": "Workers",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "workers",
+        "allow_partial_export"
+      ],
+      "title": "ExecutionConfig",
+      "type": "object"
+    },
+    "FiltersConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "min_valid_ratio": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Min Valid Ratio",
+          "type": "number"
+        },
+        "required_tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Tags",
+          "type": "array"
+        }
+      },
+      "required": [
+        "min_valid_ratio",
+        "required_tags"
+      ],
+      "title": "FiltersConfig",
+      "type": "object"
+    },
+    "FrameValidityConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "invalid_sample_policy": {
+          "enum": [
+            "retain_for_audit",
+            "drop"
+          ],
+          "title": "Invalid Sample Policy",
+          "type": "string"
+        },
+        "invalidate_on": {
+          "$ref": "#/$defs/InvalidationRulesConfig"
+        }
+      },
+      "required": [
+        "invalid_sample_policy",
+        "invalidate_on"
+      ],
+      "title": "FrameValidityConfig",
+      "type": "object"
+    },
+    "GnssConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "orientation_variance_max": {
+          "minimum": 0,
+          "title": "Orientation Variance Max",
+          "type": "number"
+        },
+        "position_sigma_max_m": {
+          "minimum": 0,
+          "title": "Position Sigma Max M",
+          "type": "number"
+        },
+        "sync_gap_max_ms": {
+          "minimum": 0,
+          "title": "Sync Gap Max Ms",
+          "type": "number"
+        }
+      },
+      "required": [
+        "position_sigma_max_m",
+        "orientation_variance_max",
+        "sync_gap_max_ms"
+      ],
+      "title": "GnssConfig",
+      "type": "object"
+    },
+    "ImageConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "jpeg_quality": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Jpeg Quality",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "jpeg_quality"
+      ],
+      "title": "ImageConfig",
+      "type": "object"
+    },
+    "InvalidationRulesConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "invalid_gnss": {
+          "default": true,
+          "title": "Invalid Gnss",
+          "type": "boolean"
+        },
+        "missing_camera": {
+          "default": true,
+          "title": "Missing Camera",
+          "type": "boolean"
+        },
+        "sync_gap_exceeded": {
+          "default": true,
+          "title": "Sync Gap Exceeded",
+          "type": "boolean"
+        }
+      },
+      "title": "InvalidationRulesConfig",
+      "type": "object"
+    },
+    "PathsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_dir": {
+          "format": "path",
+          "title": "Cache Dir",
+          "type": "string"
+        },
+        "output_dir": {
+          "format": "path",
+          "title": "Output Dir",
+          "type": "string"
+        },
+        "work_dir": {
+          "format": "path",
+          "title": "Work Dir",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_dir",
+        "cache_dir",
+        "output_dir"
+      ],
+      "title": "PathsConfig",
+      "type": "object"
+    },
+    "PublicationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "refuse_overwrite": {
+          "title": "Refuse Overwrite",
+          "type": "boolean"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "refuse_overwrite"
+      ],
+      "title": "PublicationConfig",
+      "type": "object"
+    },
+    "QuarantineConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "directory": {
+          "default": "quarantine",
+          "format": "path",
+          "title": "Directory",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "manifest_name": {
+          "default": "rejected.jsonl",
+          "minLength": 1,
+          "title": "Manifest Name",
+          "type": "string"
+        }
+      },
+      "title": "QuarantineConfig",
+      "type": "object"
+    },
+    "SamplingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "fraction": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Fraction",
+          "type": "number"
+        },
+        "max_scenes": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Scenes"
+        }
+      },
+      "required": [
+        "fraction"
+      ],
+      "title": "SamplingConfig",
+      "type": "object"
+    },
+    "SanityChecksConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_position_jump_m": {
+          "default": 20.0,
+          "exclusiveMinimum": 0,
+          "title": "Max Position Jump M",
+          "type": "number"
+        },
+        "max_speed_mps": {
+          "default": 70.0,
+          "exclusiveMinimum": 0,
+          "title": "Max Speed Mps",
+          "type": "number"
+        },
+        "timestamp_policy": {
+          "default": "quarantine",
+          "enum": [
+            "error",
+            "quarantine",
+            "warn"
+          ],
+          "title": "Timestamp Policy",
+          "type": "string"
+        }
+      },
+      "title": "SanityChecksConfig",
+      "type": "object"
+    },
+    "ScenarioRuleConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "excluded_tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Excluded Tags",
+          "type": "array"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "required_tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Tags",
+          "type": "array"
+        },
+        "sampling": {
+          "$ref": "#/$defs/SamplingConfig"
+        }
+      },
+      "required": [
+        "name",
+        "sampling"
+      ],
+      "title": "ScenarioRuleConfig",
+      "type": "object"
+    },
+    "ScenariosConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "rules": {
+          "items": {
+            "$ref": "#/$defs/ScenarioRuleConfig"
+          },
+          "title": "Rules",
+          "type": "array"
+        },
+        "seed": {
+          "title": "Seed",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seed",
+        "rules"
+      ],
+      "title": "ScenariosConfig",
+      "type": "object"
+    },
+    "ScenesConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_duration_s": {
+          "exclusiveMinimum": 0,
+          "title": "Max Duration S",
+          "type": "number"
+        },
+        "max_sample_gap_ms": {
+          "minimum": 0,
+          "title": "Max Sample Gap Ms",
+          "type": "number"
+        },
+        "min_duration_s": {
+          "exclusiveMinimum": 0,
+          "title": "Min Duration S",
+          "type": "number"
+        },
+        "min_samples": {
+          "minimum": 1,
+          "title": "Min Samples",
+          "type": "integer"
+        },
+        "mode": {
+          "enum": [
+            "hybrid",
+            "fixed",
+            "annotation"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "skip_between_scenes_s": {
+          "minimum": 0,
+          "title": "Skip Between Scenes S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "mode",
+        "min_duration_s",
+        "max_duration_s",
+        "min_samples",
+        "max_sample_gap_ms",
+        "skip_between_scenes_s"
+      ],
+      "title": "ScenesConfig",
+      "type": "object"
+    },
+    "SplitConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "seed": {
+          "title": "Seed",
+          "type": "integer"
+        },
+        "stratify": {
+          "title": "Stratify",
+          "type": "boolean"
+        },
+        "test_fraction": {
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "title": "Test Fraction",
+          "type": "number"
+        }
+      },
+      "required": [
+        "test_fraction",
+        "seed",
+        "stratify"
+      ],
+      "title": "SplitConfig",
+      "type": "object"
+    },
+    "TagsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "stationary_speed_mps": {
+          "minimum": 0,
+          "title": "Stationary Speed Mps",
+          "type": "number"
+        },
+        "turn_angle_deg": {
+          "maximum": 180,
+          "minimum": 0,
+          "title": "Turn Angle Deg",
+          "type": "number"
+        }
+      },
+      "required": [
+        "stationary_speed_mps",
+        "turn_angle_deg"
+      ],
+      "title": "TagsConfig",
+      "type": "object"
+    },
+    "TopicsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "camera": {
+          "title": "Camera",
+          "type": "string"
+        },
+        "gnss": {
+          "title": "Gnss",
+          "type": "string"
+        }
+      },
+      "required": [
+        "camera",
+        "gnss"
+      ],
+      "title": "TopicsConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "annotations": {
+      "$ref": "#/$defs/AnnotationsConfig"
+    },
+    "azure": {
+      "$ref": "#/$defs/AzureConfig"
+    },
+    "downsampling": {
+      "$ref": "#/$defs/DownsamplingConfig"
+    },
+    "execution": {
+      "$ref": "#/$defs/ExecutionConfig"
+    },
+    "filters": {
+      "$ref": "#/$defs/FiltersConfig"
+    },
+    "frame_validity": {
+      "$ref": "#/$defs/FrameValidityConfig"
+    },
+    "gnss": {
+      "$ref": "#/$defs/GnssConfig"
+    },
+    "image": {
+      "$ref": "#/$defs/ImageConfig"
+    },
+    "paths": {
+      "$ref": "#/$defs/PathsConfig"
+    },
+    "publication": {
+      "$ref": "#/$defs/PublicationConfig"
+    },
+    "quarantine": {
+      "$ref": "#/$defs/QuarantineConfig"
+    },
+    "sanity_checks": {
+      "$ref": "#/$defs/SanityChecksConfig"
+    },
+    "scenarios": {
+      "$ref": "#/$defs/ScenariosConfig"
+    },
+    "scenes": {
+      "$ref": "#/$defs/ScenesConfig"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "split": {
+      "$ref": "#/$defs/SplitConfig"
+    },
+    "tags": {
+      "$ref": "#/$defs/TagsConfig"
+    },
+    "topics": {
+      "$ref": "#/$defs/TopicsConfig"
+    }
+  },
+  "required": [
+    "schema_version",
+    "azure",
+    "paths",
+    "topics",
+    "downsampling",
+    "image",
+    "gnss",
+    "frame_validity",
+    "sanity_checks",
+    "scenes",
+    "annotations",
+    "tags",
+    "filters",
+    "scenarios",
+    "split",
+    "execution",
+    "publication"
+  ],
+  "title": "GlobalConfig",
+  "type": "object"
+}
