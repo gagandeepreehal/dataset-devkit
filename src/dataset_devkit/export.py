@@ -143,15 +143,58 @@ class _SafeDatarootWriter:
         finally:
             os.close(check_fd)
 
+    def _assert_component_chain(
+        self, directory_fds: Sequence[int], components: Sequence[str]
+    ) -> None:
+        self._assert_root_unchanged()
+        if (
+            len(directory_fds) != len(components) + 1
+            or _identity(os.fstat(directory_fds[0])) != self._root_identity
+        ):
+            raise ValueError("output directory component chain changed")
+        for index, component in enumerate(components):
+            parent_fd = directory_fds[index]
+            child_fd = directory_fds[index + 1]
+            try:
+                listed = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+                opened = os.fstat(child_fd)
+            except OSError as error:
+                raise ValueError("output directory component chain changed") from error
+            if (
+                not stat.S_ISDIR(listed.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or _identity(listed) != _identity(opened)
+            ):
+                raise ValueError("output directory component chain changed")
+
+    @staticmethod
+    def _unlink_owned_leaf(
+        directory_fd: int, filename: str, expected_identity: tuple[int, int] | None
+    ) -> None:
+        if expected_identity is None:
+            return
+        try:
+            listed = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISREG(listed.st_mode) and _identity(listed) == expected_identity:
+            os.unlink(filename, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+
     def write(self, relative_parts: tuple[str, ...], content: bytes) -> None:
         if not relative_parts:
             raise ValueError("staging output path must contain a filename")
         for part in relative_parts:
             validate_safe_segment(part)
-        self._assert_root_unchanged()
-        directory_fd = os.dup(self._root_fd)
+        directory_fds = [os.dup(self._root_fd)]
+        components: list[str] = []
+        filename = relative_parts[-1]
+        file_fd: int | None = None
+        read_fd: int | None = None
+        leaf_identity: tuple[int, int] | None = None
         try:
             for component in relative_parts[:-1]:
+                directory_fd = directory_fds[-1]
                 with suppress(FileExistsError):
                     os.mkdir(component, mode=0o700, dir_fd=directory_fd)
                 child_fd: int | None = None
@@ -174,9 +217,10 @@ class _SafeDatarootWriter:
                         os.close(child_fd)
                     raise
                 assert child_fd is not None
-                os.close(directory_fd)
-                directory_fd = child_fd
-            filename = relative_parts[-1]
+                components.append(component)
+                directory_fds.append(child_fd)
+            self._assert_component_chain(directory_fds, components)
+            directory_fd = directory_fds[-1]
             try:
                 file_fd = os.open(
                     filename,
@@ -190,25 +234,27 @@ class _SafeDatarootWriter:
                 ) from error
             except OSError as error:
                 raise ValueError("output leaf is a symlink or unsafe file") from error
-            try:
-                offset = 0
-                while offset < len(content):
-                    written = os.write(file_fd, content[offset:])
-                    if written <= 0:
-                        raise OSError("short write while exporting dataset")
-                    offset += written
-                os.fsync(file_fd)
-                written_stat = os.fstat(file_fd)
-                listed = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-                if (
-                    not stat.S_ISREG(written_stat.st_mode)
-                    or written_stat.st_nlink != 1
-                    or _identity(written_stat) != _identity(listed)
-                    or written_stat.st_size != len(content)
-                ):
-                    raise ValueError("exported file identity changed during write")
-            finally:
-                os.close(file_fd)
+            written_stat = os.fstat(file_fd)
+            leaf_identity = _identity(written_stat)
+            self._assert_component_chain(directory_fds, components)
+            offset = 0
+            while offset < len(content):
+                written = os.write(file_fd, content[offset:])
+                if written <= 0:
+                    raise OSError("short write while exporting dataset")
+                offset += written
+            os.fsync(file_fd)
+            written_stat = os.fstat(file_fd)
+            listed = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(written_stat.st_mode)
+                or written_stat.st_nlink != 1
+                or _identity(written_stat) != _identity(listed)
+                or written_stat.st_size != len(content)
+            ):
+                raise ValueError("exported file identity changed during write")
+            os.close(file_fd)
+            file_fd = None
             try:
                 read_fd = os.open(
                     filename, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd
@@ -222,11 +268,22 @@ class _SafeDatarootWriter:
                 if b"".join(chunks) != content:
                     raise ValueError("exported file content verification failed")
             finally:
-                os.close(read_fd)
+                if read_fd is not None:
+                    os.close(read_fd)
+                    read_fd = None
             os.fsync(directory_fd)
+            self._assert_component_chain(directory_fds, components)
+            self._assert_component_chain(directory_fds, components)
+        except Exception:
+            if read_fd is not None:
+                os.close(read_fd)
+            if file_fd is not None:
+                os.close(file_fd)
+            self._unlink_owned_leaf(directory_fds[-1], filename, leaf_identity)
+            raise
         finally:
-            os.close(directory_fd)
-        self._assert_root_unchanged()
+            for directory_fd in reversed(directory_fds):
+                os.close(directory_fd)
 
 
 @dataclass(frozen=True)

@@ -658,6 +658,49 @@ def test_safe_writer_rejects_nested_symlink_and_root_replacement(tmp_path: Path)
         assert not (outside / "escape.json").exists()
 
 
+@pytest.mark.parametrize("replacement", ["absent", "symlink", "directory"])
+def test_safe_writer_unlinks_leaf_when_nested_chain_moves_during_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    stolen = outside / "stolen"
+    redirect = outside / "redirect"
+    outside.mkdir()
+    redirect.mkdir()
+    original_open = os.open
+    raced = False
+
+    with export_module._SafeDatarootWriter(root) as writer:
+        writer.write(("level-one", "level-two", "seed.bin"), b"seed")
+        seed = root / "level-one" / "level-two" / "seed.bin"
+        seed.unlink()
+
+        def racing_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal raced
+            if path == "payload.bin" and flags & os.O_CREAT and not raced:
+                raced = True
+                os.rename(root / "level-one" / "level-two", stolen)
+                if replacement == "symlink":
+                    (root / "level-one" / "level-two").symlink_to(
+                        redirect, target_is_directory=True
+                    )
+                elif replacement == "directory":
+                    (root / "level-one" / "level-two").mkdir()
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", racing_open)
+        with pytest.raises(ValueError, match="directory.*changed|component.*changed"):
+            writer.write(
+                ("level-one", "level-two", "payload.bin"), b"secret-payload"
+            )
+
+    assert raced is True
+    if replacement == "absent":
+        assert not (root / "level-one" / "level-two").exists()
+    assert not (stolen / "payload.bin").exists()
+    assert not (redirect / "payload.bin").exists()
+
 def test_official_nuscenes_loader_smoke(
     tmp_path: Path,
     config_factory: Callable[[], GlobalConfig],
