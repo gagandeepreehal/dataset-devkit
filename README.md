@@ -106,7 +106,9 @@ complete sample and per-camera sample-data chains always stay in its assigned sp
 `write_split_extension` revalidates all upstream evidence before atomically writing canonical,
 wall-clock-free `mz_extensions/split.json`. The extension records source-disambiguated
 assignments, exact counts, per-stratum audits, fingerprints, and chronological adjacent-scene
-cross-split evidence with a neighboring-context leakage warning. Use `validate_scene_split` to
+cross-split evidence with a neighboring-context leakage warning. Published validation uses the
+compact complete Task 5 scene chronology in `pipeline_audit.json`, rather than treating filtered
+or unselected gaps as adjacency. Use `validate_scene_split` to
 recompute and validate an in-memory result; these three functions are the public Task 7 APIs.
 
 The stable Python import is:

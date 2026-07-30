@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from ctypes import CDLL, c_char_p, c_int, get_errno
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, cast
@@ -18,10 +22,68 @@ from pydantic import TypeAdapter, ValidationError
 from dataset_devkit.extraction.models import RecordingExtractionResult, StagedImage
 from dataset_devkit.extraction.staging import staged_directory_metadata
 from dataset_devkit.provenance import SourceFingerprint, canonical_json
-from dataset_devkit.publication import publish_staging
+from dataset_devkit.publication import fsync_tree, publish_staging
 
 _ADAPTER = TypeAdapter(RecordingExtractionResult)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    current = path.lstat()
+    if not stat.S_ISDIR(current.st_mode):
+        raise ValueError("cache generation must be a directory")
+    return current.st_dev, current.st_ino
+
+
+def _exchange_directories(parent_fd: int, left: str, right: str) -> None:
+    """Atomically exchange two sibling directories without a missing-generation gap."""
+    library = CDLL(None, use_errno=True)
+    encoded_left = os.fsencode(left)
+    encoded_right = os.fsencode(right)
+    if sys.platform == "darwin":
+        rename = library.renameatx_np
+        rename.argtypes = (c_int, c_char_p, c_int, c_char_p, c_int)
+        result = rename(parent_fd, encoded_left, parent_fd, encoded_right, 0x00000002)
+    elif sys.platform.startswith("linux"):
+        rename = library.renameat2
+        rename.argtypes = (c_int, c_char_p, c_int, c_char_p, c_int)
+        result = rename(parent_fd, encoded_left, parent_fd, encoded_right, 0x2)
+    else:
+        raise OSError("atomic directory exchange is unavailable on this platform")
+    if result != 0:
+        error_number = get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+@contextmanager
+def _cache_lock(parent: Path, name: str) -> Iterator[None]:
+    parent.mkdir(parents=True, exist_ok=True)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDWR | os.O_CREAT | _NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        listed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)
+        ):
+            raise ValueError("cache lock must be an owned single-link regular file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        if descriptor >= 0:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+        os.close(parent_fd)
 
 
 def _jsonable(value: object) -> object:
@@ -174,13 +236,27 @@ class ExtractionResultCache:
         source: SourceFingerprint,
         config_hash: str,
         result: RecordingExtractionResult,
+        *,
+        force_refresh: bool = False,
     ) -> RecordingExtractionResult:
         final = self.path_for(source, config_hash)
-        cached = self.load(source, config_hash, result.source_path)
-        if cached is not None:
-            return cached
-        final.parent.mkdir(parents=True, exist_ok=True)
-        temporary = Path(tempfile.mkdtemp(prefix=f".{config_hash}.staging-", dir=final.parent))
+        with _cache_lock(final.parent, f".{config_hash}.lock"):
+            cached = self.load(source, config_hash, result.source_path)
+            if cached is not None and not force_refresh:
+                return cached
+            return self._store_locked(source, config_hash, result, final)
+
+    def _store_locked(
+        self,
+        source: SourceFingerprint,
+        config_hash: str,
+        result: RecordingExtractionResult,
+        final: Path,
+    ) -> RecordingExtractionResult:
+        existing_identity = _directory_identity(final) if final.exists() else None
+        temporary = Path(
+            tempfile.mkdtemp(prefix=f".{config_hash}.staging-", dir=final.parent)
+        )
         try:
             image_directory = temporary / "images"
             image_directory.mkdir()
@@ -225,9 +301,10 @@ class ExtractionResultCache:
                 "images": image_rows,
             }
             (temporary / "manifest.json").write_text(canonical_json(manifest) + "\n")
-            try:
+            if existing_identity is None:
                 publish_staging(temporary, final)
-            except FileExistsError:
+            else:
+                self._publish_refresh(temporary, final, existing_identity)
                 shutil.rmtree(temporary)
             loaded = self.load(source, config_hash, result.source_path)
             if loaded is None:
@@ -237,3 +314,35 @@ class ExtractionResultCache:
             if temporary.exists():
                 shutil.rmtree(temporary)
             raise
+
+    def _publish_refresh(
+        self,
+        temporary: Path,
+        final: Path,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        """Atomically swap a verified staging generation with its locked predecessor."""
+        temporary_identity = _directory_identity(temporary)
+        fsync_tree(temporary)
+        parent_fd = os.open(final.parent, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
+        try:
+            listed_temporary = os.stat(
+                temporary.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            listed_final = os.stat(final.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (listed_temporary.st_dev, listed_temporary.st_ino) != temporary_identity:
+                raise ValueError("cache staging directory identity changed")
+            if (listed_final.st_dev, listed_final.st_ino) != expected_identity:
+                raise ValueError("cache generation identity changed before refresh")
+            _exchange_directories(parent_fd, temporary.name, final.name)
+            os.fsync(parent_fd)
+            refreshed = os.stat(final.name, dir_fd=parent_fd, follow_symlinks=False)
+            predecessor = os.stat(
+                temporary.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (refreshed.st_dev, refreshed.st_ino) != temporary_identity:
+                raise ValueError("refreshed cache generation identity differs")
+            if (predecessor.st_dev, predecessor.st_ino) != expected_identity:
+                raise ValueError("replaced cache generation identity differs")
+        finally:
+            os.close(parent_fd)

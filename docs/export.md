@@ -40,7 +40,9 @@ and camera-time ego poses are required and must be finite.
 `mz_extensions` contains canonical `recordings.json`, `gnss.json`, `validity.json`,
 `validation.json`, `tags.json`, `annotations.json`, `split.json`, `config.json`, and
 `content_manifest.json`, plus `pipeline_audit.json` for filtering, rejection, and ordered
-scenario-selection evidence. Computed tags and human labels stay separate. Before Task 9 runs,
+scenario-selection evidence. The pipeline audit also retains a compact, complete Task 5 scene
+chronology so validation distinguishes genuinely adjacent scenes from selected scenes separated
+by an unselected scene. Computed tags and human labels stay separate. Before Task 9 runs,
 `validation.json` truthfully records `state: "not_run"` and never claims success.
 
 ## Final validation, manifest, and publication

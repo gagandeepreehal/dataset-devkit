@@ -325,6 +325,32 @@ class _ExportIndex:
     channels_by_scene: Mapping[tuple[str, str], tuple[str, ...]]
 
 
+def pipeline_graph_scene_sequence(
+    graphs: Sequence[RecordingSceneResult],
+) -> list[dict[str, object]]:
+    """Return the compact complete Task 5 scene chronology used by validation."""
+    return [
+        {
+            "source_digest": graph.source.digest,
+            "source_blob_path": graph.source.blob_path,
+            "scene_token": scene.token,
+            "ordinal": scene.ordinal,
+            "first_timestamp_ns": scene.first_timestamp_ns,
+            "last_timestamp_ns": scene.last_timestamp_ns,
+        }
+        for graph in sorted(graphs, key=lambda item: item.source.digest)
+        for scene in sorted(
+            graph.scenes,
+            key=lambda item: (
+                item.first_timestamp_ns,
+                item.last_timestamp_ns,
+                item.ordinal,
+                item.token,
+            ),
+        )
+    ]
+
+
 def _build_export_index(graphs: Sequence[RecordingSceneResult]) -> _ExportIndex:
     """Index each graph collection once and reject cross-recording collisions."""
     graphs_by_source: dict[str, RecordingSceneResult] = {}
@@ -979,7 +1005,19 @@ def _export_into(
     )
     pipeline_audit = evidence.pipeline_audit or {
         "schema_version": 1,
-        "filter": {"state": "not_provided_to_direct_export"},
+        "filter": {
+            "accepted": [
+                {
+                    "scene_token": item.scene_token,
+                    "source_digest": item.source.digest,
+                }
+                for item in sorted(
+                    evidence.features_population,
+                    key=lambda item: (item.scene_token, item.source.digest),
+                )
+            ],
+            "rejected": [],
+        },
         "selection": {
             "candidate_fingerprint": evidence.selection.candidate_fingerprint,
             "config_fingerprint": evidence.selection.config_fingerprint,
@@ -988,6 +1026,7 @@ def _export_into(
             "rule_audits": _jsonable(evidence.selection.rule_audits),
             "unselected": _jsonable(evidence.selection.unselected),
         },
+        "graph_scene_sequence": pipeline_graph_scene_sequence(evidence.graphs),
     }
     _write_json(
         writer,

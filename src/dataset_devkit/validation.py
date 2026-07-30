@@ -412,6 +412,267 @@ def _sha256_text(value: object) -> bool:
     )
 
 
+def _finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _canonical_strings(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and all(isinstance(item, str) and item for item in value)
+        and value == sorted(set(value))
+    )
+
+
+def _finite_json_tree(value: object) -> bool:
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if _finite_number(value):
+        return True
+    if isinstance(value, list):
+        return all(_finite_json_tree(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _finite_json_tree(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _regular_file_sha256(path: Path) -> str | None:
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            return None
+        descriptor = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        try:
+            opened = os.fstat(descriptor)
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        def identity(item: os.stat_result) -> tuple[int, int, int, int]:
+            return item.st_dev, item.st_ino, item.st_size, item.st_nlink
+        if identity(before) != identity(opened) or identity(opened) != identity(after):
+            return None
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _validate_pipeline_audit(
+    pipeline_audit: object,
+    config: GlobalConfig | None,
+    scene_to_source: dict[str, str],
+    source_blob_paths: dict[str, str],
+    split: object,
+    findings: list[ValidationFinding],
+) -> list[dict[str, Any]] | None:
+    def fail(message: str) -> None:
+        findings.append(
+            ValidationFinding("error", "pipeline_audit", "pipeline_audit", message)
+        )
+
+    if not isinstance(pipeline_audit, dict):
+        fail("pipeline audit report is malformed")
+        return None
+    expected_keys = {"schema_version", "filter", "selection", "graph_scene_sequence"}
+    if "blob_order" in pipeline_audit or "failed_recordings" in pipeline_audit:
+        expected_keys.update({"blob_order", "failed_recordings"})
+    filter_audit = pipeline_audit.get("filter")
+    selection = pipeline_audit.get("selection")
+    sequence = pipeline_audit.get("graph_scene_sequence")
+    if (
+        set(pipeline_audit) != expected_keys
+        or pipeline_audit.get("schema_version") != 1
+        or not isinstance(filter_audit, dict)
+        or set(filter_audit) != {"accepted", "rejected"}
+        or not isinstance(selection, dict)
+        or set(selection)
+        != {
+            "candidate_fingerprint",
+            "config_fingerprint",
+            "rules_fingerprint",
+            "assignments",
+            "rule_audits",
+            "unselected",
+        }
+        or not isinstance(sequence, list)
+    ):
+        fail("pipeline audit report is malformed")
+        return None
+    accepted = filter_audit.get("accepted")
+    rejected = filter_audit.get("rejected")
+    assignments = selection.get("assignments")
+    unselected = selection.get("unselected")
+    if (
+        any(
+            not _sha256_text(selection.get(key))
+            for key in ("candidate_fingerprint", "config_fingerprint", "rules_fingerprint")
+        )
+        or config is not None
+        and selection.get("config_fingerprint")
+        != canonical_hash(config.scenarios.model_dump(mode="json"))
+        or not isinstance(accepted, list)
+        or not isinstance(rejected, list)
+        or not isinstance(assignments, list)
+        or not isinstance(selection.get("rule_audits"), list)
+        or not isinstance(unselected, list)
+    ):
+        fail("pipeline audit selection or filter evidence is malformed")
+        return None
+    if any(
+        not isinstance(item, dict)
+        or set(item) != {"scene_token", "source_digest"}
+        or not all(isinstance(item.get(key), str) for key in item)
+        for item in accepted
+    ) or any(
+        not isinstance(item, dict)
+        or set(item) != {"scene_token", "source_digest", "reasons"}
+        or not isinstance(item.get("scene_token"), str)
+        or not isinstance(item.get("source_digest"), str)
+        or not isinstance(item.get("reasons"), list)
+        for item in rejected
+    ):
+        fail("pipeline filter membership evidence is malformed")
+        return None
+    assignment_keys = {
+        "scene_token",
+        "source_digest",
+        "primary_scenario",
+        "rule_index",
+        "rank",
+    }
+    if any(
+        not isinstance(item, dict)
+        or set(item) != assignment_keys
+        or not isinstance(item.get("scene_token"), str)
+        or not isinstance(item.get("source_digest"), str)
+        or not isinstance(item.get("primary_scenario"), str)
+        or not isinstance(item.get("rule_index"), int)
+        or isinstance(item.get("rule_index"), bool)
+        or not _sha256_text(item.get("rank"))
+        for item in assignments
+    ) or any(
+        not isinstance(item, dict)
+        or set(item) != {"scene_token", "source_digest", "reason", "matching_rules"}
+        or not isinstance(item.get("scene_token"), str)
+        or not isinstance(item.get("source_digest"), str)
+        or not isinstance(item.get("reason"), str)
+        or not isinstance(item.get("matching_rules"), list)
+        or any(not isinstance(rule, str) for rule in item.get("matching_rules", []))
+        for item in unselected
+    ):
+        fail("pipeline selection membership evidence is malformed")
+        return None
+    sequence_keys = {
+        "source_digest",
+        "source_blob_path",
+        "scene_token",
+        "ordinal",
+        "first_timestamp_ns",
+        "last_timestamp_ns",
+    }
+    if any(
+        not isinstance(item, dict)
+        or set(item) != sequence_keys
+        or not isinstance(item.get("source_digest"), str)
+        or not isinstance(item.get("source_blob_path"), str)
+        or not isinstance(item.get("scene_token"), str)
+        or not isinstance(item.get("ordinal"), int)
+        or isinstance(item.get("ordinal"), bool)
+        or not isinstance(item.get("first_timestamp_ns"), int)
+        or isinstance(item.get("first_timestamp_ns"), bool)
+        or not isinstance(item.get("last_timestamp_ns"), int)
+        or isinstance(item.get("last_timestamp_ns"), bool)
+        or item.get("first_timestamp_ns", 0) > item.get("last_timestamp_ns", 0)
+        for item in sequence
+    ):
+        fail("pipeline complete graph scene sequence is malformed")
+        return None
+    typed_sequence = cast(list[dict[str, Any]], sequence)
+    canonical_sequence = sorted(
+        typed_sequence,
+        key=lambda item: (
+            item["source_digest"],
+            item["first_timestamp_ns"],
+            item["last_timestamp_ns"],
+            item["ordinal"],
+            item["scene_token"],
+        ),
+    )
+    accepted_ids = {(item["scene_token"], item["source_digest"]) for item in accepted}
+    rejected_ids = {(item["scene_token"], item["source_digest"]) for item in rejected}
+    selected_ids = {(item["scene_token"], item["source_digest"]) for item in assignments}
+    unselected_ids = {(item["scene_token"], item["source_digest"]) for item in unselected}
+    sequence_ids = {
+        (item["scene_token"], item["source_digest"]) for item in typed_sequence
+    }
+    published_ids = {(token, source) for token, source in scene_to_source.items()}
+    split_assignments = split.get("assignments") if isinstance(split, dict) else None
+    split_ids = (
+        {
+            (item.get("scene_token"), item.get("source_digest"))
+            for item in split_assignments
+            if isinstance(item, dict)
+        }
+        if isinstance(split_assignments, list)
+        else set()
+    )
+    duplicate = any(
+        len(rows) != len(identities)
+        for rows, identities in (
+            (accepted, accepted_ids),
+            (rejected, rejected_ids),
+            (assignments, selected_ids),
+            (unselected, unselected_ids),
+            (typed_sequence, sequence_ids),
+        )
+    )
+    if (
+        duplicate
+        or typed_sequence != canonical_sequence
+        or accepted_ids & rejected_ids
+        or selected_ids & unselected_ids
+        or accepted_ids | rejected_ids != sequence_ids
+        or selected_ids | unselected_ids != accepted_ids
+        or selected_ids != published_ids
+        or selected_ids != split_ids
+        or any(
+            source_blob_paths.get(item["source_digest"]) != item["source_blob_path"]
+            for item in typed_sequence
+        )
+        or any(
+            scene_to_source.get(item["scene_token"]) != item["source_digest"]
+            for item in assignments
+        )
+    ):
+        fail("published, filtered, selected, split, and graph memberships differ")
+        return None
+    typed_split_assignments = cast(list[object], split_assignments)
+    split_by_id = {
+        (item.get("scene_token"), item.get("source_digest")): item
+        for item in typed_split_assignments
+        if isinstance(item, dict)
+    }
+    if any(
+        split_by_id.get((item["scene_token"], item["source_digest"]), {}).get(
+            "primary_scenario"
+        )
+        != item["primary_scenario"]
+        for item in assignments
+    ):
+        fail("selection and split primary-scenario membership differs")
+        return None
+    return typed_sequence
+
+
 def _validate_split_extension(
     split: object,
     config: GlobalConfig | None,
@@ -593,23 +854,44 @@ def _validate_split_extension(
         fail("adjacent-scene leakage audit is malformed")
         return
     split_by_scene = {cast(str, item["scene_token"]): item["split"] for item in typed}
-    sample_by_token = {item.get("token"): item for item in tables["sample"]}
     expected_pairs: list[dict[str, object]] = []
-    for source in sorted(set(scene_to_source.values())):
-        source_scenes = [
-            scene
-            for scene in tables["scene"]
-            if scene_to_source.get(cast(str, scene.get("token"))) == source
-        ]
-        ordered = sorted(
-            source_scenes,
-            key=lambda scene: cast(
-                int, sample_by_token[scene.get("first_sample_token")]["timestamp"]
-            ),
-        )
-        for earlier, later in zip(ordered, ordered[1:], strict=False):
-            earlier_token = cast(str, earlier["token"])
-            later_token = cast(str, later["token"])
+    graph_sequence = (
+        pipeline_audit.get("graph_scene_sequence")
+        if isinstance(pipeline_audit, dict)
+        else None
+    )
+    sequence_fields = {
+        "source_digest",
+        "source_blob_path",
+        "scene_token",
+        "ordinal",
+        "first_timestamp_ns",
+        "last_timestamp_ns",
+    }
+    if not isinstance(graph_sequence, list) or any(
+        not isinstance(item, dict)
+        or set(item) != sequence_fields
+        or not isinstance(item.get("source_digest"), str)
+        or not isinstance(item.get("scene_token"), str)
+        or not isinstance(item.get("first_timestamp_ns"), int)
+        or isinstance(item.get("first_timestamp_ns"), bool)
+        or not isinstance(item.get("last_timestamp_ns"), int)
+        or isinstance(item.get("last_timestamp_ns"), bool)
+        for item in graph_sequence
+    ):
+        return
+    typed_sequence = cast(list[dict[str, Any]], graph_sequence)
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for item in typed_sequence:
+        source = item.get("source_digest")
+        if isinstance(source, str):
+            by_source.setdefault(source, []).append(item)
+    for source in sorted(by_source):
+        for earlier, later in zip(by_source[source], by_source[source][1:], strict=False):
+            earlier_token = cast(str, earlier["scene_token"])
+            later_token = cast(str, later["scene_token"])
+            if earlier_token not in split_by_scene or later_token not in split_by_scene:
+                continue
             if split_by_scene[earlier_token] == split_by_scene[later_token]:
                 continue
             expected_pairs.append(
@@ -618,12 +900,8 @@ def _validate_split_extension(
                     "source_blob_path": source_blob_paths.get(source),
                     "earlier_scene_token": earlier_token,
                     "later_scene_token": later_token,
-                    "earlier_last_timestamp_us": sample_by_token[
-                        earlier["last_sample_token"]
-                    ]["timestamp"],
-                    "later_first_timestamp_us": sample_by_token[
-                        later["first_sample_token"]
-                    ]["timestamp"],
+                    "earlier_last_timestamp_ns": earlier["last_timestamp_ns"],
+                    "later_first_timestamp_ns": later["first_timestamp_ns"],
                     "earlier_split": split_by_scene[earlier_token],
                     "later_split": split_by_scene[later_token],
                 }
@@ -633,23 +911,28 @@ def _validate_split_extension(
         fail("adjacent-scene leakage pair count differs")
     else:
         for actual, expected in zip(actual_pairs, expected_pairs, strict=True):
-            earlier_ns = (
-                actual.get("earlier_last_timestamp_ns") if isinstance(actual, dict) else None
-            )
-            later_ns = actual.get("later_first_timestamp_ns") if isinstance(actual, dict) else None
             if not isinstance(actual, dict) or (
-                actual.get("source_digest") != expected["source_digest"]
+                set(actual)
+                != {
+                    "source_digest",
+                    "source_blob_path",
+                    "earlier_scene_token",
+                    "later_scene_token",
+                    "earlier_last_timestamp_ns",
+                    "later_first_timestamp_ns",
+                    "earlier_split",
+                    "later_split",
+                }
+                or actual.get("source_digest") != expected["source_digest"]
                 or actual.get("source_blob_path") != expected["source_blob_path"]
                 or actual.get("earlier_scene_token") != expected["earlier_scene_token"]
                 or actual.get("later_scene_token") != expected["later_scene_token"]
                 or actual.get("earlier_split") != expected["earlier_split"]
                 or actual.get("later_split") != expected["later_split"]
-                or not isinstance(earlier_ns, int)
-                or isinstance(earlier_ns, bool)
-                or earlier_ns // 1000 != expected["earlier_last_timestamp_us"]
-                or not isinstance(later_ns, int)
-                or isinstance(later_ns, bool)
-                or later_ns // 1000 != expected["later_first_timestamp_us"]
+                or actual.get("earlier_last_timestamp_ns")
+                != expected["earlier_last_timestamp_ns"]
+                or actual.get("later_first_timestamp_ns")
+                != expected["later_first_timestamp_ns"]
             ):
                 fail("adjacent-scene leakage pair differs from chronology")
 
@@ -702,6 +985,7 @@ def _extensions(
     recording_sources: set[str] = set()
     log_to_source: dict[str, str] = {}
     source_blob_paths: dict[str, str] = {}
+    channels_by_source: dict[str, dict[str, str]] = {}
     recording_keys = {"source", "source_digest", "log_token", "channels"}
     source_keys = {"account_url", "container", "blob_path", "etag", "size"}
     channel_keys = {"original", "normalized"}
@@ -761,6 +1045,10 @@ def _extensions(
                 )
             else:
                 source_blob_paths[source] = blob_path
+                channels_by_source[source] = {
+                    cast(str, row["normalized"]): cast(str, row["original"])
+                    for row in channel_rows
+                }
     else:
         findings.append(
             ValidationFinding(
@@ -821,6 +1109,199 @@ def _extensions(
                     "scene extension coverage differs from scenes",
                 )
             )
+    sample_by_token = {cast(str, item["token"]): item for item in tables["sample"]}
+    data_by_token = {cast(str, item["token"]): item for item in tables["sample_data"]}
+    calibration_by_token = {
+        cast(str, item["token"]): item for item in tables["calibrated_sensor"]
+    }
+    sensor_by_token = {cast(str, item["token"]): item for item in tables["sensor"]}
+    samples_by_scene: dict[str, set[str]] = {scene: set() for scene in scenes}
+    data_by_scene: dict[str, set[str]] = {scene: set() for scene in scenes}
+    normalized_channel_by_data: dict[str, str] = {}
+    for token, sample in sample_by_token.items():
+        scene_token = sample.get("scene_token")
+        if isinstance(scene_token, str) and scene_token in samples_by_scene:
+            samples_by_scene[scene_token].add(token)
+    for token, data in data_by_token.items():
+        sample_token = data.get("sample_token")
+        sample = sample_by_token.get(cast(str, sample_token), {})
+        scene_token = sample.get("scene_token")
+        if isinstance(scene_token, str) and scene_token in data_by_scene:
+            data_by_scene[scene_token].add(token)
+        calibration = calibration_by_token.get(
+            cast(str, data.get("calibrated_sensor_token")), {}
+        )
+        sensor = sensor_by_token.get(cast(str, calibration.get("sensor_token")), {})
+        channel = sensor.get("channel")
+        if isinstance(channel, str):
+            normalized_channel_by_data[token] = channel
+    official_channels_by_source: dict[str, set[str]] = {
+        source: set() for source in recording_sources
+    }
+    for token, channel in normalized_channel_by_data.items():
+        sample = sample_by_token.get(cast(str, data_by_token[token].get("sample_token")), {})
+        source = scene_to_source.get(cast(str, sample.get("scene_token")))
+        if source in official_channels_by_source:
+            official_channels_by_source[source].add(channel)
+    if any(
+        set(channels_by_source.get(source, {})) != official_channels
+        for source, official_channels in official_channels_by_source.items()
+    ):
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_reference",
+                "recordings",
+                "recording channel mapping differs from official sample data",
+            )
+        )
+
+    tags_value = loaded["tags"]
+    if isinstance(tags_value, list) and any(
+        not isinstance(item, dict) or not _canonical_strings(item.get("computed_tags"))
+        for item in tags_value
+    ):
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_value",
+                "tags",
+                "computed tags must be a canonical unique string list",
+            )
+        )
+
+    validity_value = loaded["validity"]
+    validity_malformed = False
+    if isinstance(validity_value, list):
+        for item in validity_value:
+            if not isinstance(item, dict):
+                validity_malformed = True
+                continue
+            scene_token = item.get("scene_token")
+            if not isinstance(scene_token, str) or scene_token not in scenes:
+                validity_malformed = True
+                continue
+            ratios = (
+                item.get("scene_valid_ratio"),
+                item.get("source_gnss_valid_ratio"),
+                item.get("camera_coverage_ratio"),
+            )
+            sync_values = (
+                item.get("max_abs_sync_error_ms"),
+                item.get("mean_abs_sync_error_ms"),
+            )
+            coverage = item.get("camera_coverage_by_channel")
+            coverage_rows = (
+                cast(list[dict[str, Any]], coverage) if isinstance(coverage, list) else []
+            )
+            coverage_channels = [row.get("channel") for row in coverage_rows]
+            nested_samples = item.get("samples")
+            nested_data = item.get("sample_data")
+            sample_rows = (
+                cast(list[dict[str, Any]], nested_samples)
+                if isinstance(nested_samples, list)
+                else []
+            )
+            data_rows = (
+                cast(list[dict[str, Any]], nested_data)
+                if isinstance(nested_data, list)
+                else []
+            )
+            sample_ids = [row.get("sample_token") for row in sample_rows]
+            data_ids = [row.get("sample_data_token") for row in data_rows]
+            validity_malformed = validity_malformed or (
+                any(
+                    not _finite_number(value) or not 0 <= cast(float, value) <= 1
+                    for value in ratios
+                )
+                or any(
+                    not _finite_number(value) or cast(float, value) < 0
+                    for value in sync_values
+                )
+                or not isinstance(coverage, list)
+                or any(
+                    not isinstance(row, dict)
+                    or set(row) != {"channel", "present", "expected", "ratio"}
+                    or not isinstance(row.get("channel"), str)
+                    or not isinstance(row.get("present"), int)
+                    or isinstance(row.get("present"), bool)
+                    or not isinstance(row.get("expected"), int)
+                    or isinstance(row.get("expected"), bool)
+                    or cast(int, row.get("present")) < 0
+                    or cast(int, row.get("expected")) <= 0
+                    or cast(int, row.get("present")) > cast(int, row.get("expected"))
+                    or not _finite_number(row.get("ratio"))
+                    or cast(float, row.get("ratio"))
+                    != cast(int, row.get("present")) / cast(int, row.get("expected"))
+                    for row in coverage_rows
+                )
+                or not all(isinstance(channel, str) for channel in coverage_channels)
+                or cast(list[str], coverage_channels)
+                != sorted(set(cast(list[str], coverage_channels)))
+                or not isinstance(nested_samples, list)
+                or any(
+                    not isinstance(row, dict)
+                    or set(row)
+                    != {"sample_token", "timestamp_ns", "grid_timestamp_ns", "batch_timestamp_ns"}
+                    or not isinstance(row.get("timestamp_ns"), int)
+                    or isinstance(row.get("timestamp_ns"), bool)
+                    or not isinstance(row.get("grid_timestamp_ns"), int)
+                    or isinstance(row.get("grid_timestamp_ns"), bool)
+                    or not isinstance(row.get("batch_timestamp_ns"), int)
+                    or isinstance(row.get("batch_timestamp_ns"), bool)
+                    for row in sample_rows
+                )
+                or len(sample_ids) != len(set(sample_ids))
+                or set(sample_ids) != samples_by_scene[scene_token]
+                or any(
+                    cast(int, row.get("timestamp_ns")) // 1000
+                    != sample_by_token[cast(str, row.get("sample_token"))].get("timestamp")
+                    for row in sample_rows
+                )
+                or not isinstance(nested_data, list)
+                or any(
+                    not isinstance(row, dict)
+                    or set(row)
+                    != {
+                        "sample_data_token",
+                        "timestamp_ns",
+                        "grid_signed_sync_error_ns",
+                        "camera_signed_sync_error_ns",
+                        "gnss_source_validity",
+                    }
+                    or not isinstance(row.get("timestamp_ns"), int)
+                    or isinstance(row.get("timestamp_ns"), bool)
+                    or not isinstance(row.get("grid_signed_sync_error_ns"), int)
+                    or isinstance(row.get("grid_signed_sync_error_ns"), bool)
+                    or not isinstance(row.get("camera_signed_sync_error_ns"), int)
+                    or isinstance(row.get("camera_signed_sync_error_ns"), bool)
+                    or not isinstance(row.get("gnss_source_validity"), list)
+                    or len(row.get("gnss_source_validity", [])) != 2
+                    or any(
+                        not isinstance(value, bool)
+                        for value in row.get("gnss_source_validity", [])
+                    )
+                    for row in data_rows
+                )
+                or len(data_ids) != len(set(data_ids))
+                or set(data_ids) != data_by_scene[scene_token]
+                or any(
+                    cast(int, row.get("timestamp_ns")) // 1000
+                    != data_by_token[cast(str, row.get("sample_data_token"))].get("timestamp")
+                    for row in data_rows
+                )
+            )
+    else:
+        validity_malformed = True
+    if validity_malformed:
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_value",
+                "validity",
+                "validity evidence is malformed or differs from official scene ownership",
+            )
+        )
         if isinstance(value, list) and any(
             not isinstance(item, dict)
             or (
@@ -890,6 +1371,117 @@ def _extensions(
                 "extension_reference",
                 "gnss",
                 "GNSS scene/source reference differs from official ownership",
+            )
+        )
+    gnss_malformed = False
+    if isinstance(gnss, list):
+        for item in gnss:
+            if not isinstance(item, dict):
+                gnss_malformed = True
+                continue
+            gnss_token = item.get("sample_data_token")
+            scene_token = item.get("scene_token")
+            source = item.get("source_digest")
+            if (
+                not isinstance(gnss_token, str)
+                or not isinstance(scene_token, str)
+                or not isinstance(source, str)
+            ):
+                gnss_malformed = True
+                continue
+            official = data_by_token.get(gnss_token)
+            if official is None:
+                gnss_malformed = True
+                continue
+            official_sample = sample_by_token.get(cast(str, official.get("sample_token")), {})
+            normalized = normalized_channel_by_data.get(gnss_token)
+            original = channels_by_source.get(source, {}).get(cast(str, normalized))
+            filename = official.get("filename")
+            image_digest = (
+                _regular_file_sha256(root / filename) if isinstance(filename, str) else None
+            )
+            available = item.get("available")
+            source_validity = item.get("source_validity")
+            quaternion = item.get("quaternion_wxyz")
+            sync_before = item.get("sync_gap_before_ns")
+            sync_after = item.get("sync_gap_after_ns")
+            fraction = item.get("fraction")
+            nullable_scalars = (
+                item.get("latitude_deg"),
+                item.get("longitude_deg"),
+                item.get("height_m"),
+            )
+            gnss_malformed = gnss_malformed or (
+                official_sample.get("scene_token") != scene_token
+                or scene_to_source.get(scene_token) != source
+                or item.get("normalized_channel") != normalized
+                or item.get("original_channel") != original
+                or not isinstance(item.get("timestamp_ns"), int)
+                or isinstance(item.get("timestamp_ns"), bool)
+                or cast(int, item.get("timestamp_ns")) // 1000
+                != official.get("timestamp")
+                or item.get("image_sha256") != image_digest
+                or not _sha256_text(item.get("image_sha256"))
+                or not isinstance(available, bool)
+                or not isinstance(item.get("position_uncertainty"), dict)
+                or not _finite_json_tree(item.get("position_uncertainty"))
+                or not isinstance(item.get("orientation_uncertainty"), dict)
+                or not _finite_json_tree(item.get("orientation_uncertainty"))
+                or not _finite_json_tree(item.get("before"))
+                or not _finite_json_tree(item.get("after"))
+                or any(
+                    value is not None and not _finite_number(value)
+                    for value in nullable_scalars
+                )
+                or (
+                    fraction is not None
+                    and (not _finite_number(fraction) or not 0 <= fraction <= 1)
+                )
+                or (
+                    sync_before is not None
+                    and (
+                        not isinstance(sync_before, int)
+                        or isinstance(sync_before, bool)
+                        or sync_before < 0
+                    )
+                )
+                or (
+                    sync_after is not None
+                    and (
+                        not isinstance(sync_after, int)
+                        or isinstance(sync_after, bool)
+                        or sync_after < 0
+                    )
+                )
+                or (
+                    source_validity is not None
+                    and (
+                        not isinstance(source_validity, list)
+                        or len(source_validity) != 2
+                        or any(not isinstance(value, bool) for value in source_validity)
+                    )
+                )
+                or (
+                    quaternion is not None
+                    and (
+                        not isinstance(quaternion, list)
+                        or len(quaternion) != 4
+                        or any(not _finite_number(value) for value in quaternion)
+                        or abs(sum(value * value for value in quaternion) - 1.0) > 1e-6
+                    )
+                )
+                or (item.get("before") is not None and not isinstance(item.get("before"), dict))
+                or (item.get("after") is not None and not isinstance(item.get("after"), dict))
+            )
+    else:
+        gnss_malformed = True
+    if gnss_malformed:
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_value",
+                "gnss",
+                "GNSS evidence is malformed or differs from official image/channel ownership",
             )
         )
     split = loaded["split"]
@@ -1102,48 +1694,14 @@ def _extensions(
             )
         )
     pipeline_audit = loaded["pipeline_audit"]
-    audit_keys = (
-        set(pipeline_audit) if isinstance(pipeline_audit, dict) else set()
+    _validate_pipeline_audit(
+        pipeline_audit,
+        config,
+        scene_to_source,
+        source_blob_paths,
+        split,
+        findings,
     )
-    selection_audit = (
-        pipeline_audit.get("selection") if isinstance(pipeline_audit, dict) else None
-    )
-    if (
-        not isinstance(pipeline_audit, dict)
-        or audit_keys
-        not in (
-            {"schema_version", "filter", "selection"},
-            {"schema_version", "blob_order", "failed_recordings", "filter", "selection"},
-        )
-        or pipeline_audit.get("schema_version") != 1
-        or not isinstance(pipeline_audit.get("filter"), dict)
-        or not isinstance(selection_audit, dict)
-        or set(selection_audit)
-        != {
-            "candidate_fingerprint",
-            "config_fingerprint",
-            "rules_fingerprint",
-            "assignments",
-            "rule_audits",
-            "unselected",
-        }
-        or any(
-            not _sha256_text(selection_audit.get(key))
-            for key in ("candidate_fingerprint", "config_fingerprint", "rules_fingerprint")
-        )
-        or any(
-            not isinstance(selection_audit.get(key), list)
-            for key in ("assignments", "rule_audits", "unselected")
-        )
-    ):
-        findings.append(
-            ValidationFinding(
-                "error",
-                "pipeline_audit",
-                "pipeline_audit",
-                "pipeline audit report is malformed",
-            )
-        )
     _validate_split_extension(
         split,
         config,
@@ -1158,12 +1716,22 @@ def _extensions(
             f"CAM_{str(channel).upper().replace('-', '_')}"
             for channel in config.frame_validity.required_cameras
         }
-        calibration_by_token = {item.get("token"): item for item in tables["calibrated_sensor"]}
-        sensor_by_token = {item.get("token"): item for item in tables["sensor"]}
+        calibration_by_token = {
+            cast(str, item["token"]): item
+            for item in tables["calibrated_sensor"]
+            if isinstance(item.get("token"), str)
+        }
+        sensor_by_token = {
+            cast(str, item["token"]): item
+            for item in tables["sensor"]
+            if isinstance(item.get("token"), str)
+        }
         channels_by_sample: dict[str, set[str]] = {token: set() for token in samples}
         for item in tables["sample_data"]:
-            calibration = calibration_by_token.get(item.get("calibrated_sensor_token"), {})
-            sensor = sensor_by_token.get(calibration.get("sensor_token"), {})
+            calibration = calibration_by_token.get(
+                cast(str, item.get("calibrated_sensor_token")), {}
+            )
+            sensor = sensor_by_token.get(cast(str, calibration.get("sensor_token")), {})
             channel = sensor.get("channel")
             sample_token = item.get("sample_token")
             if (

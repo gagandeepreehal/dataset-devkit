@@ -24,7 +24,12 @@ from dataset_devkit.coordinator import (
     RecordingRequest,
 )
 from dataset_devkit.dataset import Dataset, DatasetFormatError
-from dataset_devkit.export import NUSCENES_VERSION, ExportEvidence, export_dataset
+from dataset_devkit.export import (
+    NUSCENES_VERSION,
+    ExportEvidence,
+    export_dataset,
+    pipeline_graph_scene_sequence,
+)
 from dataset_devkit.extraction.cache import ExtractionResultCache
 from dataset_devkit.extraction.camera import HevcDecoder
 from dataset_devkit.extraction.errors import StructuralExtractionError
@@ -179,7 +184,12 @@ def _build_evidence(
             if cached is not None:
                 return cached
         extracted = extractor.extract(path)
-        cached = extraction_cache.store(source, extraction_hash, extracted)
+        cached = extraction_cache.store(
+            source,
+            extraction_hash,
+            extracted,
+            force_refresh=True,
+        )
         acquirer.record_extraction_complete(source, extraction_hash)
         return cached
 
@@ -335,6 +345,7 @@ def _build_evidence(
                 "rule_audits": [asdict(item) for item in selection.rule_audits],
                 "unselected": [asdict(item) for item in selection.unselected],
             },
+            "graph_scene_sequence": pipeline_graph_scene_sequence(tuple(graphs)),
         },
     )
     return evidence, tuple(failures)

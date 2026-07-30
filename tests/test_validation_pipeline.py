@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -223,7 +224,7 @@ def test_manifest_detects_tamper_extra_and_symlink(
     finalize_dataset(root, official_smoke=False)
     image = next((root / "samples").rglob("*.jpg"))
     image.write_bytes(image.read_bytes() + b"tamper")
-    with pytest.raises(DatasetValidationError, match="manifest"):
+    with pytest.raises(DatasetValidationError, match="manifest|GNSS evidence"):
         validate_dataset(root, official_smoke=False, raise_on_error=True)
 
     other = _export(tmp_path / "extra", config_factory, feature_factory)
@@ -287,14 +288,54 @@ def test_manifest_detects_tamper_extra_and_symlink(
             "extension_reference",
         ),
         (
+            "mz_extensions/tags.json",
+            lambda value: value[0].update(computed_tags=["duplicate", "duplicate"]),
+            "extension_value",
+        ),
+        (
             "mz_extensions/validity.json",
             lambda value: value.append(dict(value[0])),
             "extension_reference",
         ),
         (
+            "mz_extensions/validity.json",
+            lambda value: value[0].update(scene_valid_ratio=2.0),
+            "extension_value",
+        ),
+        (
+            "mz_extensions/validity.json",
+            lambda value: value[0]["samples"].append(dict(value[0]["samples"][0])),
+            "extension_value",
+        ),
+        (
+            "mz_extensions/validity.json",
+            lambda value: value[0]["sample_data"][0].update(sample_data_token="foreign"),
+            "extension_value",
+        ),
+        (
             "mz_extensions/gnss.json",
             lambda value: value.append(dict(value[0])),
             "extension_reference",
+        ),
+        (
+            "mz_extensions/gnss.json",
+            lambda value: value[0].update(scene_token="foreign"),
+            "extension_reference",
+        ),
+        (
+            "mz_extensions/gnss.json",
+            lambda value: value[0].update(normalized_channel="CAM_FOREIGN"),
+            "extension_value",
+        ),
+        (
+            "mz_extensions/gnss.json",
+            lambda value: value[0].update(image_sha256="0" * 64),
+            "extension_value",
+        ),
+        (
+            "mz_extensions/gnss.json",
+            lambda value: value[0].update(position_uncertainty={"sigma": float("nan")}),
+            "extension_value",
         ),
         (
             "mz_extensions/recordings.json",
@@ -450,6 +491,12 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     first_decoder_creations = decoder_creations
     assert first_decoder_creations > 0
     assert Dataset(first.dataroot).validation_report()["succeeded"] is True
+    source = acquirer.acquire(blob).manifest.source
+    extraction_hash = extraction_config_hash(config)
+    extraction_cache = ExtractionResultCache(config.paths.cache_dir)
+    first_cached = extraction_cache.load(source, extraction_hash, recording)
+    assert first_cached is not None
+    first_cache_identity = first_cached.samples[0].staged_image.path.stat().st_ino
     archived = tmp_path / "first-published"
     first.dataroot.rename(archived)
     second = build_dataset(config, runtime=runtime)
@@ -457,16 +504,27 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     assert second.content_hash == first_hash
     assert decoder_creations == first_decoder_creations
     assert acquirer.extraction_cache_reusable(
-        acquirer.acquire(blob).manifest.source,
-        extraction_config_hash(config),
+        source,
+        extraction_hash,
     )
+    second_cached = extraction_cache.load(source, extraction_hash, recording)
+    assert second_cached is not None
+    assert second_cached.samples[0].staged_image.path.stat().st_ino == first_cache_identity
+
+    second.dataroot.rename(tmp_path / "second-published")
+    acquirer.completed.clear()
+    third = build_dataset(config, runtime=runtime)
+    refreshed = extraction_cache.load(source, extraction_hash, recording)
+    assert decoder_creations > first_decoder_creations
+    assert refreshed is not None
+    assert refreshed.samples[0].staged_image.path.stat().st_ino != first_cache_identity
     from dataset_devkit.cli import main
 
     assert main(
         [
             "validate",
             "--dataroot",
-            str(second.dataroot),
+            str(third.dataroot),
             "--version",
             "v1.0-trainval",
         ]
@@ -476,16 +534,16 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
         [
             "inspect",
             "--dataroot",
-            str(second.dataroot),
+            str(third.dataroot),
             "--version",
             "v1.0-trainval",
         ]
     ) == 0
-    assert json.loads(capsys.readouterr().out)["content_hash"] == first_hash
+    assert json.loads(capsys.readouterr().out)["content_hash"] == third.content_hash
 
-    monkeypatch.setattr("dataset_devkit.cli.build_dataset", lambda _config: second)
+    monkeypatch.setattr("dataset_devkit.cli.build_dataset", lambda _config: third)
     assert main(["build", "--config", "examples/dataset_config.json"]) == 0
-    assert json.loads(capsys.readouterr().out)["dataroot"] == str(second.dataroot)
+    assert json.loads(capsys.readouterr().out)["dataroot"] == str(third.dataroot)
 
 
 def test_stage_injected_partial_failure_requires_persisted_quarantine(
@@ -615,3 +673,139 @@ def test_extraction_result_cache_is_materialized_and_tamper_evident(
 
     stored.samples[0].staged_image.path.write_bytes(b"corrupt")
     assert cache.load(source, config_hash, recording) is None
+
+
+def test_extraction_result_cache_force_refresh_replaces_an_existing_generation(
+    tmp_path: Path,
+) -> None:
+    recording = tmp_path / "recording.mcap"
+    write_mcap(
+        recording,
+        camera_payloads=(
+            camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
+            camera_message(1_500_000_000, (1_500_000_010, 1_500_000_020)),
+        ),
+    )
+    extractor = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=2,
+        tolerance_ns=0,
+        staging_root=tmp_path / "staging",
+        decoder_factory=DeterministicDecoder,
+    )
+    extracted = extractor.extract(recording)
+    source = SourceFingerprint(
+        "https://example.blob.core.windows.net",
+        "recordings",
+        "mcap-h265/recording.mcap",
+        '"etag"',
+        recording.stat().st_size,
+    )
+    config_hash = "a" * 64
+    cache = ExtractionResultCache(tmp_path / "cache")
+    first = cache.store(source, config_hash, extracted)
+    first_identity = first.samples[0].staged_image.path.stat().st_ino
+
+    refreshed = cache.store(source, config_hash, extracted, force_refresh=True)
+
+    assert refreshed.samples[0].staged_image.path.stat().st_ino != first_identity
+    assert cache.load(source, config_hash, recording) is not None
+
+
+def test_extraction_result_cache_interrupted_refresh_preserves_previous_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = tmp_path / "recording.mcap"
+    write_mcap(
+        recording,
+        camera_payloads=(
+            camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
+        ),
+    )
+    extracted = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=1,
+        tolerance_ns=0,
+        staging_root=tmp_path / "staging",
+        decoder_factory=DeterministicDecoder,
+    ).extract(recording)
+    source = SourceFingerprint(
+        "https://example.blob.core.windows.net",
+        "recordings",
+        "mcap-h265/recording.mcap",
+        '"etag"',
+        recording.stat().st_size,
+    )
+    config_hash = "a" * 64
+    cache = ExtractionResultCache(tmp_path / "cache")
+    first = cache.store(source, config_hash, extracted)
+    first_identity = first.samples[0].staged_image.path.stat().st_ino
+
+    def interrupt(*_args: object) -> None:
+        raise RuntimeError("interrupted refresh")
+
+    monkeypatch.setattr(cache, "_publish_refresh", interrupt, raising=False)
+    with pytest.raises(RuntimeError, match="interrupted refresh"):
+        cache.store(source, config_hash, extracted, force_refresh=True)
+
+    loaded = cache.load(source, config_hash, recording)
+    assert loaded is not None
+    assert loaded.samples[0].staged_image.path.stat().st_ino == first_identity
+
+
+def test_extraction_result_cache_concurrent_refreshes_publish_complete_generations(
+    tmp_path: Path,
+) -> None:
+    recording = tmp_path / "recording.mcap"
+    write_mcap(
+        recording,
+        camera_payloads=(
+            camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
+        ),
+    )
+    extracted = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=1,
+        tolerance_ns=0,
+        staging_root=tmp_path / "staging",
+        decoder_factory=DeterministicDecoder,
+    ).extract(recording)
+    source = SourceFingerprint(
+        "https://example.blob.core.windows.net",
+        "recordings",
+        "mcap-h265/recording.mcap",
+        '"etag"',
+        recording.stat().st_size,
+    )
+    config_hash = "a" * 64
+    cache = ExtractionResultCache(tmp_path / "cache")
+    cache.store(source, config_hash, extracted)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        refreshed = tuple(
+            executor.map(
+                lambda _: cache.store(
+                    source,
+                    config_hash,
+                    extracted,
+                    force_refresh=True,
+                ),
+                range(2),
+            )
+        )
+
+    assert all(len(result.samples) == len(extracted.samples) for result in refreshed)
+    refreshed_identities = {
+        result.samples[0].staged_image.inode for result in refreshed
+    }
+    assert None not in refreshed_identities
+    assert len(refreshed_identities) == 2
+    loaded = cache.load(source, config_hash, recording)
+    assert loaded is not None
+    assert len(loaded.samples) == len(extracted.samples)
+    assert loaded.samples[0].staged_image.inode in refreshed_identities
+    assert not tuple(cache.path_for(source, config_hash).parent.glob("*.staging-*"))
