@@ -17,6 +17,14 @@ from mcap_fixture import (
 )
 
 
+def iter_descriptor_messages(
+    messages: Any,
+) -> Any:
+    for message in messages:
+        yield message
+        yield from iter_descriptor_messages(message.nested_type)
+
+
 def descriptor_with_field_change(
     message_name: str,
     field_name: str,
@@ -28,7 +36,7 @@ def descriptor_with_field_change(
     file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
     target: Any = None
     for file_proto in file_set.file:
-        for message in file_proto.message_type:
+        for message in iter_descriptor_messages(file_proto.message_type):
             if message.name == message_name:
                 target = next(field for field in message.field if field.name == field_name)
     assert target is not None
@@ -46,7 +54,7 @@ def descriptor_with_field_change(
 def descriptor_with_optional_numeric(message_name: str, field_name: str) -> bytes:
     file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
     for file_proto in file_set.file:
-        for message in file_proto.message_type:
+        for message in iter_descriptor_messages(file_proto.message_type):
             if message.name != message_name:
                 continue
             oneof_index = len(message.oneof_decl)
@@ -58,6 +66,30 @@ def descriptor_with_optional_numeric(message_name: str, field_name: str) -> byte
     raise AssertionError(f"message {message_name!r} not found")
 
 
+def descriptor_with_top_level_camera_types() -> bytes:
+    file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
+    telemetry = next(file for file in file_set.file if file.name == "telemetry.proto")
+    camera = next(
+        message for message in telemetry.message_type if message.name == "CompressedVideos"
+    )
+    nested: dict[str, descriptor_pb2.DescriptorProto] = {}
+    for message in camera.nested_type:
+        copied = descriptor_pb2.DescriptorProto()
+        copied.CopyFrom(message)
+        nested[message.name] = copied
+        telemetry.message_type.add().CopyFrom(copied)
+    camera.ClearField("nested_type")
+    for field in camera.field:
+        if field.name == "camera_intrinsic":
+            field.type_name = ".autonome.CameraIntrinsic"
+        elif field.name == "camera_extrinsic":
+            field.type_name = ".autonome.CameraExtrinsic"
+    top_level = {message.name: message for message in telemetry.message_type}
+    top_level["CameraIntrinsic"].CopyFrom(nested["CameraIntrinsic"])
+    top_level["CameraExtrinsic"].CopyFrom(nested["CameraExtrinsic"])
+    return file_set.SerializeToString()
+
+
 def test_dynamic_descriptor_loader_resolves_reverse_dependencies() -> None:
     classes = build_message_classes(descriptor_set_bytes())
     assert "autonome.CompressedVideos" in classes
@@ -65,6 +97,31 @@ def test_dynamic_descriptor_loader_resolves_reverse_dependencies() -> None:
 
     with pytest.raises(StructuralExtractionError, match="FileDescriptorSet"):
         build_message_classes(b"not-a-descriptor")
+
+
+def test_exact_real_nested_camera_descriptor_shape_is_accepted(tmp_path: Path) -> None:
+    descriptor_data = descriptor_set_bytes()
+    camera_type = build_message_classes(descriptor_data)["autonome.CompressedVideos"]
+    descriptor = camera_type.DESCRIPTOR
+    intrinsic = descriptor.fields_by_name["camera_intrinsic"].message_type
+    extrinsic = descriptor.fields_by_name["camera_extrinsic"].message_type
+
+    assert intrinsic.full_name == "autonome.CompressedVideos.CameraIntrinsic"
+    assert extrinsic.full_name == "autonome.CompressedVideos.CameraExtrinsic"
+    assert intrinsic.fields_by_name["focal_length_x"].type == (
+        descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT
+    )
+    assert intrinsic.fields_by_name["distortion_coeffs"].type == (
+        descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE
+    )
+    assert extrinsic.fields_by_name["rotation_vector"].type == (
+        descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT
+    )
+
+    path = tmp_path / "real-nested-schema.mcap"
+    write_mcap(path, descriptor_data=descriptor_data)
+    recording = read_recording(path, "rec_cameras", "gnss")
+    assert len(recording.camera_batches[0].frames) == 2
 
 
 def test_real_mcap_reader_decodes_exact_topics_and_per_camera_timestamps(tmp_path: Path) -> None:
@@ -151,7 +208,7 @@ def test_actual_mcap_rejects_non_annex_b_or_non_vcl_camera_payload(
             descriptor_with_field_change(
                 "CompressedVideos",
                 "rec_timestamp",
-                type_name=".autonome.CameraIntrinsic",
+                type_name=".autonome.CompressedVideos.CameraIntrinsic",
             ),
             "rec_timestamp",
         ),
@@ -172,6 +229,21 @@ def test_camera_descriptor_rejects_wrong_type_or_cardinality_lookalikes(
     write_mcap(path, descriptor_data=descriptor_data)
 
     with pytest.raises(StructuralExtractionError, match=f"camera schema field.*{field_name}"):
+        read_recording(path, "rec_cameras", "gnss")
+
+
+def test_camera_descriptor_rejects_top_level_calibration_types(
+    tmp_path: Path,
+) -> None:
+    descriptor_data = descriptor_with_top_level_camera_types()
+    path = tmp_path / "legacy-top-level-camera-types.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        camera_payloads=(camera_message(descriptor_data=descriptor_data),),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="camera schema field.*camera_intrinsic"):
         read_recording(path, "rec_cameras", "gnss")
 
 

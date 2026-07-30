@@ -27,28 +27,11 @@ def _field(
 
 def descriptor_set_bytes() -> bytes:
     calibration = descriptor_pb2.FileDescriptorProto(
-        name="calibration.proto", package="autonome", syntax="proto3"
+        name="calibration.proto",
+        package="autonome",
+        syntax="proto3",
+        dependency=["google/protobuf/timestamp.proto"],
     )
-    intrinsic = calibration.message_type.add(name="CameraIntrinsic")
-    for number, name in enumerate(
-        [
-            "focal_length_x",
-            "focal_length_y",
-            "optical_center_x",
-            "optical_center_y",
-            "rmse",
-            "skew",
-        ],
-        1,
-    ):
-        _field(intrinsic, name, number, F.TYPE_DOUBLE)
-    _field(intrinsic, "distortion_coeffs", 7, F.TYPE_DOUBLE, repeated=True)
-    _field(intrinsic, "width", 8, F.TYPE_INT32)
-    _field(intrinsic, "height", 9, F.TYPE_INT32)
-    extrinsic = calibration.message_type.add(name="CameraExtrinsic")
-    _field(extrinsic, "rotation_vector", 1, F.TYPE_DOUBLE, repeated=True)
-    _field(extrinsic, "translation_vector", 2, F.TYPE_DOUBLE, repeated=True)
-
     for type_name, fields in {
         "LatLonHt": ["latitude_deg", "longitude_deg", "height_m"],
         "Orientation": ["roll_rad", "pitch_rad", "yaw_rad"],
@@ -58,6 +41,26 @@ def descriptor_set_bytes() -> bytes:
         nested = calibration.message_type.add(name=type_name)
         for number, name in enumerate(fields, 1):
             _field(nested, name, number, F.TYPE_DOUBLE)
+    benchmarking = calibration.message_type.add(name="Benchmarking")
+    for number, name in enumerate(
+        [
+            "sensor_source_time",
+            "process_start_time",
+            "data_receive_ack_time",
+            "publish_time",
+        ],
+        1,
+    ):
+        _field(
+            benchmarking,
+            name,
+            number,
+            F.TYPE_MESSAGE,
+            repeated=name == "data_receive_ack_time",
+            type_name=".google.protobuf.Timestamp",
+        )
+    _field(benchmarking, "module_name", 5, F.TYPE_STRING)
+    _field(benchmarking, "process_id", 6, F.TYPE_UINT64)
 
     telemetry = descriptor_pb2.FileDescriptorProto(
         name="telemetry.proto",
@@ -76,21 +79,48 @@ def descriptor_set_bytes() -> bytes:
     _field(camera, "width", 8, F.TYPE_INT32)
     _field(camera, "height", 9, F.TYPE_INT32)
     _field(camera, "number_of_cameras", 10, F.TYPE_INT32)
+    intrinsic = camera.nested_type.add(name="CameraIntrinsic")
+    for number, name in enumerate(
+        [
+            "focal_length_x",
+            "focal_length_y",
+            "optical_center_x",
+            "optical_center_y",
+            "rmse",
+            "skew",
+        ],
+        1,
+    ):
+        _field(intrinsic, name, number, F.TYPE_FLOAT)
+    _field(intrinsic, "distortion_coeffs", 7, F.TYPE_DOUBLE, repeated=True)
+    _field(intrinsic, "width", 8, F.TYPE_FLOAT)
+    _field(intrinsic, "height", 9, F.TYPE_FLOAT)
     _field(
         camera,
         "camera_intrinsic",
         11,
         F.TYPE_MESSAGE,
         repeated=True,
-        type_name=".autonome.CameraIntrinsic",
+        type_name=".autonome.CompressedVideos.CameraIntrinsic",
     )
+    extrinsic = camera.nested_type.add(name="CameraExtrinsic")
+    _field(extrinsic, "rotation_vector", 1, F.TYPE_FLOAT, repeated=True)
+    _field(extrinsic, "translation_vector", 2, F.TYPE_FLOAT, repeated=True)
     _field(
         camera,
         "camera_extrinsic",
         12,
         F.TYPE_MESSAGE,
         repeated=True,
-        type_name=".autonome.CameraExtrinsic",
+        type_name=".autonome.CompressedVideos.CameraExtrinsic",
+    )
+    _field(
+        camera,
+        "benchmarking",
+        13,
+        F.TYPE_MESSAGE,
+        repeated=True,
+        type_name=".autonome.Benchmarking",
     )
     _field(
         camera,
@@ -151,8 +181,9 @@ def camera_message(
     format_name: str = "h265",
     payloads: tuple[bytes, ...] | None = None,
     dimensions: tuple[int, int] = (4, 3),
+    descriptor_data: bytes | None = None,
 ) -> bytes:
-    camera_type, _ = message_classes()
+    camera_type, _ = message_classes(descriptor_data)
     message = camera_type()
     message.rec_frame_id = 9
     message.frame_id = 10

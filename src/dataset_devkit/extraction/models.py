@@ -18,8 +18,8 @@ class CameraIntrinsic:
     rmse: float
     skew: float
     distortion_coeffs: tuple[float, ...]
-    width: int
-    height: int
+    width: float
+    height: float
 
 
 @dataclass(frozen=True)

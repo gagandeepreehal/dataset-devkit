@@ -229,7 +229,7 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
         field_type=FieldDescriptor.TYPE_MESSAGE,
         repeated=True,
         number=11,
-        message_type="autonome.CameraIntrinsic",
+        message_type="autonome.CompressedVideos.CameraIntrinsic",
     )
     extrinsic_field = _require_descriptor_field(
         descriptor,
@@ -239,7 +239,7 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
         field_type=FieldDescriptor.TYPE_MESSAGE,
         repeated=True,
         number=12,
-        message_type="autonome.CameraExtrinsic",
+        message_type="autonome.CompressedVideos.CameraExtrinsic",
     )
     intrinsic = cast(Descriptor, intrinsic_field.message_type)
     for name, number in (
@@ -255,7 +255,7 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
             context="camera",
             path=f"camera_intrinsic.{name}",
             name=name,
-            field_type=FieldDescriptor.TYPE_DOUBLE,
+            field_type=FieldDescriptor.TYPE_FLOAT,
             repeated=False,
             number=number,
         )
@@ -274,7 +274,7 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
             context="camera",
             path=f"camera_intrinsic.{name}",
             name=name,
-            field_type=FieldDescriptor.TYPE_INT32,
+            field_type=FieldDescriptor.TYPE_FLOAT,
             repeated=False,
             number=number,
         )
@@ -285,7 +285,7 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
             context="camera",
             path=f"camera_extrinsic.{name}",
             name=name,
-            field_type=FieldDescriptor.TYPE_DOUBLE,
+            field_type=FieldDescriptor.TYPE_FLOAT,
             repeated=True,
             number=number,
         )
@@ -332,8 +332,8 @@ def _parse_camera(message: Message) -> RawCameraBatch:
                     float(intrinsic.rmse),
                     float(intrinsic.skew),
                     tuple(float(value) for value in intrinsic.distortion_coeffs),
-                    int(intrinsic.width),
-                    int(intrinsic.height),
+                    float(intrinsic.width),
+                    float(intrinsic.height),
                 ),
                 CameraExtrinsic(
                     tuple(float(value) for value in extrinsic.rotation_vector),

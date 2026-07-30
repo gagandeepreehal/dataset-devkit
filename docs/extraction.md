@@ -14,8 +14,10 @@ resolved before dependants and `google.protobuf.Timestamp` supplied as a well-kn
 No generated source files are required.
 
 The camera descriptor is checked before message decoding for exact field numbers, scalar/message
-types, repeated-versus-singular cardinality, Timestamp types, and intrinsic/extrinsic nested
-shapes. A same-named but wire-incompatible lookalike schema is a structural failure.
+types, repeated-versus-singular cardinality, Timestamp types, and the real nested
+`CompressedVideos.CameraIntrinsic` / `CompressedVideos.CameraExtrinsic` shapes. Intrinsic scalar
+and dimension fields and extrinsic vectors are protobuf `float`; distortion coefficients are
+`double`. A same-named but wire-incompatible lookalike schema is a structural failure.
 
 The camera schema name is exactly `autonome.CompressedVideos`. The extractor requires exact
 `format == "h265"`, positive shared dimensions, a positive `number_of_cameras`, and index-aligned
