@@ -14,7 +14,6 @@ import pytest
 
 from conftest import FeatureFactory
 from dataset_devkit import publication as publication_module
-from dataset_devkit import services as services_module
 from dataset_devkit import validation as validation_module
 from dataset_devkit.acquisition import AcquisitionResult
 from dataset_devkit.config import (
@@ -34,7 +33,7 @@ from dataset_devkit.provenance import (
     SourceFingerprint,
     extraction_config_hash,
 )
-from dataset_devkit.publication import publish_staging
+from dataset_devkit.publication import StagingLease, publish_staging
 from dataset_devkit.services import (
     BuildOperationalError,
     BuildRuntime,
@@ -43,6 +42,7 @@ from dataset_devkit.services import (
 )
 from dataset_devkit.validation import (
     DatasetValidationError,
+    ValidationReport,
     build_content_manifest,
     finalize_dataset,
     validate_dataset,
@@ -722,14 +722,24 @@ def test_build_never_publishes_or_deletes_a_replacement_staging_entry(
         decoder_factory=DeterministicDecoder,
         official_smoke=False,
     )
-    original_finalize = services_module.finalize_dataset
     replacement: Path | None = None
     sentinel: Path | None = None
 
-    def displace_after_validation(*args: object, **kwargs: object) -> object:
+    def displace_after_validation(
+        dataroot: str | Path,
+        version: str = "v1.0-trainval",
+        *,
+        official_smoke: bool = True,
+        lease: StagingLease | None = None,
+    ) -> ValidationReport:
         nonlocal replacement, sentinel
-        report = original_finalize(*args, **kwargs)
-        staging = Path(str(args[0]))
+        report = finalize_dataset(
+            dataroot,
+            version,
+            official_smoke=official_smoke,
+            lease=lease,
+        )
+        staging = Path(dataroot)
         staging.rename(staging.with_name(f"{staging.name}.displaced"))
         staging.mkdir()
         replacement = staging
@@ -737,7 +747,9 @@ def test_build_never_publishes_or_deletes_a_replacement_staging_entry(
         sentinel.write_text("survives", encoding="utf-8")
         return report
 
-    monkeypatch.setattr(services_module, "finalize_dataset", displace_after_validation)
+    monkeypatch.setattr(
+        "dataset_devkit.services.finalize_dataset", displace_after_validation
+    )
 
     with pytest.raises(ValueError, match="entry no longer names"):
         build_dataset(config, runtime=runtime)

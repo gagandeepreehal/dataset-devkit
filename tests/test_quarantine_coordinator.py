@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
@@ -204,19 +205,21 @@ def test_new_quarantine_ancestors_are_fsynced(
 def test_rejection_manifest_revalidates_lock_inode_after_flock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_flock = quarantine_module.fcntl.flock
+    original_flock = fcntl.flock
     replaced = False
 
     def replace_lock_after_flock(file_descriptor: int, operation: int) -> None:
         nonlocal replaced
         original_flock(file_descriptor, operation)
-        if operation == quarantine_module.fcntl.LOCK_EX and not replaced:
+        if operation == fcntl.LOCK_EX and not replaced:
             replaced = True
             lock = tmp_path / ".rejections.jsonl.lock"
             lock.rename(tmp_path / ".rejections.jsonl.lock.stale")
             lock.write_bytes(b"")
 
-    monkeypatch.setattr(quarantine_module.fcntl, "flock", replace_lock_after_flock)
+    monkeypatch.setattr(
+        "dataset_devkit.quarantine.fcntl.flock", replace_lock_after_flock
+    )
 
     with pytest.raises(StructuralExtractionError, match="manifest lock"):
         write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
@@ -229,11 +232,11 @@ def test_rejection_manifest_read_is_bound_to_opened_inode(
 ) -> None:
     manifest = write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))
     original_content = manifest.read_bytes()
-    original_open = quarantine_module.os.open
+    original_open = os.open
     raced = False
 
     def replace_manifest_before_open(
-        path: str | bytes | int,
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         flags: int,
         mode: int = 0o777,
         *,
@@ -246,7 +249,9 @@ def test_rejection_manifest_read_is_bound_to_opened_inode(
             manifest.write_text('{"forged":true}\n', encoding="utf-8")
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(quarantine_module.os, "open", replace_manifest_before_open)
+    monkeypatch.setattr(
+        "dataset_devkit.quarantine.os.open", replace_manifest_before_open
+    )
 
     with pytest.raises(StructuralExtractionError, match="manifest.*identity"):
         write_rejection_manifest(tmp_path, "rejections.jsonl", (_report(),))

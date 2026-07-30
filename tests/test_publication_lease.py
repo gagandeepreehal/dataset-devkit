@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-import dataset_devkit.publication as publication_module
 from conftest import FeatureFactory
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.export import export_dataset
@@ -92,7 +91,7 @@ def test_hash_walker_rejects_same_size_rewrite_during_read(
     target = root / "payload.bin"
     target.write_bytes(b"a" * (2 * 1024 * 1024))
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    original_read = publication_module.os.read
+    original_read = os.read
     rewritten = False
 
     def racing_read(descriptor: int, size: int) -> bytes:
@@ -108,7 +107,7 @@ def test_hash_walker_rejects_same_size_rewrite_during_read(
                 os.close(writer)
         return chunk
 
-    monkeypatch.setattr(publication_module.os, "read", racing_read)
+    monkeypatch.setattr("dataset_devkit.publication.os.read", racing_read)
     try:
         with pytest.raises(ValueError, match="changed while hashing"):
             hash_regular_files_fd(root_fd)
