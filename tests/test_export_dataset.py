@@ -19,6 +19,7 @@ from dataset_devkit.provenance import SourceFingerprint
 from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scenes import build_recording_scenes
 from dataset_devkit.split import split_selected_scenes
+from dataset_devkit.validity import InvalidityObservation
 from test_scenes import _annotation_config, _annotations, _config, _report
 from test_split import _scenarios, _selection
 
@@ -39,6 +40,7 @@ def _evidence(
     )
     max_duration = 0.000000001 if tight_timestamps else 0.001
     graphs_list = []
+    validity_reports = []
     for index in range(recordings):
         report = _report(
             tmp_path / "inputs" / f"recording-{index}",
@@ -68,19 +70,19 @@ def _evidence(
                 for audit in report.final_candidates
             )
             report = replace(report, sample_audits=audits, final_candidates=audits)
+        source = SourceFingerprint(
+            "https://example.blob.core.windows.net",
+            "recordings",
+            f"mcap-h265/recording-{index}.mcap",
+            f'"recording-{index}"',
+            4,
+        )
         graphs_list.append(
             build_recording_scenes(
-                report,
-                SourceFingerprint(
-                    "https://example.blob.core.windows.net",
-                    "recordings",
-                    f"mcap-h265/recording-{index}.mcap",
-                    f'"recording-{index}"',
-                    4,
-                ),
-                _config(config_factory(), max_duration_s=max_duration),
+                report, source, _config(config_factory(), max_duration_s=max_duration)
             )
         )
+        validity_reports.append((source, report))
     graphs = tuple(graphs_list)
     selection = _selection(graphs, feature_factory)
     scenarios = _scenarios(selection)
@@ -104,6 +106,7 @@ def _evidence(
         split=split,
         resolved_config=config,
         content_manifest={"schema_version": 1, "content_sha256": "a" * 64},
+        validity_reports=tuple(validity_reports),
     )
 
 
@@ -139,9 +142,8 @@ def _annotated_evidence(
     config = config.model_copy(
         update={"annotations": config.annotations.model_copy(update={"path": annotation_path})}
     )
-    graph = build_recording_scenes(
-        _report(tmp_path / "inputs", (0, 1_000_000)), source, config
-    )
+    validity_report = _report(tmp_path / "inputs", (0, 1_000_000))
+    graph = build_recording_scenes(validity_report, source, config)
     assert len(graph.scenes) == 1
     scene = graph.scenes[0]
     population = (
@@ -175,6 +177,7 @@ def _annotated_evidence(
         split,
         resolved,
         {"schema_version": 1},
+        validity_reports=((source, validity_report),),
     )
 
 
@@ -224,12 +227,68 @@ def test_export_official_tables_extensions_and_sdk_queries(
     assert dataset.tags(first_scene["token"])["computed_tags"]
     assert dataset.annotations(first_scene["token"])["scene_token"] == first_scene["token"]
     assert dataset.validity(first_scene["token"])["scene_token"] == first_scene["token"]
+    first_source = dataset.recordings()[0]["source_digest"]
+    recording_validity = dataset.recording_validity(first_source)
+    assert recording_validity["source_digest"] == first_source
+    assert isinstance(recording_validity["grid_audits"], list)
+    assert isinstance(recording_validity["sample_audits"], list)
+    assert {
+        observation["reason"]
+        for observation in recording_validity["observations"]
+    } == {
+        observation.code
+        for source, report in evidence.validity_reports
+        if source.digest == first_source
+        for observation in report.observations
+    }
     assert dataset.split(first_scene["token"]) in {"train", "test"}
     assert dataset.scenes_in_split(dataset.split(first_scene["token"]))
     assert len(dataset.recordings()) == 2
     assert dataset.validation_report()["state"] == "not_run"
     with Image.open(root / camera["filename"]) as image:
         assert image.size == (camera["width"], camera["height"])
+
+
+def test_validity_v2_preserves_complete_recording_observation_details(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    feature_factory: FeatureFactory,
+) -> None:
+    evidence = _evidence(tmp_path, config_factory, feature_factory)
+    source, report = evidence.validity_reports[0]
+    observation = InvalidityObservation(
+        "camera_timestamp_gap_exceeded",
+        "camera",
+        measured_values={"delta_ns": 42},
+        threshold=40,
+        details={"origin": "unselected_batch"},
+        grid_target_timestamp_ns=None,
+        batch_timestamp_ns=99,
+        camera_timestamp_ns=101,
+        camera_name="front",
+        enabled_as_invalidator=False,
+    )
+    reports = (
+        (source, replace(report, observations=(*report.observations, observation))),
+        *evidence.validity_reports[1:],
+    )
+    root = tmp_path / "dataset-validity-v2"
+    export_dataset(root, replace(evidence, validity_reports=reports))
+
+    recording = Dataset(root).recording_validity(source.digest)
+    preserved = recording["observations"][-1]
+    assert preserved == {
+        "reason": "camera_timestamp_gap_exceeded",
+        "scope": "camera",
+        "measured_values": {"delta_ns": 42},
+        "threshold": 40,
+        "details": {"origin": "unselected_batch"},
+        "grid_target_timestamp_ns": None,
+        "batch_timestamp_ns": 99,
+        "camera_timestamp_ns": 101,
+        "camera_name": "front",
+        "enabled": False,
+    }
 
 
 def test_real_timestamps_calibration_pose_and_extension_separation(

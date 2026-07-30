@@ -18,6 +18,7 @@ from dataset_devkit.coordinator import (
     RecordingCoordinator,
     RecordingFailure,
     RecordingRequest,
+    RecordingSuccess,
 )
 from dataset_devkit.dataset import Dataset, DatasetFormatError
 from dataset_devkit.export import (
@@ -25,6 +26,7 @@ from dataset_devkit.export import (
     ExportEvidence,
     export_dataset,
     pipeline_graph_scene_sequence,
+    preflight_recording_export,
 )
 from dataset_devkit.extraction.cache import ExtractionResultCache
 from dataset_devkit.extraction.camera import HevcDecoder
@@ -213,7 +215,9 @@ def _build_evidence(
         raise BuildOperationalError(str(error)) from error
     successes = () if coordinator_result is None else coordinator_result.successes
     processing_failures = () if coordinator_result is None else coordinator_result.failures
+    request_by_id = {item.recording_id: item for item in requests}
     graphs = []
+    success_by_source: dict[str, RecordingSuccess] = {}
     scene_failures: list[RecordingFailure] = []
     for success in successes:
         acquisition = acquisition_by_path[success.extraction.source_path.resolve()]
@@ -222,7 +226,7 @@ def _build_evidence(
                 success.validity, acquisition.manifest.source, config
             )
         except Exception as error:
-            request = next(item for item in requests if item.recording_id == success.recording_id)
+            request = request_by_id[success.recording_id]
             scene_failures.append(
                 coordinator.quarantine_failure(
                     request,
@@ -239,9 +243,70 @@ def _build_evidence(
             )
             continue
         graphs.append(graph)
+        success_by_source[graph.source.digest] = success
+
+    features: list[SceneFeatures] = []
+    feature_graphs = []
+    feature_failures: list[RecordingFailure] = []
+    for graph in graphs:
+        success = success_by_source[graph.source.digest]
+        try:
+            result = compute_recording_features(graph, config.tags)
+        except Exception as error:
+            feature_failures.append(
+                coordinator.quarantine_failure(
+                    request_by_id[success.recording_id],
+                    error,
+                    category=(
+                        "structural"
+                        if isinstance(error, StructuralExtractionError)
+                        else "unexpected"
+                    ),
+                    stage="feature_computation",
+                    extraction=success.extraction,
+                    validity=success.validity,
+                )
+            )
+            continue
+        feature_graphs.append(graph)
+        features.extend(result.scenes)
+
+    exportable_graphs = []
+    preflight_failures: list[RecordingFailure] = []
+    for graph in feature_graphs:
+        success = success_by_source[graph.source.digest]
+        try:
+            preflight_recording_export(graph)
+        except Exception as error:
+            preflight_failures.append(
+                coordinator.quarantine_failure(
+                    request_by_id[success.recording_id],
+                    error,
+                    category=(
+                        "structural"
+                        if isinstance(error, StructuralExtractionError)
+                        else "unexpected"
+                    ),
+                    stage="export_preflight",
+                    extraction=success.extraction,
+                    validity=success.validity,
+                )
+            )
+            continue
+        exportable_graphs.append(graph)
+    graphs = exportable_graphs
+    exportable_sources = {item.source.digest for item in graphs}
+    features = [item for item in features if item.source.digest in exportable_sources]
+
     all_failures = tuple(
         sorted(
-            (*acquisition_failures, *processing_failures, *scene_failures),
+            (
+                *acquisition_failures,
+                *processing_failures,
+                *scene_failures,
+                *feature_failures,
+                *preflight_failures,
+            ),
             key=lambda item: item.recording_id,
         )
     )
@@ -269,9 +334,6 @@ def _build_evidence(
         )
     if not graphs:
         raise BuildOperationalError("no successful recordings are available for publication")
-    features: list[SceneFeatures] = []
-    for graph in graphs:
-        features.extend(compute_recording_features(graph, config.tags).scenes)
     filtered = filter_scenes(features, config.filters)
     selection = select_scenarios(filtered.accepted, config.scenarios)
     if not selection.selected_scenes:
@@ -279,6 +341,10 @@ def _build_evidence(
     selected_sources = {item.source_digest for item in selection.assignments}
     selected_graphs = tuple(
         graph for graph in graphs if graph.source.digest in selected_sources
+    )
+    selected_validity = tuple(
+        (graph.source, success_by_source[graph.source.digest].validity)
+        for graph in selected_graphs
     )
     split = split_selected_scenes(
         selection,
@@ -329,6 +395,7 @@ def _build_evidence(
                 tuple(graphs), selection
             ),
         },
+        selected_validity,
     )
     return evidence, tuple(failures)
 

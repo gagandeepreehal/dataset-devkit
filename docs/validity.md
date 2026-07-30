@@ -131,4 +131,19 @@ quarantined and unauthorized. An incomplete quarantine persistence forces the bl
 and zero authorization regardless of that flag. With no failures, every successful input is
 authorized. Task 5 scene construction consumes only the successful recording's
 `final_candidates`; tag/split construction and nuScenes export or publication remain outside this
-boundary.
+boundary. The production boundary immediately validates that every enabled observation
+was enforced: invalid logical samples and grid misses cannot enter final candidates, enabled
+recording-scope observations quarantine the source, and `retain_for_audit` versus `drop` changes
+only invalid-sample evidence/image retention rather than quarantining a recording whose invalid
+frames were correctly excluded.
+
+Independent failure handling continues after scene construction. Feature computation and the
+per-recording export preflight (owned JPEG identity/hash/dimensions, calibration, pose, timestamp,
+and Task 8 structure) quarantine only the attributable source. The default/partial authorization
+gate is rerun after those stages; global selection, relational validation, and publication failures
+remain whole-build failures.
+
+Published `mz_extensions/validity.json` is a versioned object with `recordings` and `scenes`.
+Every exported source retains its complete observation list, grid audits, sample audits,
+audit-only/final-candidate identities, configured policy, and report validity. Scene rows retain the
+per-scene aggregates and official sample references. No observed invalidity reason is discarded.

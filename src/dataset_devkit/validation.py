@@ -1224,8 +1224,18 @@ def _extensions(
         },
         "tags": {"scene_token", "source_digest", "computed_tags"},
     }
+    validity_value = loaded["validity"]
+    validity_scenes: object = None
+    validity_recordings: object = None
+    if (
+        isinstance(validity_value, dict)
+        and set(validity_value) == {"schema_version", "recordings", "scenes"}
+        and validity_value.get("schema_version") == 2
+    ):
+        validity_scenes = validity_value.get("scenes")
+        validity_recordings = validity_value.get("recordings")
     for name in ("validity", "tags"):
-        value = loaded[name]
+        value = validity_scenes if name == "validity" else loaded[name]
         typed_rows = cast(list[dict[str, Any]], value) if isinstance(value, list) else []
         identities = [item.get("scene_token") for item in typed_rows if isinstance(item, dict)]
         if (
@@ -1324,10 +1334,9 @@ def _extensions(
             )
         )
 
-    validity_value = loaded["validity"]
     validity_malformed = False
-    if isinstance(validity_value, list):
-        for item in validity_value:
+    if isinstance(validity_scenes, list):
+        for item in validity_scenes:
             if not isinstance(item, dict):
                 validity_malformed = True
                 continue
@@ -1454,6 +1463,242 @@ def _extensions(
                 "extension_value",
                 "validity",
                 "validity evidence is malformed or differs from official scene ownership",
+            )
+        )
+    observation_keys = {
+        "reason",
+        "scope",
+        "measured_values",
+        "threshold",
+        "details",
+        "grid_target_timestamp_ns",
+        "batch_timestamp_ns",
+        "camera_timestamp_ns",
+        "camera_name",
+        "enabled",
+    }
+    invalidity_reasons = {
+        "gnss_source_invalid",
+        "position_sigma_exceeded",
+        "orientation_variance_exceeded",
+        "gnss_sync_gap_exceeded",
+        "camera_timestamp_non_monotonic",
+        "camera_timestamp_gap_exceeded",
+        "missing_required_camera",
+        "grid_miss",
+    }
+    invalidity_scopes = {"recording", "grid", "sample", "camera", "pose"}
+
+    def valid_observation(value: object) -> bool:
+        if not isinstance(value, dict) or set(value) != observation_keys:
+            return False
+        threshold = value.get("threshold")
+        timestamps = (
+            value.get("grid_target_timestamp_ns"),
+            value.get("batch_timestamp_ns"),
+            value.get("camera_timestamp_ns"),
+        )
+        return bool(
+            value.get("reason") in invalidity_reasons
+            and value.get("scope") in invalidity_scopes
+            and isinstance(value.get("measured_values"), dict)
+            and (threshold is None or _finite_number(threshold))
+            and isinstance(value.get("details"), dict)
+            and all(
+                timestamp is None
+                or (isinstance(timestamp, int) and not isinstance(timestamp, bool))
+                for timestamp in timestamps
+            )
+            and (
+                value.get("camera_name") is None
+                or isinstance(value.get("camera_name"), str)
+            )
+            and isinstance(value.get("enabled"), bool)
+        )
+
+    exported_identities_by_source: dict[str, set[tuple[int, int]]] = {
+        source: set() for source in recording_sources
+    }
+    if isinstance(validity_scenes, list):
+        for scene_row in validity_scenes:
+            if not isinstance(scene_row, dict):
+                continue
+            source = scene_row.get("source_digest")
+            nested = scene_row.get("samples")
+            if isinstance(source, str) and isinstance(nested, list):
+                exported_identities_by_source.setdefault(source, set()).update(
+                    (
+                        cast(int, row["grid_timestamp_ns"]),
+                        cast(int, row["batch_timestamp_ns"]),
+                    )
+                    for row in nested
+                    if isinstance(row, dict)
+                    and isinstance(row.get("grid_timestamp_ns"), int)
+                    and not isinstance(row.get("grid_timestamp_ns"), bool)
+                    and isinstance(row.get("batch_timestamp_ns"), int)
+                    and not isinstance(row.get("batch_timestamp_ns"), bool)
+                )
+
+    recording_validity_malformed = False
+    recording_rows = (
+        cast(list[dict[str, Any]], validity_recordings)
+        if isinstance(validity_recordings, list)
+        else []
+    )
+    recording_validity_sources = [row.get("source_digest") for row in recording_rows]
+    if (
+        not isinstance(validity_recordings, list)
+        or len(recording_rows) != len(validity_recordings)
+        or len(recording_validity_sources) != len(set(recording_validity_sources))
+        or set(recording_validity_sources) != recording_sources
+    ):
+        recording_validity_malformed = True
+    recording_keys = {
+        "source_digest",
+        "source_path",
+        "policy",
+        "valid",
+        "observations",
+        "grid_audits",
+        "sample_audits",
+    }
+    grid_audit_keys = {
+        "grid_target_timestamp_ns",
+        "batch_timestamp_ns",
+        "camera_timestamps",
+        "observations",
+        "valid",
+    }
+    sample_audit_keys = grid_audit_keys | {
+        "sample_identities",
+        "final_candidate",
+        "audit_only",
+    }
+    camera_timestamp_keys = {"camera_name", "camera_timestamp_ns"}
+    sample_identity_keys = {
+        "camera_index",
+        "camera_name",
+        "camera_timestamp_ns",
+        "batch_timestamp_ns",
+        "grid_target_timestamp_ns",
+    }
+    for row in recording_rows:
+        source = row.get("source_digest")
+        observations = row.get("observations")
+        grid_audits = row.get("grid_audits")
+        sample_audits = row.get("sample_audits")
+        if (
+            set(row) != recording_keys
+            or not isinstance(source, str)
+            or not isinstance(row.get("source_path"), str)
+            or row.get("policy") not in {"retain_for_audit", "drop"}
+            or not isinstance(row.get("valid"), bool)
+            or not isinstance(observations, list)
+            or any(not valid_observation(item) for item in observations)
+            or not isinstance(grid_audits, list)
+            or not isinstance(sample_audits, list)
+        ):
+            recording_validity_malformed = True
+            continue
+        if row.get("valid") != (
+            not any(
+                isinstance(item, dict) and item.get("enabled") is True
+                for item in observations
+            )
+        ):
+            recording_validity_malformed = True
+        final_identities: set[tuple[int, int]] = set()
+        for audit in (*grid_audits, *sample_audits):
+            expected_keys = sample_audit_keys if audit in sample_audits else grid_audit_keys
+            if not isinstance(audit, dict) or set(audit) != expected_keys:
+                recording_validity_malformed = True
+                continue
+            camera_timestamps = audit.get("camera_timestamps")
+            audit_observations = audit.get("observations")
+            if (
+                not isinstance(audit.get("grid_target_timestamp_ns"), int)
+                or isinstance(audit.get("grid_target_timestamp_ns"), bool)
+                or (
+                    audit.get("batch_timestamp_ns") is not None
+                    and (
+                        not isinstance(audit.get("batch_timestamp_ns"), int)
+                        or isinstance(audit.get("batch_timestamp_ns"), bool)
+                    )
+                )
+                or not isinstance(camera_timestamps, list)
+                or any(
+                    not isinstance(item, dict)
+                    or set(item) != camera_timestamp_keys
+                    or not isinstance(item.get("camera_name"), str)
+                    or not isinstance(item.get("camera_timestamp_ns"), int)
+                    or isinstance(item.get("camera_timestamp_ns"), bool)
+                    for item in camera_timestamps
+                )
+                or not isinstance(audit_observations, list)
+                or any(not valid_observation(item) for item in audit_observations)
+                or not isinstance(audit.get("valid"), bool)
+                or audit.get("valid")
+                != (
+                    not any(
+                        isinstance(item, dict) and item.get("enabled") is True
+                        for item in audit_observations
+                    )
+                )
+            ):
+                recording_validity_malformed = True
+        for audit in sample_audits:
+            if not isinstance(audit, dict):
+                continue
+            sample_identities_value = audit.get("sample_identities")
+            if (
+                not isinstance(sample_identities_value, list)
+                or any(
+                    not isinstance(item, dict)
+                    or set(item) != sample_identity_keys
+                    or not isinstance(item.get("camera_index"), int)
+                    or isinstance(item.get("camera_index"), bool)
+                    or not isinstance(item.get("camera_name"), str)
+                    or any(
+                        not isinstance(item.get(key), int)
+                        or isinstance(item.get(key), bool)
+                        for key in (
+                            "camera_timestamp_ns",
+                            "batch_timestamp_ns",
+                            "grid_target_timestamp_ns",
+                        )
+                    )
+                    for item in sample_identities_value
+                )
+                or not isinstance(audit.get("final_candidate"), bool)
+                or not isinstance(audit.get("audit_only"), bool)
+                or (
+                    audit.get("final_candidate") != audit.get("valid")
+                    or audit.get("audit_only")
+                    != (
+                        row.get("policy") == "retain_for_audit"
+                        and audit.get("valid") is False
+                    )
+                )
+            ):
+                recording_validity_malformed = True
+            if audit.get("final_candidate") is True:
+                target = audit.get("grid_target_timestamp_ns")
+                batch = audit.get("batch_timestamp_ns")
+                if isinstance(target, int) and isinstance(batch, int):
+                    final_identities.add((target, batch))
+                if audit.get("valid") is not True:
+                    recording_validity_malformed = True
+        if isinstance(source, str):
+            exported_identities = exported_identities_by_source.get(source, set())
+            if not exported_identities <= final_identities:
+                recording_validity_malformed = True
+    if recording_validity_malformed:
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_value",
+                "validity",
+                "recording validity audit is malformed or differs from exported samples",
             )
         )
     gnss = loaded["gnss"]

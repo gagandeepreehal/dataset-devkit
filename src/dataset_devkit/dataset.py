@@ -261,7 +261,31 @@ class Dataset:
 
     def validity(self, scene_token: str) -> JsonRecord:
         """Return validity and source-audit evidence for one scene."""
-        return self._scene_extension("validity", scene_token)
+        value = self._extensions["validity"]
+        if not isinstance(value, dict) or not isinstance(value.get("scenes"), list):
+            raise DatasetFormatError("validity extension is malformed")
+        matches = [
+            item
+            for item in value["scenes"]
+            if isinstance(item, dict) and item.get("scene_token") == scene_token
+        ]
+        if len(matches) != 1:
+            raise DatasetFormatError("validity has missing or duplicate scene entry")
+        return deepcopy(cast(JsonRecord, matches[0]))
+
+    def recording_validity(self, source_digest: str) -> JsonRecord:
+        """Return the complete validity report for one exported source."""
+        value = self._extensions["validity"]
+        if not isinstance(value, dict) or not isinstance(value.get("recordings"), list):
+            raise DatasetFormatError("validity extension is malformed")
+        matches = [
+            item
+            for item in value["recordings"]
+            if isinstance(item, dict) and item.get("source_digest") == source_digest
+        ]
+        if len(matches) != 1:
+            raise DatasetFormatError("validity has missing or duplicate recording entry")
+        return deepcopy(cast(JsonRecord, matches[0]))
 
     def tags(self, scene_token: str) -> JsonRecord:
         """Return computed tags for one scene (human labels are intentionally separate)."""

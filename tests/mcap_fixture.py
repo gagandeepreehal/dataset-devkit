@@ -1,13 +1,63 @@
 from __future__ import annotations
 
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pytest
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory, timestamp_pb2
 from mcap.writer import Writer
 
 HEVC_AU = b"\x00\x00\x00\x01\x26\x01\xaa"
 F = descriptor_pb2.FieldDescriptorProto
+
+
+def encode_hevc_access_units(
+    colors: tuple[tuple[int, int, int], ...],
+    *,
+    b_frames: int = 0,
+) -> tuple[bytes, ...]:
+    """Encode one deterministic Annex-B HEVC access unit per synthetic RGB frame."""
+    try:
+        import av
+    except ImportError as error:
+        pytest.skip(f"PyAV is unavailable for real HEVC fixtures: {error}")
+    try:
+        encoder: Any = av.CodecContext.create("libx265", "w")
+        encoder.width = 32
+        encoder.height = 32
+        encoder.pix_fmt = "yuv420p"
+        encoder.time_base = Fraction(1, 10)
+        encoder.framerate = Fraction(10, 1)
+        encoder.options = {
+            "preset": "ultrafast",
+            "x265-params": (
+                "keyint=30:min-keyint=30:scenecut=0:"
+                f"bframes={b_frames}:repeat-headers=1"
+            ),
+        }
+        encoder.open()
+    except Exception as error:
+        pytest.skip(f"PyAV libx265 encoder is unavailable for real HEVC fixtures: {error}")
+
+    packets: list[bytes] = []
+    for index, color in enumerate(colors):
+        pixels = np.empty((32, 32, 3), dtype=np.uint8)
+        pixels[:, :] = color
+        frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+        frame.pts = index
+        packets.extend(bytes(packet) for packet in encoder.encode(frame))
+    packets.extend(bytes(packet) for packet in encoder.encode(None))
+    assert len(packets) == len(colors), (
+        "libx265 violated the fixture's one-packet-per-frame contract: "
+        f"frames={len(colors)}, packets={len(packets)}"
+    )
+    assert all(
+        packet.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01"))
+        for packet in packets
+    ), "libx265 fixture output is not Annex-B HEVC"
+    return tuple(packets)
 
 
 def _field(

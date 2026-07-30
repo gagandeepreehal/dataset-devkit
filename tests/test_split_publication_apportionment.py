@@ -34,9 +34,8 @@ def _export_stratified_dataset(
         for index in range(8)
         for timestamp in (index * 2_000_000_000, index * 2_000_000_000 + 1_000_000)
     )
-    graph = build_recording_scenes(
-        _report(tmp_path / "input", timestamps), source, scene_config
-    )
+    validity_report = _report(tmp_path / "input", timestamps)
+    graph = build_recording_scenes(validity_report, source, scene_config)
     assert len(graph.scenes) == 8
     selection = _selection(
         (graph,),
@@ -64,6 +63,7 @@ def _export_stratified_dataset(
         split,
         resolved,
         {"schema_version": 1},
+        validity_reports=((source, validity_report),),
     )
     root = tmp_path / "dataset"
     export_dataset(root, evidence)

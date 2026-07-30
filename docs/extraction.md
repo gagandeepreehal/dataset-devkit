@@ -65,10 +65,14 @@ All camera access units are fed in MCAP log-time order through exactly one persi
 decoder context per camera index, including unselected batches needed as inter-frame references.
 Every submitted packet receives a unique deterministic PTS and nanosecond time base. Decode calls
 may return zero, one, or multiple frames; output PTS associates each frame with its originating
-access unit even when the codec delays or reorders output. Pending association state contains only
-compact camera/batch/grid metadata; it never retains a `CameraAccessUnit`, payload bytes, or a view
-of those bytes. Every decoder is flushed at EOF, and the recording fails for an unknown, duplicate,
-ambiguous, or missing final output. Only outputs whose originating batches were selected are staged.
+access unit even when the codec delays or reorders output. This scheduling flexibility does not
+relax cardinality: over the complete stream, including the EOF flush, every submitted access unit
+must produce exactly one decoded frame. A decode call may release multiple frames only when they
+have distinct PTS values belonging to distinct submitted access units; two outputs for one access
+unit, an output without a submitted origin, or an access unit with no final output is a structural
+failure. Pending association state contains only compact camera/batch/grid metadata; it never
+retains a `CameraAccessUnit`, payload bytes, or a view of those bytes. Only outputs whose
+originating batches were selected are staged.
 
 Each extraction invocation exclusively creates a UUID-suffixed subdirectory below the trusted
 staging root. Deterministic leaf names include batch ordinal, camera index, exact camera name,

@@ -32,7 +32,11 @@ from dataset_devkit.quarantine import (
     write_quarantine_report,
 )
 from dataset_devkit.sanity import SanityReport, evaluate_sanity
-from dataset_devkit.validity import ValidityReport, evaluate_validity
+from dataset_devkit.validity import (
+    ValidityReport,
+    evaluate_validity,
+    validate_validity_enforcement,
+)
 
 
 class CoordinatorInputError(ValueError):
@@ -317,6 +321,7 @@ class RecordingCoordinator:
             extraction = self.extractor(request.source_path)
             stage = "validity"
             validity = evaluate_validity(extraction, self.config)
+            validate_validity_enforcement(extraction, validity, self.config)
             stage = "sanity"
             sanity = evaluate_sanity(extraction, validity, self.config)
         except StructuralExtractionError as error:

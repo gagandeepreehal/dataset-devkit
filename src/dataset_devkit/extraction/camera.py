@@ -154,6 +154,16 @@ class CameraDecoderSet:
             {} for _ in range(camera_count)
         ]
         self._emitted: list[set[int]] = [set() for _ in range(camera_count)]
+        self._submitted_counts = [0 for _ in range(camera_count)]
+        self._decoded_counts = [0 for _ in range(camera_count)]
+
+    def _cardinality_message(self, camera_index: int, detail: str) -> str:
+        return (
+            "decoder must produce exactly one decoded frame per HEVC access unit "
+            f"for camera index {camera_index}: {detail}; "
+            f"submitted={self._submitted_counts[camera_index]}, "
+            f"decoded={self._decoded_counts[camera_index]}"
+        )
 
     def _associate(
         self, camera_index: int, outputs: list[DecoderOutput]
@@ -171,15 +181,20 @@ class CameraDecoderSet:
                     )
             if pts in self._emitted[camera_index]:
                 raise StructuralExtractionError(
-                    f"decoder emitted duplicate PTS {pts} for camera index {camera_index}"
+                    self._cardinality_message(
+                        camera_index, f"decoder emitted duplicate PTS {pts}"
+                    )
                 )
             submitted = pending.pop(pts, None)
             if submitted is None:
                 raise StructuralExtractionError(
-                    f"decoder emitted unknown PTS {pts} for camera index {camera_index}"
+                    self._cardinality_message(
+                        camera_index, f"decoder emitted unknown PTS {pts}"
+                    )
                 )
             submission_index, metadata = submitted
             self._emitted[camera_index].add(pts)
+            self._decoded_counts[camera_index] += 1
             associated.append(
                 AssociatedDecodedFrame(
                     submission_index,
@@ -201,6 +216,7 @@ class CameraDecoderSet:
             pts = self._next_pts
             self._next_pts += 1
             self._pending[camera_index][pts] = (pts, metadata)
+            self._submitted_counts[camera_index] += 1
             return self._associate(
                 camera_index,
                 decoder.decode(payload, pts, Fraction(1, 1_000_000_000)),
@@ -221,11 +237,17 @@ class CameraDecoderSet:
         try:
             for camera_index, decoder in enumerate(self._decoders):
                 emitted.extend(self._associate(camera_index, decoder.flush()))
-            missing = sum(len(pending) for pending in self._pending)
-            if missing:
-                raise StructuralExtractionError(
-                    f"decoder is missing {missing} frame output(s) after EOF flush"
-                )
+            for camera_index, pending in enumerate(self._pending):
+                if pending or (
+                    self._decoded_counts[camera_index]
+                    != self._submitted_counts[camera_index]
+                ):
+                    raise StructuralExtractionError(
+                        self._cardinality_message(
+                            camera_index,
+                            f"decoder is missing {len(pending)} frame output(s) after EOF flush",
+                        )
+                    )
             self._finished = True
             self.close()
             return tuple(emitted)

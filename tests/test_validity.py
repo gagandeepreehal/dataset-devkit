@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 
@@ -30,6 +30,7 @@ from dataset_devkit.validity import (
     INVALIDITY_CODES,
     InvalidityObservation,
     evaluate_validity,
+    validate_validity_enforcement,
 )
 
 
@@ -207,6 +208,47 @@ def test_observation_first_engine_retains_every_reason_and_raw_measurement(
     assert all(sample.staged_image.path.is_file() for sample in result.samples)
     assert len(report.grid_audits) == 2
     assert report.grid_audits[1].batch_timestamp_ns is None
+    validate_validity_enforcement(result, report, config)
+
+
+def test_enforcement_rejects_invalid_audit_in_final_candidates(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _configured(config_factory(), missing_required_camera=True)
+    result = _result(tmp_path)
+    report = evaluate_validity(result, config)
+    invalid = report.sample_audits[0]
+
+    with pytest.raises(StructuralExtractionError, match="final candidates"):
+        validate_validity_enforcement(
+            result,
+            replace(report, final_candidates=(invalid,)),
+            config,
+        )
+
+
+def test_enforcement_blocks_enabled_recording_scope_observation(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _configured(config_factory(), grid_miss=True)
+    result = _result(tmp_path)
+    report = evaluate_validity(result, config)
+    recording_observation = InvalidityObservation(
+        "grid_miss",
+        "recording",
+        enabled_as_invalidator=True,
+    )
+
+    with pytest.raises(StructuralExtractionError, match="recording-scope"):
+        validate_validity_enforcement(
+            result,
+            replace(
+                report,
+                observations=(*report.observations, recording_observation),
+                valid=False,
+            ),
+            config,
+        )
 
 
 def test_unselected_camera_timeline_violations_remain_in_recording_audit(

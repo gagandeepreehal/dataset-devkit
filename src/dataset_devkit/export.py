@@ -17,10 +17,11 @@ from uuid import UUID, uuid5
 from PIL import Image
 
 from dataset_devkit.config import GlobalConfig, ScenariosConfig, SplitConfig
+from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import CameraCalibration, EgoPose, StagedImage
 from dataset_devkit.features import SceneFeatures
 from dataset_devkit.identifiers import validate_safe_segment
-from dataset_devkit.provenance import canonical_hash, canonical_json
+from dataset_devkit.provenance import SourceFingerprint, canonical_hash, canonical_json
 from dataset_devkit.publication import StagingLease
 from dataset_devkit.scenario_selection import ScenarioSelectionResult, validate_scenario_selection
 from dataset_devkit.scene_models import (
@@ -31,6 +32,7 @@ from dataset_devkit.scene_models import (
 )
 from dataset_devkit.scenes import validate_scene_graph
 from dataset_devkit.split import SceneSplitResult, split_extension_payload, validate_scene_split
+from dataset_devkit.validity import InvalidityObservation, LogicalSampleAudit, ValidityReport
 
 NUSCENES_VERSION = "v1.0-trainval"
 OFFICIAL_TABLES = (
@@ -327,6 +329,7 @@ class ExportEvidence:
     resolved_config: GlobalConfig
     content_manifest: object
     pipeline_audit: object | None = None
+    validity_reports: Sequence[tuple[SourceFingerprint, ValidityReport]] = ()
 
 
 @dataclass(frozen=True)
@@ -460,6 +463,109 @@ def _jsonable(value: object) -> object:
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
     return value
+
+
+def _validity_observation_payload(item: InvalidityObservation) -> dict[str, object]:
+    return {
+        "reason": item.code,
+        "scope": item.scope,
+        "measured_values": _jsonable(item.measured_values),
+        "threshold": item.threshold,
+        "details": _jsonable(item.details),
+        "grid_target_timestamp_ns": item.grid_target_timestamp_ns,
+        "batch_timestamp_ns": item.batch_timestamp_ns,
+        "camera_timestamp_ns": item.camera_timestamp_ns,
+        "camera_name": item.camera_name,
+        "enabled": item.enabled_as_invalidator,
+    }
+
+
+def _logical_audit_payload(
+    item: LogicalSampleAudit,
+    *,
+    final_candidate: bool,
+    audit_only: bool,
+) -> dict[str, object]:
+    return {
+        "grid_target_timestamp_ns": item.grid_target_timestamp_ns,
+        "batch_timestamp_ns": item.batch_timestamp_ns,
+        "camera_timestamps": [
+            {"camera_name": name, "camera_timestamp_ns": timestamp}
+            for name, timestamp in item.camera_timestamps
+        ],
+        "sample_identities": [
+            {
+                "camera_index": sample.camera_index,
+                "camera_name": sample.camera_name,
+                "camera_timestamp_ns": sample.camera_timestamp_ns,
+                "batch_timestamp_ns": sample.batch_timestamp_ns,
+                "grid_target_timestamp_ns": sample.grid_target_timestamp_ns,
+            }
+            for sample in item.samples
+        ],
+        "observations": [
+            _validity_observation_payload(observation)
+            for observation in item.observations
+        ],
+        "valid": item.valid,
+        "final_candidate": final_candidate,
+        "audit_only": audit_only,
+    }
+
+
+def _recording_validity_payload(
+    source: SourceFingerprint,
+    report: ValidityReport,
+) -> dict[str, object]:
+    final_ids = {
+        (item.grid_target_timestamp_ns, item.batch_timestamp_ns)
+        for item in report.final_candidates
+    }
+    audit_only_ids = {
+        (item.grid_target_timestamp_ns, item.batch_timestamp_ns)
+        for item in report.audit_only_samples
+    }
+    return {
+        "source_digest": source.digest,
+        "source_path": str(report.source_path),
+        "policy": report.invalid_sample_policy,
+        "valid": report.valid,
+        "observations": [
+            _validity_observation_payload(item) for item in report.observations
+        ],
+        "grid_audits": [
+            {
+                "grid_target_timestamp_ns": item.grid_target_timestamp_ns,
+                "batch_timestamp_ns": item.batch_timestamp_ns,
+                "camera_timestamps": [
+                    {"camera_name": name, "camera_timestamp_ns": timestamp}
+                    for name, timestamp in item.camera_timestamps
+                ],
+                "observations": [
+                    _validity_observation_payload(observation)
+                    for observation in item.observations
+                ],
+                "valid": item.valid,
+            }
+            for item in report.grid_audits
+        ],
+        "sample_audits": [
+            _logical_audit_payload(
+                item,
+                final_candidate=(
+                    item.grid_target_timestamp_ns,
+                    item.batch_timestamp_ns,
+                )
+                in final_ids,
+                audit_only=(
+                    item.grid_target_timestamp_ns,
+                    item.batch_timestamp_ns,
+                )
+                in audit_only_ids,
+            )
+            for item in report.sample_audits
+        ],
+    }
 
 
 def _token(namespace: UUID, kind: str, identity: object) -> str:
@@ -602,6 +708,47 @@ def _read_verified_jpeg(staged: StagedImage) -> tuple[bytes, str]:
     return data, digest
 
 
+def preflight_recording_export(graph: RecordingSceneResult) -> None:
+    """Validate one source's complete Task 8 exportability before global selection."""
+    try:
+        validate_scene_graph(graph)
+        index = _build_export_index((graph,))
+        normalized_channels: dict[str, str] = {}
+        for scene in graph.scenes:
+            identity = (graph.source.digest, scene.token)
+            samples = index.samples_by_scene.get(identity, ())
+            if len(samples) != scene.nbr_samples or not samples:
+                raise ValueError("scene sample count differs during export preflight")
+            _assert_converted_chain(
+                [item.timestamp_ns for item in samples], "sample chain"
+            )
+            for channel in index.channels_by_scene.get(identity, ()):
+                normalized = _normalized_channel(channel)
+                previous = normalized_channels.setdefault(normalized, channel)
+                if previous != channel:
+                    raise ValueError("camera channel normalization collision")
+                chain = index.sample_data_by_scene_channel[
+                    (graph.source.digest, scene.token, channel)
+                ]
+                _assert_converted_chain(
+                    [item.timestamp_ns for item in chain], f"camera {channel} chain"
+                )
+        for item in graph.sample_data:
+            if item.calibration is None:
+                raise ValueError("camera calibration is absent")
+            if item.timestamp_ns != item.ego_pose.timestamp_ns:
+                raise ValueError("ego pose timestamp differs from camera timestamp")
+            _calibration_value(
+                item.calibration,
+                item.staged_image.width,
+                item.staged_image.height,
+            )
+            _pose_value(item.ego_pose)
+            _read_verified_jpeg(item.staged_image)
+    except (OSError, ValueError) as error:
+        raise StructuralExtractionError(f"export preflight failed: {error}") from error
+
+
 def _write_json(
     writer: _SafeDatarootWriter, relative_parts: tuple[str, ...], value: object
 ) -> bytes:
@@ -668,6 +815,21 @@ def _validate_boundary(evidence: ExportEvidence) -> None:
     config_namespace = evidence.resolved_config.scenes.dataset_namespace
     if any(graph.dataset_namespace != config_namespace for graph in evidence.graphs):
         raise ValueError("scene graph namespace differs from resolved config")
+    validity_by_source = {
+        source.digest: (source, report) for source, report in evidence.validity_reports
+    }
+    graph_sources = {graph.source.digest for graph in evidence.graphs}
+    if (
+        len(validity_by_source) != len(evidence.validity_reports)
+        or set(validity_by_source) != graph_sources
+        or any(
+            validity_by_source[graph.source.digest][0] != graph.source
+            for graph in evidence.graphs
+        )
+    ):
+        raise ValueError("validity evidence coverage differs from exported recordings")
+    for source, report in evidence.validity_reports:
+        canonical_json(_recording_validity_payload(source, report))
     # Ensure the supplied content manifest is canonicalizable and finite.
     canonical_json(evidence.content_manifest)
     if evidence.pipeline_audit is not None:
@@ -1016,7 +1178,17 @@ def _export_into(
     }
     _write_json(writer, ("mz_extensions", "recordings.json"), recordings)
     _write_json(writer, ("mz_extensions", "gnss.json"), gnss_extension)
-    _write_json(writer, ("mz_extensions", "validity.json"), validity_extension)
+    validity_payload = {
+        "schema_version": 2,
+        "recordings": [
+            _recording_validity_payload(source, report)
+            for source, report in sorted(
+                evidence.validity_reports, key=lambda item: item[0].digest
+            )
+        ],
+        "scenes": validity_extension,
+    }
+    _write_json(writer, ("mz_extensions", "validity.json"), validity_payload)
     _write_json(
         writer,
         ("mz_extensions", "validation.json"),

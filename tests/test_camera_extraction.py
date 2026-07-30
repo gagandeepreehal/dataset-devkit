@@ -165,6 +165,54 @@ def test_decoder_associates_zero_now_multiple_later_and_flush_outputs_by_pts() -
     assert decoder.closed
 
 
+def test_decoder_accepts_multiple_delayed_outputs_only_when_each_has_one_origin() -> None:
+    decoder = DelayedDecoder(
+        outputs=[[], [output_frame(0, 10), output_frame(1, 20)]],
+        flush=[],
+    )
+    decoders = CameraDecoderSet(1, lambda: decoder)
+
+    assert decoders.submit(0, HEVC_AU, "first") == ()
+    emitted = decoders.submit(0, HEVC_AU, "second")
+    assert [item.metadata for item in emitted] == ["first", "second"]
+    assert decoders.finish() == ()
+
+
+def test_decoder_rejects_two_outputs_for_one_access_unit_as_cardinality_violation() -> None:
+    decoder = DelayedDecoder(
+        outputs=[[output_frame(0, 10), output_frame(0, 20)]],
+        flush=[],
+    )
+    decoders = CameraDecoderSet(1, lambda: decoder)
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match=r"exactly one decoded frame per HEVC access unit.*camera index 0",
+    ):
+        decoders.submit(0, HEVC_AU, "only")
+    assert decoder.closed
+
+
+def test_decoder_reports_exact_missing_frame_cardinality_after_flush() -> None:
+    decoder = DelayedDecoder(
+        outputs=[[], []],
+        flush=[output_frame(0, 10)],
+    )
+    decoders = CameraDecoderSet(1, lambda: decoder)
+    decoders.submit(0, HEVC_AU, "first")
+    decoders.submit(0, HEVC_AU, "second")
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match=(
+            r"exactly one decoded frame per HEVC access unit.*camera index 0.*"
+            r"submitted=2.*decoded=1"
+        ),
+    ):
+        decoders.finish()
+    assert decoder.closed
+
+
 @pytest.mark.parametrize(
     ("outputs", "flush", "message"),
     [

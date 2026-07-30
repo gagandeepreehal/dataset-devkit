@@ -610,3 +610,96 @@ def evaluate_validity(
         not any(item.enabled_as_invalidator for item in all_observations),
         config.frame_validity.invalid_sample_policy,
     )
+
+
+def validate_validity_enforcement(
+    result: RecordingExtractionResult,
+    report: ValidityReport,
+    config: GlobalConfig,
+) -> None:
+    """Prove every enabled observation is enforced before scene construction."""
+    if report.source_path != result.source_path:
+        raise StructuralExtractionError("validity report source differs from extraction")
+    if report.invalid_sample_policy != config.frame_validity.invalid_sample_policy:
+        raise StructuralExtractionError("validity report policy differs from configuration")
+    expected_recording_valid = not any(
+        item.enabled_as_invalidator for item in report.observations
+    )
+    if report.valid != expected_recording_valid:
+        raise StructuralExtractionError("validity report valid flag is inconsistent")
+
+    sample_by_identity = {
+        (item.grid_target_timestamp_ns, item.batch_timestamp_ns): item
+        for item in report.sample_audits
+    }
+    if len(sample_by_identity) != len(report.sample_audits):
+        raise StructuralExtractionError("validity sample audit identities are duplicated")
+    final_identities = {
+        (item.grid_target_timestamp_ns, item.batch_timestamp_ns)
+        for item in report.final_candidates
+    }
+    expected_final = {
+        identity for identity, item in sample_by_identity.items() if item.valid
+    }
+    if final_identities != expected_final or len(final_identities) != len(
+        report.final_candidates
+    ):
+        raise StructuralExtractionError("validity final candidates do not equal valid audits")
+    for identity, sample_audit in sample_by_identity.items():
+        enabled = tuple(
+            item for item in sample_audit.observations if item.enabled_as_invalidator
+        )
+        if sample_audit.valid != (not enabled):
+            raise StructuralExtractionError("logical sample validity is inconsistent")
+        if enabled and identity in final_identities:
+            raise StructuralExtractionError("invalid logical sample reached final candidates")
+
+    grid_by_target = {item.grid_target_timestamp_ns: item for item in report.grid_audits}
+    if len(grid_by_target) != len(report.grid_audits):
+        raise StructuralExtractionError("validity grid audit identities are duplicated")
+    for grid_audit in report.grid_audits:
+        enabled = tuple(
+            item for item in grid_audit.observations if item.enabled_as_invalidator
+        )
+        if grid_audit.valid != (not enabled):
+            raise StructuralExtractionError("grid audit validity is inconsistent")
+        if enabled and any(
+            item.grid_target_timestamp_ns == grid_audit.grid_target_timestamp_ns
+            for item in report.final_candidates
+        ):
+            raise StructuralExtractionError("invalid or missed grid target reached candidates")
+
+    final_batches = {item.batch_timestamp_ns for item in report.final_candidates}
+    for observation in report.observations:
+        if observation.enabled_as_invalidator != _enabled(config, observation.code):
+            raise StructuralExtractionError("observation invalidator flag differs from config")
+        if not observation.enabled_as_invalidator:
+            continue
+        if observation.scope == "recording":
+            raise StructuralExtractionError(
+                f"enabled recording-scope invalidator observed: {observation.code}"
+            )
+        if observation.scope == "grid":
+            target = observation.grid_target_timestamp_ns
+            enforced_grid = None if target is None else grid_by_target.get(target)
+            if enforced_grid is None or enforced_grid.valid:
+                raise StructuralExtractionError("grid invalidator lacks an enforced audit")
+        elif observation.batch_timestamp_ns in final_batches:
+            raise StructuralExtractionError(
+                "enabled sample/camera/pose invalidator reached final candidates"
+            )
+
+    invalid_audits = tuple(item for item in report.sample_audits if not item.valid)
+    if report.invalid_sample_policy == "retain_for_audit":
+        invalid_ids = {
+            (item.grid_target_timestamp_ns, item.batch_timestamp_ns)
+            for item in invalid_audits
+        }
+        audit_only_ids = {
+            (item.grid_target_timestamp_ns, item.batch_timestamp_ns)
+            for item in report.audit_only_samples
+        }
+        if audit_only_ids != invalid_ids:
+            raise StructuralExtractionError("retained audit-only samples are incomplete")
+    elif report.audit_only_samples or any(item.samples for item in invalid_audits):
+        raise StructuralExtractionError("drop policy retained invalid sample images")

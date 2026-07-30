@@ -22,6 +22,7 @@ from dataset_devkit.scene_models import RecordingSceneResult
 from dataset_devkit.scenes import build_recording_scenes
 from dataset_devkit.split import split_selected_scenes
 from dataset_devkit.validation import validate_dataset
+from dataset_devkit.validity import ValidityReport
 from test_scenes import _config, _report
 
 
@@ -30,7 +31,7 @@ def _graph(
     config: GlobalConfig,
     name: str,
     scene_count: int,
-) -> RecordingSceneResult:
+) -> tuple[RecordingSceneResult, ValidityReport]:
     timestamps = tuple(
         timestamp
         for index in range(scene_count)
@@ -43,10 +44,14 @@ def _graph(
         f'"{name}"',
         8,
     )
-    return build_recording_scenes(
-        _report(tmp_path / name, timestamps),
-        source,
-        _config(config, max_duration_s=0.001),
+    report = _report(tmp_path / name, timestamps)
+    return (
+        build_recording_scenes(
+            report,
+            source,
+            _config(config, max_duration_s=0.001),
+        ),
+        report,
     )
 
 
@@ -56,8 +61,8 @@ def _evidence(
     feature_factory: FeatureFactory,
 ) -> tuple[ExportEvidence, tuple[RecordingSceneResult, ...]]:
     config = config_factory()
-    selected_graph = _graph(tmp_path, config, "selected", 3)
-    unselected_graph = _graph(tmp_path, config, "all-unselected", 1)
+    selected_graph, selected_validity = _graph(tmp_path, config, "selected", 3)
+    unselected_graph, _ = _graph(tmp_path, config, "all-unselected", 1)
     population = tuple(
         replace(
             feature_factory(
@@ -128,6 +133,7 @@ def _evidence(
         resolved,
         {"schema_version": 1},
         audit,
+        ((selected_graph.source, selected_validity),),
     )
     return evidence, (selected_graph, unselected_graph)
 

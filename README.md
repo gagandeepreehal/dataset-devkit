@@ -92,8 +92,9 @@ See [export.md](docs/export.md) for the official nuScenes table layout, exact ti
 copy rules, loader-required non-semantic map compatibility scaffold, extension tables, exporter
 evidence boundary, validation/manifest semantics, atomic publication, and Dataset SDK methods.
 
-All recordings are attempted independently. Any acquisition, extraction, validity, or sanity
-failure is quarantined and blocks publication by default. Setting
+All recordings are attempted independently through acquisition, extraction, validity, sanity,
+scene construction, feature computation, and per-recording export preflight. Any attributable
+failure at those stages is quarantined and blocks publication by default. Setting
 `execution.allow_partial_export` to `true` permits successful recordings only when every failure
 report was durably quarantined; the resulting build JSON explicitly reports `partial: true` and
 the failed blob names. Managed identity is always supplied by `DefaultAzureCredential`; secrets,

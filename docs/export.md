@@ -44,6 +44,8 @@ scenario-selection evidence. The pipeline audit also retains a compact, complete
 chronology so validation distinguishes genuinely adjacent scenes from selected scenes separated
 by an unselected scene. Computed tags and human labels stay separate. Before Task 9 runs,
 `validation.json` truthfully records `state: "not_run"` and never claims success.
+`validity.json` uses schema version 2 with `recordings` for complete per-source observations and
+grid/sample audits, plus `scenes` for selected-scene aggregates and official sample references.
 
 ## Final validation, manifest, and publication
 
@@ -113,7 +115,8 @@ duplicate tokens. Its stable methods are:
   `field2token(table_name, field_name, query)`;
 - `scene_samples(scene_token)` with cycle, endpoint, scene, and count checks;
 - `camera(sample_token, "CAM_*")` and `ego_pose(sample_data_token)`;
-- `validity(scene_token)`, `tags(scene_token)`, and `annotations(scene_token)`;
+- `validity(scene_token)`, `recording_validity(source_digest)`, `tags(scene_token)`, and
+  `annotations(scene_token)`;
 - `annotation_records()`, `annotation_matches()`, `annotation_windows()`,
   `annotation_scene_references()`, individual annotation resolvers, and
   `scene_annotation_evidence(scene_token)`;

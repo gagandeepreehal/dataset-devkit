@@ -21,11 +21,14 @@ from dataset_devkit.config import (
     GlobalConfig,
     ScenarioRuleConfig,
     ScenariosConfig,
+    TagsConfig,
 )
 from dataset_devkit.dataset import Dataset
-from dataset_devkit.export import export_dataset
+from dataset_devkit.export import export_dataset, preflight_recording_export
 from dataset_devkit.extraction.cache import ExtractionResultCache
+from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.service import RecordingExtractor
+from dataset_devkit.features import RecordingFeatureResult, compute_recording_features
 from dataset_devkit.provenance import (
     AcquisitionManifest,
     ArtifactIdentity,
@@ -34,8 +37,10 @@ from dataset_devkit.provenance import (
     extraction_config_hash,
 )
 from dataset_devkit.publication import StagingLease, publish_staging
+from dataset_devkit.scene_models import RecordingSceneResult
 from dataset_devkit.services import (
     BuildOperationalError,
+    BuildResult,
     BuildRuntime,
     build_dataset,
     inspect_dataset,
@@ -47,7 +52,7 @@ from dataset_devkit.validation import (
     finalize_dataset,
     validate_dataset,
 )
-from mcap_fixture import camera_message, write_mcap
+from mcap_fixture import camera_message, encode_hevc_access_units, write_mcap
 from test_export_dataset import _evidence
 from test_extraction_service import DeterministicDecoder
 
@@ -392,27 +397,43 @@ def test_manifest_detects_tamper_extra_and_symlink(
         ),
         (
             "mz_extensions/validity.json",
-            lambda value: value.append(dict(value[0])),
+            lambda value: value["scenes"].append(dict(value["scenes"][0])),
             "extension_reference",
         ),
         (
             "mz_extensions/validity.json",
-            lambda value: value[0].update(scene_valid_ratio=2.0),
+            lambda value: value["scenes"][0].update(scene_valid_ratio=2.0),
             "extension_value",
         ),
         (
             "mz_extensions/validity.json",
-            lambda value: value[0].update(source_digest="0" * 64),
+            lambda value: value["scenes"][0].update(source_digest="0" * 64),
             "extension_reference",
         ),
         (
             "mz_extensions/validity.json",
-            lambda value: value[0]["samples"].append(dict(value[0]["samples"][0])),
+            lambda value: value["scenes"][0]["samples"].append(
+                dict(value["scenes"][0]["samples"][0])
+            ),
             "extension_value",
         ),
         (
             "mz_extensions/validity.json",
-            lambda value: value[0]["sample_data"][0].update(sample_data_token="foreign"),
+            lambda value: value["scenes"][0]["sample_data"][0].update(
+                sample_data_token="foreign"
+            ),
+            "extension_value",
+        ),
+        (
+            "mz_extensions/validity.json",
+            lambda value: value["recordings"][0].update(policy="unknown"),
+            "extension_value",
+        ),
+        (
+            "mz_extensions/validity.json",
+            lambda value: value["recordings"][0]["sample_audits"][0].update(
+                final_candidate=False
+            ),
             "extension_value",
         ),
         (
@@ -656,6 +677,83 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     assert json.loads(capsys.readouterr().out)["dataroot"] == str(third.dataroot)
 
 
+def test_true_pyav_multicamera_build_is_officially_loadable_and_repeatable(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+) -> None:
+    from nuscenes.nuscenes import NuScenes  # type: ignore[import-untyped]
+    from PIL import Image
+
+    frame_count = 10
+    front = encode_hevc_access_units(
+        tuple((20 + index * 10, 30, 40) for index in range(frame_count)),
+        b_frames=3,
+    )
+    rear = encode_hevc_access_units(
+        tuple((40, 30, 20 + index * 10) for index in range(frame_count)),
+        b_frames=3,
+    )
+    recording = tmp_path / "true-pyav.mcap"
+    timestamps = tuple(1_000_000_000 + index * 100_000_000 for index in range(frame_count))
+    write_mcap(
+        recording,
+        camera_payloads=tuple(
+            camera_message(
+                timestamp,
+                (timestamp + 10, timestamp + 20),
+                payloads=(front[index], rear[index]),
+                dimensions=(32, 32),
+                camera_names=("front", "rear"),
+            )
+            for index, timestamp in enumerate(timestamps)
+        ),
+    )
+    blob = "mcap-h265/true-pyav.mcap"
+    config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
+    acquirer = _FakeAcquirer({blob: recording})
+
+    def build_once() -> BuildResult:
+        return build_dataset(
+            config,
+            runtime=BuildRuntime(
+                acquirer_factory=lambda _config: acquirer,
+                official_smoke=True,
+            ),
+        )
+
+    first = build_once()
+    first_root = first.dataroot.with_name("true-pyav-first")
+    first.dataroot.rename(first_root)
+    first_tables = {
+        path.name: path.read_bytes()
+        for path in sorted((first_root / first.version).glob("*.json"))
+    }
+
+    second = build_once()
+    second_tables = {
+        path.name: path.read_bytes()
+        for path in sorted((second.dataroot / second.version).glob("*.json"))
+    }
+
+    assert first.content_hash == second.content_hash
+    assert first_tables == second_tables
+    assert first.sample_count == second.sample_count == 3
+    assert first.sample_data_count == second.sample_data_count == 6
+
+    dataset = NuScenes(
+        version=second.version,
+        dataroot=str(second.dataroot),
+        verbose=False,
+    )
+    sample = dataset.get("sample", dataset.scene[0]["first_sample_token"])
+    assert set(sample["data"]) == {"CAM_FRONT", "CAM_REAR"}
+    for channel in ("CAM_FRONT", "CAM_REAR"):
+        sample_data = dataset.get("sample_data", sample["data"][channel])
+        with Image.open(second.dataroot / sample_data["filename"]) as image:
+            image.load()
+            assert image.size == (32, 32)
+
+
 def test_stage_injected_partial_failure_requires_persisted_quarantine(
     tmp_path: Path,
     config_factory: Callable[[], GlobalConfig],
@@ -698,6 +796,138 @@ def test_stage_injected_partial_failure_requires_persisted_quarantine(
     assert rows[0]["source_config_hash"]
     assert rows[0]["extraction_config_hash"] == extraction_config_hash(config)
     assert rows[0]["artifact_handling"] == "no_owned_artifacts"
+
+
+def _two_pipeline_recordings(tmp_path: Path) -> tuple[Path, Path]:
+    good = tmp_path / "good.mcap"
+    bad = tmp_path / "bad.mcap"
+    payloads = tuple(
+        camera_message(
+            timestamp,
+            (timestamp + 10, timestamp + 20),
+            camera_names=("front", "rear"),
+        )
+        for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
+    )
+    write_mcap(good, camera_payloads=payloads)
+    write_mcap(bad, camera_payloads=payloads)
+    return good, bad
+
+
+def test_feature_failure_blocks_default_and_partial_export_keeps_good_source(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    good_path, bad_path = _two_pipeline_recordings(tmp_path)
+    good_blob = "mcap-h265/good.mcap"
+    bad_blob = "mcap-h265/bad.mcap"
+    config = _pipeline_config(
+        config_factory(), tmp_path, (good_blob, bad_blob), partial=False
+    )
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: _FakeAcquirer(
+            {good_blob: good_path, bad_blob: bad_path}
+        ),
+        decoder_factory=DeterministicDecoder,
+        official_smoke=False,
+    )
+    original_compute = compute_recording_features
+
+    def fail_bad_feature(
+        graph: RecordingSceneResult, tags: TagsConfig
+    ) -> RecordingFeatureResult:
+        if graph.source.blob_path == bad_blob:
+            raise StructuralExtractionError("injected per-source feature failure")
+        return original_compute(graph, tags)
+
+    monkeypatch.setattr(
+        "dataset_devkit.services.compute_recording_features", fail_bad_feature
+    )
+    with pytest.raises(BuildOperationalError, match="blocked"):
+        build_dataset(config, runtime=runtime)
+
+    partial_config = config.model_copy(
+        update={
+            "execution": config.execution.model_copy(
+                update={"allow_partial_export": True}
+            )
+        }
+    )
+    result = build_dataset(partial_config, runtime=runtime)
+    assert result.partial is True
+    assert result.failed_recordings == (bad_blob,)
+    rows = [
+        json.loads(line)
+        for line in (
+            partial_config.quarantine.directory
+            / partial_config.quarantine.manifest_name
+        ).read_text().splitlines()
+    ]
+    assert {row["stage"] for row in rows} == {"feature_computation"}
+    assert all(row["category"] == "structural" for row in rows)
+
+
+@pytest.mark.parametrize("failure_kind", ["image", "calibration"])
+def test_export_preflight_failure_blocks_default_and_partial_keeps_good_source(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    good_path, bad_path = _two_pipeline_recordings(tmp_path)
+    good_blob = "mcap-h265/good.mcap"
+    bad_blob = "mcap-h265/bad.mcap"
+    config = _pipeline_config(
+        config_factory(), tmp_path, (good_blob, bad_blob), partial=False
+    )
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: _FakeAcquirer(
+            {good_blob: good_path, bad_blob: bad_path}
+        ),
+        decoder_factory=DeterministicDecoder,
+        official_smoke=False,
+    )
+
+    def fail_bad_preflight(graph: RecordingSceneResult) -> None:
+        if graph.source.blob_path != bad_blob:
+            preflight_recording_export(graph)
+            return
+        if failure_kind == "image":
+            graph.sample_data[0].staged_image.path.write_bytes(b"not-jpeg")
+            preflight_recording_export(graph)
+        else:
+            data = graph.sample_data
+            damaged = replace(data[0], calibration=None)
+            preflight_recording_export(
+                replace(graph, sample_data=(damaged, *data[1:]))
+            )
+
+    monkeypatch.setattr(
+        "dataset_devkit.services.preflight_recording_export", fail_bad_preflight
+    )
+    with pytest.raises(BuildOperationalError, match="blocked"):
+        build_dataset(config, runtime=runtime)
+
+    partial_config = config.model_copy(
+        update={
+            "execution": config.execution.model_copy(
+                update={"allow_partial_export": True}
+            )
+        }
+    )
+    result = build_dataset(partial_config, runtime=runtime)
+    assert result.partial is True
+    assert result.failed_recordings == (bad_blob,)
+    rows = [
+        json.loads(line)
+        for line in (
+            partial_config.quarantine.directory
+            / partial_config.quarantine.manifest_name
+        ).read_text().splitlines()
+    ]
+    assert {row["stage"] for row in rows} == {"export_preflight"}
+    assert all(row["category"] == "structural" for row in rows)
 
 
 def test_build_never_publishes_or_deletes_a_replacement_staging_entry(
