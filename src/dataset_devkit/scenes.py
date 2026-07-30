@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import stat
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -77,10 +78,43 @@ def _validate_input(
                 raise StructuralExtractionError("broken staged frame logical timestamp reference")
             if camera.batch_timestamp_ns != audit.batch_timestamp_ns:
                 raise StructuralExtractionError("broken staged frame batch timestamp reference")
-            if camera.staged_image.timestamp_ns != camera.camera_timestamp_ns:
-                raise StructuralExtractionError("broken staged image timestamp reference")
+            staged = camera.staged_image
+            if (
+                staged.camera_index != camera.camera_index
+                or staged.camera_name != camera.camera_name
+                or staged.timestamp_ns != camera.camera_timestamp_ns
+            ):
+                raise StructuralExtractionError("staged image camera identity is inconsistent")
+            try:
+                staged_stat = staged.path.lstat()
+            except OSError as error:
+                raise StructuralExtractionError("broken staged image file reference") from error
+            if (
+                staged.device is None
+                or staged.inode is None
+                or not stat.S_ISREG(staged_stat.st_mode)
+                or staged_stat.st_nlink != 1
+                or (staged_stat.st_dev, staged_stat.st_ino) != (staged.device, staged.inode)
+            ):
+                raise StructuralExtractionError("staged image ownership identity is inconsistent")
+            if staged.width <= 0 or staged.height <= 0:
+                raise StructuralExtractionError("staged image dimensions are invalid")
             if camera.ego_pose.timestamp_ns != camera.camera_timestamp_ns:
                 raise StructuralExtractionError("broken ego-pose timestamp reference")
+            pose = camera.ego_pose
+            if (
+                pose.interpolation.timestamp_ns != pose.timestamp_ns
+                or pose.available != pose.interpolation.available
+                or (
+                    pose.available
+                    and (pose.translation_xyz_m is None or pose.rotation_wxyz is None)
+                )
+                or (
+                    not pose.available
+                    and (pose.translation_xyz_m is not None or pose.rotation_wxyz is not None)
+                )
+            ):
+                raise StructuralExtractionError("ego-pose interpolation identity is inconsistent")
             pose_numbers = (
                 *(camera.ego_pose.translation_xyz_m or ()),
                 *(camera.ego_pose.rotation_wxyz or ()),
@@ -89,6 +123,13 @@ def _validate_input(
                 raise StructuralExtractionError("sample pose contains non-finite values")
             if camera.calibration is not None:
                 calibration = camera.calibration
+                if (
+                    calibration.intrinsic.width != staged.width
+                    or calibration.intrinsic.height != staged.height
+                ):
+                    raise StructuralExtractionError(
+                        "staged image calibration dimensions are inconsistent"
+                    )
                 calibration_numbers = (
                     calibration.intrinsic.focal_length_x,
                     calibration.intrinsic.focal_length_y,
@@ -104,8 +145,6 @@ def _validate_input(
                 )
                 if not all(math.isfinite(value) for value in calibration_numbers):
                     raise StructuralExtractionError("sample calibration contains non-finite values")
-            if not camera.staged_image.path.is_file():
-                raise StructuralExtractionError("broken staged image file reference")
     if report.source_path.name and not source.blob_path:
         raise StructuralExtractionError("source fingerprint lacks exact blob path")
     return samples

@@ -64,7 +64,6 @@ def _camera(tmp_path: Path, logical: int, channel: str, real: int) -> ExtractedC
         CameraIntrinsic(1.0, 1.0, 1.0, 1.0, 0.0, 0.0, (), 4.0, 3.0),
         CameraExtrinsic((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
     )
-    del calibration  # calibration is preserved through the corresponding extracted frame in Task 4.
     return ExtractedCameraSample(
         logical,
         logical,
@@ -75,6 +74,7 @@ def _camera(tmp_path: Path, logical: int, channel: str, real: int) -> ExtractedC
             0 if channel == "front" else 1, channel, real, image, 4, 3, stat.st_dev, stat.st_ino
         ),
         pose,
+        calibration,
     )
 
 
@@ -222,6 +222,91 @@ def test_duplicate_final_logical_timestamp_structural_fails(
     report = replace(report, final_candidates=(report.final_candidates[0],) * 2)
     with pytest.raises(StructuralExtractionError, match="duplicate logical timestamp"):
         build_recording_scenes(report, SOURCE, _config(config_factory()))
+
+
+def test_staged_image_camera_name_mismatch_structural_fails(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    report = _report(tmp_path, (0,))
+    audit = report.final_candidates[0]
+    camera = audit.samples[0]
+    bad_camera = replace(
+        camera, staged_image=replace(camera.staged_image, camera_name="wrong-camera")
+    )
+    bad_audit = replace(audit, samples=(bad_camera, *audit.samples[1:]))
+    bad_report = replace(report, sample_audits=(bad_audit,), final_candidates=(bad_audit,))
+
+    with pytest.raises(StructuralExtractionError, match="staged image.*identity"):
+        build_recording_scenes(bad_report, SOURCE, _config(config_factory()))
+
+
+def test_staged_image_camera_index_mismatch_structural_fails(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    report = _report(tmp_path, (0,))
+    audit = report.final_candidates[0]
+    camera = audit.samples[0]
+    bad_camera = replace(camera, staged_image=replace(camera.staged_image, camera_index=99))
+    bad_audit = replace(audit, samples=(bad_camera, *audit.samples[1:]))
+    bad_report = replace(report, sample_audits=(bad_audit,), final_candidates=(bad_audit,))
+
+    with pytest.raises(StructuralExtractionError, match="staged image.*identity"):
+        build_recording_scenes(bad_report, SOURCE, _config(config_factory()))
+
+
+def test_staged_image_owned_inode_and_calibration_dimensions_are_verified(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    report = _report(tmp_path, (0,))
+    audit = report.final_candidates[0]
+    camera = audit.samples[0]
+
+    bad_staged = replace(camera.staged_image, inode=(camera.staged_image.inode or 0) + 1)
+    bad_camera = replace(camera, staged_image=bad_staged)
+    bad_audit = replace(audit, samples=(bad_camera, *audit.samples[1:]))
+    bad_report = replace(report, sample_audits=(bad_audit,), final_candidates=(bad_audit,))
+    with pytest.raises(StructuralExtractionError, match="staged image.*ownership"):
+        build_recording_scenes(bad_report, SOURCE, _config(config_factory()))
+
+    assert camera.calibration is not None
+    bad_intrinsic = replace(camera.calibration.intrinsic, width=5.0)
+    bad_calibration = replace(camera.calibration, intrinsic=bad_intrinsic)
+    bad_camera = replace(camera, calibration=bad_calibration)
+    bad_audit = replace(audit, samples=(bad_camera, *audit.samples[1:]))
+    bad_report = replace(report, sample_audits=(bad_audit,), final_candidates=(bad_audit,))
+    with pytest.raises(StructuralExtractionError, match="staged image.*dimensions"):
+        build_recording_scenes(bad_report, SOURCE, _config(config_factory()))
+
+
+def test_ego_pose_interpolation_identity_is_verified_at_scene_boundary(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    report = _report(tmp_path, (0,))
+    audit = report.final_candidates[0]
+    camera = audit.samples[0]
+    bad_interpolation = replace(
+        camera.ego_pose.interpolation,
+        timestamp_ns=camera.ego_pose.interpolation.timestamp_ns + 1,
+    )
+    bad_pose = replace(camera.ego_pose, interpolation=bad_interpolation)
+    bad_camera = replace(camera, ego_pose=bad_pose)
+    bad_audit = replace(audit, samples=(bad_camera, *audit.samples[1:]))
+    bad_report = replace(report, sample_audits=(bad_audit,), final_candidates=(bad_audit,))
+
+    with pytest.raises(StructuralExtractionError, match="ego-pose.*identity"):
+        build_recording_scenes(bad_report, SOURCE, _config(config_factory()))
+
+
+def test_valid_multicamera_staged_identity_reaches_sample_data(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    result = build_recording_scenes(_report(tmp_path, (0,)), SOURCE, _config(config_factory()))
+
+    assert [(item.channel, item.staged_image.name) for item in result.sample_data] == [
+        ("front", "0-front.jpg"),
+        ("rear", "0-rear.jpg"),
+    ]
+    assert all(item.calibration is not None for item in result.sample_data)
 
 
 def test_validator_rejects_broken_or_cyclic_links(
