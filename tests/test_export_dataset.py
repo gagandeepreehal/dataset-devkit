@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from PIL import Image
 
 from conftest import FeatureFactory
+from dataset_devkit import export as export_module
 from dataset_devkit.config import GlobalConfig, ScenarioRuleConfig, ScenariosConfig, SplitConfig
 from dataset_devkit.dataset import Dataset, DatasetFormatError
 from dataset_devkit.export import ExportEvidence, export_dataset
@@ -471,13 +473,27 @@ def test_annotation_sdk_full_access_resolution_and_isolation(
         human_labels=["merge"], annotation_refs=["ann-1"], annotation_window_ref="window-1"
     )
     value["records"] = [
-        {"token": "ann-1", "line_number": 1, "labels": ["merge"]}
+        {
+            "token": "ann-1",
+            "line_number": 1,
+            "labels": ["merge"],
+            "source_digest": value["scenes"][0]["source_digest"],
+        }
     ]
     value["matches"] = [
-        {"annotation_token": "ann-1", "matched": True, "reason": "matched"}
+        {
+            "annotation_token": "ann-1",
+            "matched": True,
+            "reason": "matched",
+            "source_digest": value["scenes"][0]["source_digest"],
+        }
     ]
     value["windows"] = [
-        {"token": "window-1", "annotation_tokens": ["ann-1"]}
+        {
+            "token": "window-1",
+            "annotation_tokens": ["ann-1"],
+            "source_digest": value["scenes"][0]["source_digest"],
+        }
     ]
     path.write_text(json.dumps(value), encoding="utf-8")
     dataset = Dataset(root)
@@ -495,6 +511,26 @@ def test_annotation_sdk_full_access_resolution_and_isolation(
     assert resolved["windows"][0]["token"] == "window-1"
     resolved["records"][0]["labels"].append("mutated")
     assert dataset.annotation_record("ann-1")["labels"] == ["merge"]
+
+    unrelated = json.loads(path.read_text())
+    unrelated["records"].append(
+        {
+            "token": "ann-2",
+            "line_number": 2,
+            "labels": ["other"],
+            "source_digest": unrelated["scenes"][0]["source_digest"],
+        }
+    )
+    unrelated["windows"][0]["annotation_tokens"] = ["ann-2"]
+    path.write_text(json.dumps(unrelated), encoding="utf-8")
+    with pytest.raises(DatasetFormatError, match="exactly match"):
+        Dataset(root).scene_annotation_evidence(scene_token)
+
+    wrong_source = json.loads(json.dumps(value))
+    wrong_source["records"][0]["source_digest"] = "foreign"
+    path.write_text(json.dumps(wrong_source), encoding="utf-8")
+    with pytest.raises(DatasetFormatError, match="source"):
+        Dataset(root).scene_annotation_evidence(scene_token)
 
     value["scenes"][0]["annotation_refs"] = ["missing"]
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -535,11 +571,91 @@ def test_sdk_rejects_ambiguous_camera_rows(
     duplicate = dict(values[0], token="f" * 32)
     values.append(duplicate)
     path.write_text(json.dumps(values))
+    with pytest.raises(DatasetFormatError, match="ambiguous|duplicate"):
+        Dataset(root)
+
+
+def test_camera_uses_prebuilt_index_and_rejects_malformed_references(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    feature_factory: FeatureFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "dataset"
+    export_dataset(root, _evidence(tmp_path, config_factory, feature_factory))
     dataset = Dataset(root)
-    sensor = dataset.get("calibrated_sensor", duplicate["calibrated_sensor_token"])
-    channel = dataset.get("sensor", sensor["sensor_token"])["channel"]
-    with pytest.raises(DatasetFormatError, match="ambiguous"):
-        dataset.camera(duplicate["sample_token"], channel)
+    sample = dataset.scene_samples(dataset.table("scene")[0]["token"])[0]
+    expected = dataset.camera(sample["token"], "CAM_FRONT")
+    monkeypatch.setattr(
+        Dataset,
+        "table",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("linear scan")),
+    )
+    assert dataset.camera(sample["token"], "CAM_FRONT")["token"] == expected["token"]
+
+    bad_root = tmp_path / "bad"
+    export_dataset(
+        bad_root,
+        _evidence(tmp_path / "bad-input", config_factory, feature_factory),
+    )
+    path = bad_root / "v1.0-trainval" / "sample_data.json"
+    values = json.loads(path.read_text())
+    values[0]["calibrated_sensor_token"] = ["unhashable"]
+    path.write_text(json.dumps(values), encoding="utf-8")
+    with pytest.raises(DatasetFormatError, match="calibrated_sensor"):
+        Dataset(bad_root)
+
+
+def test_export_index_reads_each_record_collection_once(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    feature_factory: FeatureFactory,
+) -> None:
+    graph = _evidence(tmp_path, config_factory, feature_factory).graphs[0]
+
+    class CountingSequence:
+        def __init__(self, values: Sequence[object]) -> None:
+            self.values = values
+            self.iterations = 0
+
+        def __iter__(self) -> Iterator[object]:
+            self.iterations += 1
+            return iter(self.values)
+
+    scenes = CountingSequence(graph.scenes)
+    samples = CountingSequence(graph.samples)
+    sample_data = CountingSequence(graph.sample_data)
+    wrapped = replace(
+        graph,
+        scenes=scenes,  # type: ignore[arg-type]
+        samples=samples,  # type: ignore[arg-type]
+        sample_data=sample_data,  # type: ignore[arg-type]
+    )
+
+    index = export_module._build_export_index((wrapped,))
+
+    assert len(index.scenes_by_identity) == len(graph.scenes)
+    assert scenes.iterations == samples.iterations == sample_data.iterations == 1
+
+
+def test_safe_writer_rejects_nested_symlink_and_root_replacement(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with export_module._SafeDatarootWriter(root) as writer:
+        (root / "nested").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(ValueError, match="symlink|directory"):
+            writer.write(("nested", "escape.json"), b"{}\n")
+        assert not (outside / "escape.json").exists()
+
+    second = tmp_path / "second"
+    moved = tmp_path / "moved"
+    with export_module._SafeDatarootWriter(second) as writer:
+        os.rename(second, moved)
+        second.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(ValueError, match="root.*changed|symlink"):
+            writer.write(("escape.json",), b"{}\n")
+        assert not (outside / "escape.json").exists()
 
 
 def test_official_nuscenes_loader_smoke(

@@ -8,6 +8,7 @@ import os
 import stat
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from io import BytesIO
 from pathlib import Path
@@ -49,6 +50,183 @@ OFFICIAL_TABLES = (
 _EMPTY_TABLES = frozenset(
     {"category", "attribute", "visibility", "instance", "sample_annotation"}
 )
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_FILE_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def _open_absolute_directory(
+    path: Path, *, create: bool
+) -> tuple[int, tuple[tuple[int, int], ...]]:
+    absolute = path.absolute()
+    if not absolute.is_absolute() or ".." in absolute.parts:
+        raise ValueError("staging dataroot must be an absolute traversal-safe path")
+    current = os.open("/", _DIRECTORY_FLAGS)
+    identities = [_identity(os.fstat(current))]
+    try:
+        for component in absolute.parts[1:]:
+            if create:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o700, dir_fd=current)
+            child: int | None = None
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+                listed = os.stat(component, dir_fd=current, follow_symlinks=False)
+                opened = os.fstat(child)
+                if not stat.S_ISDIR(listed.st_mode) or _identity(listed) != _identity(opened):
+                    raise ValueError("staging dataroot directory identity changed")
+            except OSError as error:
+                if child is not None:
+                    os.close(child)
+                raise ValueError(
+                    "staging dataroot contains a symlink or unsafe directory"
+                ) from error
+            except Exception:
+                if child is not None:
+                    os.close(child)
+                raise
+            assert child is not None
+            identities.append(_identity(opened))
+            os.close(current)
+            current = child
+        return current, tuple(identities)
+    except Exception:
+        os.close(current)
+        raise
+
+
+class _SafeDatarootWriter:
+    """Pinned no-follow, exclusive writer for one initially empty staging dataroot."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root).absolute()
+        self._root_fd, self._chain_identities = _open_absolute_directory(
+            self.root, create=True
+        )
+        self._closed = False
+        try:
+            has_entries = bool(os.listdir(self._root_fd))
+        except Exception:
+            self.close()
+            raise
+        if has_entries:
+            self.close()
+            raise FileExistsError("staging dataroot must be empty; refusing overwrite")
+        self._root_identity = _identity(os.fstat(self._root_fd))
+
+    def __enter__(self) -> _SafeDatarootWriter:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            os.close(self._root_fd)
+            self._closed = True
+
+    def _assert_root_unchanged(self) -> None:
+        if self._closed:
+            raise ValueError("staging dataroot writer is closed")
+        if _identity(os.fstat(self._root_fd)) != self._root_identity:
+            raise ValueError("staging dataroot root identity changed")
+        try:
+            check_fd, actual_chain = _open_absolute_directory(self.root, create=False)
+        except ValueError as error:
+            raise ValueError("staging dataroot root changed or became a symlink") from error
+        try:
+            if actual_chain != self._chain_identities:
+                raise ValueError("staging dataroot root identity changed")
+        finally:
+            os.close(check_fd)
+
+    def write(self, relative_parts: tuple[str, ...], content: bytes) -> None:
+        if not relative_parts:
+            raise ValueError("staging output path must contain a filename")
+        for part in relative_parts:
+            validate_safe_segment(part)
+        self._assert_root_unchanged()
+        directory_fd = os.dup(self._root_fd)
+        try:
+            for component in relative_parts[:-1]:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                child_fd: int | None = None
+                try:
+                    child_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+                    listed = os.stat(
+                        component, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    opened = os.fstat(child_fd)
+                    if not stat.S_ISDIR(listed.st_mode) or _identity(listed) != _identity(
+                        opened
+                    ):
+                        raise ValueError("output directory identity changed")
+                except OSError as error:
+                    if child_fd is not None:
+                        os.close(child_fd)
+                    raise ValueError("output directory is a symlink or unsafe directory") from error
+                except Exception:
+                    if child_fd is not None:
+                        os.close(child_fd)
+                    raise
+                assert child_fd is not None
+                os.close(directory_fd)
+                directory_fd = child_fd
+            filename = relative_parts[-1]
+            try:
+                file_fd = os.open(
+                    filename,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError as error:
+                raise FileExistsError(
+                    f"refusing output destination collision at {'/'.join(relative_parts)}"
+                ) from error
+            except OSError as error:
+                raise ValueError("output leaf is a symlink or unsafe file") from error
+            try:
+                offset = 0
+                while offset < len(content):
+                    written = os.write(file_fd, content[offset:])
+                    if written <= 0:
+                        raise OSError("short write while exporting dataset")
+                    offset += written
+                os.fsync(file_fd)
+                written_stat = os.fstat(file_fd)
+                listed = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(written_stat.st_mode)
+                    or written_stat.st_nlink != 1
+                    or _identity(written_stat) != _identity(listed)
+                    or written_stat.st_size != len(content)
+                ):
+                    raise ValueError("exported file identity changed during write")
+            finally:
+                os.close(file_fd)
+            try:
+                read_fd = os.open(
+                    filename, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd
+                )
+            except OSError as error:
+                raise ValueError("exported file changed before verification") from error
+            try:
+                chunks: list[bytes] = []
+                while chunk := os.read(read_fd, 1024 * 1024):
+                    chunks.append(chunk)
+                if b"".join(chunks) != content:
+                    raise ValueError("exported file content verification failed")
+            finally:
+                os.close(read_fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        self._assert_root_unchanged()
 
 
 @dataclass(frozen=True)
@@ -74,6 +252,87 @@ class ExportResult:
     sample_data_count: int
     image_count: int
     content_fingerprint: str
+
+
+@dataclass(frozen=True)
+class _ExportIndex:
+    graphs_by_source: Mapping[str, RecordingSceneResult]
+    scenes_by_identity: Mapping[tuple[str, str], SceneRecord]
+    samples_by_scene: Mapping[tuple[str, str], tuple[SampleRecord, ...]]
+    sample_data_by_scene: Mapping[tuple[str, str], tuple[SampleDataRecord, ...]]
+    sample_data_by_sample: Mapping[str, tuple[SampleDataRecord, ...]]
+    sample_data_by_scene_channel: Mapping[
+        tuple[str, str, str], tuple[SampleDataRecord, ...]
+    ]
+    channels_by_scene: Mapping[tuple[str, str], tuple[str, ...]]
+
+
+def _build_export_index(graphs: Sequence[RecordingSceneResult]) -> _ExportIndex:
+    """Index each graph collection once and reject cross-recording collisions."""
+    graphs_by_source: dict[str, RecordingSceneResult] = {}
+    scenes_by_identity: dict[tuple[str, str], SceneRecord] = {}
+    samples_by_scene_lists: dict[tuple[str, str], list[SampleRecord]] = defaultdict(list)
+    data_by_scene_lists: dict[tuple[str, str], list[SampleDataRecord]] = defaultdict(list)
+    data_by_sample_lists: dict[str, list[SampleDataRecord]] = defaultdict(list)
+    data_by_scene_channel_lists: dict[
+        tuple[str, str, str], list[SampleDataRecord]
+    ] = defaultdict(list)
+    sample_tokens: set[str] = set()
+    sample_data_tokens: set[str] = set()
+    for graph in graphs:
+        digest = graph.source.digest
+        if digest in graphs_by_source:
+            raise ValueError("recording graphs contain duplicate source identities")
+        graphs_by_source[digest] = graph
+        for scene in graph.scenes:
+            identity = (digest, scene.token)
+            if identity in scenes_by_identity:
+                raise ValueError("recording graphs contain duplicate scene identities")
+            scenes_by_identity[identity] = scene
+        for sample in graph.samples:
+            if sample.token in sample_tokens:
+                raise ValueError("recording graphs contain duplicate sample tokens")
+            sample_tokens.add(sample.token)
+            samples_by_scene_lists[(digest, sample.scene_token)].append(sample)
+        for item in graph.sample_data:
+            if item.token in sample_data_tokens:
+                raise ValueError("recording graphs contain duplicate sample_data tokens")
+            sample_data_tokens.add(item.token)
+            data_by_scene_lists[(digest, item.scene_token)].append(item)
+            data_by_sample_lists[item.sample_token].append(item)
+            data_by_scene_channel_lists[(digest, item.scene_token, item.channel)].append(
+                item
+            )
+    samples_by_scene = {
+        key: tuple(sorted(values, key=lambda item: (item.timestamp_ns, item.token)))
+        for key, values in samples_by_scene_lists.items()
+    }
+    data_by_scene = {
+        key: tuple(
+            sorted(values, key=lambda item: (item.channel, item.timestamp_ns, item.token))
+        )
+        for key, values in data_by_scene_lists.items()
+    }
+    return _ExportIndex(
+        graphs_by_source,
+        scenes_by_identity,
+        samples_by_scene,
+        data_by_scene,
+        {
+            key: tuple(
+                sorted(values, key=lambda item: (item.channel, item.timestamp_ns, item.token))
+            )
+            for key, values in data_by_sample_lists.items()
+        },
+        {
+            key: tuple(sorted(values, key=lambda item: (item.timestamp_ns, item.token)))
+            for key, values in data_by_scene_channel_lists.items()
+        },
+        {
+            key: tuple(sorted({item.channel for item in values}))
+            for key, values in data_by_scene.items()
+        },
+    )
 
 
 def _jsonable(value: object) -> object:
@@ -228,25 +487,12 @@ def _read_verified_jpeg(staged: StagedImage) -> tuple[bytes, str]:
     return data, digest
 
 
-def _write_json(path: Path, value: object) -> bytes:
+def _write_json(
+    writer: _SafeDatarootWriter, relative_parts: tuple[str, ...], value: object
+) -> bytes:
     content = (canonical_json(value) + "\n").encode("utf-8")
-    _write_bytes(path, content)
+    writer.write(relative_parts, content)
     return content
-
-
-def _write_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as error:
-        raise FileExistsError(f"refusing to overwrite {path}") from error
-    try:
-        offset = 0
-        while offset < len(content):
-            offset += os.write(descriptor, content[offset:])
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _compatibility_mask() -> bytes:
@@ -255,33 +501,16 @@ def _compatibility_mask() -> bytes:
     return stream.getvalue()
 
 
-def _copy_image(root: Path, relative: str, staged: StagedImage) -> str:
+def _copy_image(
+    writer: _SafeDatarootWriter, relative: str, staged: StagedImage
+) -> str:
     parts = relative.split("/")
     if len(parts) != 3 or parts[0] != "samples":
         raise ValueError("unsafe exported image filename")
     for part in parts:
         validate_safe_segment(part)
     content, digest = _read_verified_jpeg(staged)
-    destination = root.joinpath(*parts)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as error:
-        raise FileExistsError(f"refusing image destination collision at {relative}") from error
-    try:
-        offset = 0
-        while offset < len(content):
-            offset += os.write(descriptor, content[offset:])
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    copied = destination.read_bytes()
-    if len(copied) != len(content) or hashlib.sha256(copied).hexdigest() != digest:
-        raise ValueError("copied image verification failed")
-    with Image.open(BytesIO(copied)) as image:
-        image.load()
-        if image.format != "JPEG" or image.size != (staged.width, staged.height):
-            raise ValueError("copied image dimensions differ")
+    writer.write(tuple(parts), content)
     return digest
 
 
@@ -330,40 +559,21 @@ def _validate_boundary(evidence: ExportEvidence) -> None:
 
 def _selected_records(
     evidence: ExportEvidence,
-) -> tuple[
-    tuple[tuple[RecordingSceneResult, SceneRecord], ...],
-    dict[str, SampleRecord],
-    dict[str, tuple[SampleDataRecord, ...]],
-]:
+) -> tuple[tuple[tuple[RecordingSceneResult, SceneRecord], ...], _ExportIndex]:
     selected = {
         (item.scene_token, item.source_digest) for item in evidence.split.assignments
     }
-    scenes: list[tuple[RecordingSceneResult, SceneRecord]] = []
-    samples: dict[str, SampleRecord] = {}
-    data_lists: dict[str, list[SampleDataRecord]] = defaultdict(list)
-    for graph in sorted(evidence.graphs, key=lambda item: item.source.digest):
-        for scene in graph.scenes:
-            if (scene.token, graph.source.digest) in selected:
-                scenes.append((graph, scene))
-                for sample in graph.samples:
-                    if sample.scene_token == scene.token:
-                        if sample.token in samples:
-                            raise ValueError("selected samples contain duplicate tokens")
-                        samples[sample.token] = sample
-                for item in graph.sample_data:
-                    if item.scene_token == scene.token:
-                        data_lists[item.sample_token].append(item)
+    index = _build_export_index(evidence.graphs)
+    scenes = [
+        (index.graphs_by_source[source_digest], scene)
+        for scene_token, source_digest in sorted(selected)
+        if (scene := index.scenes_by_identity.get((source_digest, scene_token))) is not None
+    ]
     if len(scenes) != len(selected):
         raise ValueError("selected scene graph coverage is missing or duplicated")
     return (
         tuple(sorted(scenes, key=lambda item: (item[0].source.digest, item[1].ordinal))),
-        samples,
-        {
-            key: tuple(
-                sorted(value, key=lambda item: (item.channel, item.timestamp_ns, item.token))
-            )
-            for key, value in data_lists.items()
-        },
+        index,
     )
 
 
@@ -376,35 +586,24 @@ def _assert_converted_chain(timestamps_ns: Sequence[int], label: str) -> None:
         raise ValueError(f"{label} has a microsecond conversion collision or order hazard")
 
 
-def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> ExportResult:
-    """Export selected scenes into a new or existing empty staging dataroot.
-
-    Integer nanoseconds are converted to official nuScenes integer microseconds with
-    floor division. Exact nanoseconds remain in extensions, and any chain whose order
-    would collapse or reverse at microsecond precision is rejected.
-    """
-    _validate_boundary(evidence)
-    root = Path(staging_dataroot)
-    if root.exists() and (root.is_symlink() or not root.is_dir()):
-        raise ValueError("staging dataroot must be a real directory")
-    root.mkdir(parents=True, exist_ok=True)
-    if any(root.iterdir()):
-        raise FileExistsError("staging dataroot must be empty; refusing overwrite")
-
+def _export_into(
+    writer: _SafeDatarootWriter, evidence: ExportEvidence
+) -> ExportResult:
+    root = writer.root
     namespace = evidence.resolved_config.scenes.dataset_namespace
-    selected_scenes, samples_by_token, data_by_sample = _selected_records(evidence)
+    selected_scenes, export_index = _selected_records(evidence)
     feature_by_identity = {
         (item.scene_token, item.source.digest): item
         for item in evidence.selection.selected_scenes
     }
 
+    selected_channels_by_source: dict[str, set[str]] = defaultdict(set)
+    for graph, scene in selected_scenes:
+        selected_channels_by_source[graph.source.digest].update(
+            export_index.channels_by_scene[(graph.source.digest, scene.token)]
+        )
     original_channels = sorted(
-        {
-            item.channel
-            for graph, scene in selected_scenes
-            for item in graph.sample_data
-            if item.scene_token == scene.token
-        }
+        {channel for channels in selected_channels_by_source.values() for channel in channels}
     )
     channel_map = {channel: _normalized_channel(channel) for channel in original_channels}
     reverse: dict[str, list[str]] = defaultdict(list)
@@ -457,10 +656,8 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
     for graph, scene_value in selected_scenes:
         scene = scene_value
         feature = feature_by_identity[(scene.token, graph.source.digest)]
-        scene_samples = sorted(
-            (item for item in samples_by_token.values() if item.scene_token == scene.token),
-            key=lambda item: (item.timestamp_ns, item.token),
-        )
+        scene_identity = (graph.source.digest, scene.token)
+        scene_samples = list(export_index.samples_by_scene.get(scene_identity, ()))
         if not scene_samples or len(scene_samples) != scene.nbr_samples:
             raise ValueError("selected scene sample count differs")
         _assert_converted_chain([item.timestamp_ns for item in scene_samples], "sample chain")
@@ -490,12 +687,13 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
                 }
             )
 
-        scene_data = [item for sample in scene_samples for item in data_by_sample[sample.token]]
-        by_channel: dict[str, list[SampleDataRecord]] = defaultdict(list)
-        for item in scene_data:
-            by_channel[item.channel].append(item)
-        for channel, chain in by_channel.items():
-            chain.sort(key=lambda item: (item.timestamp_ns, item.token))
+        scene_data = list(export_index.sample_data_by_scene.get(scene_identity, ()))
+        for channel in export_index.channels_by_scene[scene_identity]:
+            chain = list(
+                export_index.sample_data_by_scene_channel[
+                    (graph.source.digest, scene.token, channel)
+                ]
+            )
             _assert_converted_chain(
                 [item.timestamp_ns for item in chain], f"camera {channel} chain"
             )
@@ -531,7 +729,7 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
                     }
                 )
                 relative = f"samples/{channel_map[channel]}/{item.token}.jpg"
-                image_sha = _copy_image(root, relative, item.staged_image)
+                image_sha = _copy_image(writer, relative, item.staged_image)
                 image_count += 1
                 official_data.append(
                     {
@@ -654,14 +852,10 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
         sample_data=official_data,
         map=[compatibility_map],
     )
-    _write_bytes(root / compatibility_mask_filename, _compatibility_mask())
-    version_dir = root / NUSCENES_VERSION
+    writer.write(tuple(compatibility_mask_filename.split("/")), _compatibility_mask())
     for name in OFFICIAL_TABLES:
-        _write_json(version_dir / f"{name}.json", tables[name])
+        _write_json(writer, (NUSCENES_VERSION, f"{name}.json"), tables[name])
 
-    selected_tokens_by_source: dict[str, set[str]] = defaultdict(set)
-    for selected_graph, selected_scene in selected_scenes:
-        selected_tokens_by_source[selected_graph.source.digest].add(selected_scene.token)
     recordings = [
         {
             "source": graph.source.to_dict(),
@@ -669,13 +863,7 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
             "log_token": log_by_source[graph.source.digest],
             "channels": [
                 {"original": channel, "normalized": channel_map[channel]}
-                for channel in sorted(
-                    {
-                        item.channel
-                        for item in graph.sample_data
-                        if item.scene_token in selected_tokens_by_source[graph.source.digest]
-                    }
-                )
+                for channel in sorted(selected_channels_by_source[graph.source.digest])
             ],
         }
         for graph in selected_graphs
@@ -709,21 +897,31 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
             if item.token in selected_window_tokens
         ],
     }
-    extensions = root / "mz_extensions"
-    _write_json(extensions / "recordings.json", recordings)
-    _write_json(extensions / "gnss.json", gnss_extension)
-    _write_json(extensions / "validity.json", validity_extension)
+    _write_json(writer, ("mz_extensions", "recordings.json"), recordings)
+    _write_json(writer, ("mz_extensions", "gnss.json"), gnss_extension)
+    _write_json(writer, ("mz_extensions", "validity.json"), validity_extension)
     _write_json(
-        extensions / "validation.json",
+        writer,
+        ("mz_extensions", "validation.json"),
         {"schema_version": 1, "state": "not_run", "succeeded": False, "report": None},
     )
-    _write_json(extensions / "tags.json", tags_extension)
-    _write_json(extensions / "annotations.json", annotation_payload)
-    _write_json(extensions / "split.json", split_extension_payload(evidence.split))
+    _write_json(writer, ("mz_extensions", "tags.json"), tags_extension)
+    _write_json(writer, ("mz_extensions", "annotations.json"), annotation_payload)
     _write_json(
-        extensions / "config.json", evidence.resolved_config.model_dump(mode="json")
+        writer,
+        ("mz_extensions", "split.json"),
+        split_extension_payload(evidence.split),
     )
-    manifest_bytes = _write_json(extensions / "content_manifest.json", evidence.content_manifest)
+    _write_json(
+        writer,
+        ("mz_extensions", "config.json"),
+        evidence.resolved_config.model_dump(mode="json"),
+    )
+    manifest_bytes = _write_json(
+        writer,
+        ("mz_extensions", "content_manifest.json"),
+        evidence.content_manifest,
+    )
     return ExportResult(
         root.resolve(),
         NUSCENES_VERSION,
@@ -733,3 +931,17 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
         image_count,
         hashlib.sha256(manifest_bytes).hexdigest(),
     )
+
+
+def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> ExportResult:
+    """Export selected scenes into a new or existing empty staging dataroot.
+
+    Integer nanoseconds are converted to official nuScenes integer microseconds with
+    floor division. Exact nanoseconds remain in extensions, and any chain whose order
+    would collapse or reverse at microsecond precision is rejected. A failed export may
+    leave a partial staging root; the caller must remove it before retrying. Task 9 owns
+    lifecycle cleanup for its publication staging directories.
+    """
+    _validate_boundary(evidence)
+    with _SafeDatarootWriter(staging_dataroot) as writer:
+        return _export_into(writer, evidence)

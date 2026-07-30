@@ -28,6 +28,13 @@ def _load_json(path: Path) -> object:
         raise DatasetFormatError(f"malformed or missing JSON file: {path}") from error
 
 
+def _required_string(record: JsonRecord, field_name: str, label: str) -> str:
+    value = record.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise DatasetFormatError(f"{label} {field_name} must be a nonempty string")
+    return value
+
+
 def _safe_asset_filename(
     value: object, *, directory: str, part_count: int, label: str
 ) -> str:
@@ -62,6 +69,7 @@ class Dataset:
     _tables: Mapping[str, tuple[JsonRecord, ...]] = field(init=False, repr=False)
     _token_index: Mapping[str, Mapping[str, JsonRecord]] = field(init=False, repr=False)
     _extensions: Mapping[str, object] = field(init=False, repr=False)
+    _camera_index: Mapping[tuple[str, str], str] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         root = Path(self.dataroot).resolve()
@@ -104,6 +112,39 @@ class Dataset:
                         raise DatasetFormatError("map compatibility mask is missing")
             tables[name] = records
             indexes[name] = MappingProxyType(index)
+        camera_index: dict[tuple[str, str], str] = {}
+        for calibration in tables["calibrated_sensor"]:
+            sensor_token = _required_string(
+                calibration, "sensor_token", "calibrated_sensor"
+            )
+            if sensor_token not in indexes["sensor"]:
+                raise DatasetFormatError("calibrated_sensor references a missing sensor")
+        for item in tables["sample_data"]:
+            sample_token = _required_string(item, "sample_token", "sample_data")
+            calibration_token = _required_string(
+                item, "calibrated_sensor_token", "sample_data"
+            )
+            ego_pose_token = _required_string(item, "ego_pose_token", "sample_data")
+            if sample_token not in indexes["sample"]:
+                raise DatasetFormatError("sample_data references a missing sample")
+            if calibration_token not in indexes["calibrated_sensor"]:
+                raise DatasetFormatError(
+                    "sample_data references a missing calibrated_sensor"
+                )
+            if ego_pose_token not in indexes["ego_pose"]:
+                raise DatasetFormatError("sample_data references a missing ego_pose")
+            calibration = indexes["calibrated_sensor"][calibration_token]
+            sensor_token = _required_string(
+                calibration, "sensor_token", "calibrated_sensor"
+            )
+            sensor = indexes["sensor"][sensor_token]
+            channel = _required_string(sensor, "channel", "sensor")
+            if not channel.startswith("CAM_"):
+                raise DatasetFormatError("camera sensor channel must use normalized CAM_* form")
+            key = (sample_token, channel)
+            if key in camera_index:
+                raise DatasetFormatError("duplicate or ambiguous camera sample/channel reference")
+            camera_index[key] = _required_string(item, "token", "sample_data")
         extensions: dict[str, object] = {}
         for name in (
             "recordings",
@@ -120,9 +161,12 @@ class Dataset:
         object.__setattr__(self, "_tables", MappingProxyType(tables))
         object.__setattr__(self, "_token_index", MappingProxyType(indexes))
         object.__setattr__(self, "_extensions", MappingProxyType(extensions))
+        object.__setattr__(self, "_camera_index", MappingProxyType(camera_index))
 
     def table(self, table_name: str) -> tuple[JsonRecord, ...]:
         """Return one official table in deterministic file order."""
+        if not isinstance(table_name, str):
+            raise DatasetFormatError("table name must be a string")
         try:
             return deepcopy(self._tables[table_name])
         except KeyError as error:
@@ -130,6 +174,8 @@ class Dataset:
 
     def get(self, table_name: str, token: str) -> JsonRecord:
         """Return one official record by token."""
+        if not isinstance(table_name, str) or not isinstance(token, str):
+            raise DatasetFormatError("table name and token must be strings")
         try:
             table = self._token_index[table_name]
         except KeyError as error:
@@ -178,24 +224,18 @@ class Dataset:
 
     def camera(self, sample_token: str, channel: str) -> JsonRecord:
         """Resolve exactly one sample_data row for a normalized camera channel."""
-        if not channel.startswith("CAM_"):
+        if (
+            not isinstance(sample_token, str)
+            or not isinstance(channel, str)
+            or not channel.startswith("CAM_")
+        ):
             raise DatasetFormatError("camera channel must use normalized CAM_* form")
-        matches: list[JsonRecord] = []
-        for record in self.table("sample_data"):
-            if record.get("sample_token") != sample_token:
-                continue
-            calibration = self.get(
-                "calibrated_sensor", cast(str, record.get("calibrated_sensor_token"))
-            )
-            sensor = self.get("sensor", cast(str, calibration.get("sensor_token")))
-            if sensor.get("channel") == channel:
-                matches.append(record)
-        if len(matches) != 1:
-            qualifier = "missing" if not matches else "ambiguous"
+        token = self._camera_index.get((sample_token, channel))
+        if token is None:
             raise DatasetFormatError(
-                f"{qualifier} camera row for sample {sample_token!r} channel {channel!r}"
+                f"missing camera row for sample {sample_token!r} channel {channel!r}"
             )
-        return matches[0]
+        return self.get("sample_data", token)
 
     def ego_pose(self, sample_data_token: str) -> JsonRecord:
         """Return the ego pose referenced by one sample_data row."""
@@ -281,6 +321,8 @@ class Dataset:
     def _one_annotation(
         records: tuple[JsonRecord, ...], field_name: str, token: str, label: str
     ) -> JsonRecord:
+        if not isinstance(token, str):
+            raise DatasetFormatError(f"{label} token must be a string")
         matches = [item for item in records if item.get(field_name) == token]
         if not matches:
             raise DatasetFormatError(f"missing {label} {token!r}")
@@ -314,6 +356,8 @@ class Dataset:
             not isinstance(token, str) for token in references
         ):
             raise DatasetFormatError("scene annotation record references are malformed")
+        if len(references) != len(set(references)):
+            raise DatasetFormatError("scene annotation record references contain duplicates")
         if not isinstance(window_reference, str):
             raise DatasetFormatError("scene annotation window reference is malformed")
         records = [self.annotation_record(token) for token in references]
@@ -325,8 +369,19 @@ class Dataset:
                 not isinstance(token, str) for token in window_tokens
             ):
                 raise DatasetFormatError("annotation window record references are malformed")
-            for token in window_tokens:
-                self.annotation_record(token)
+            if window_tokens != references:
+                raise DatasetFormatError(
+                    "annotation window tokens must exactly match scene annotation references"
+                )
+        source_digest = summary.get("source_digest")
+        if not isinstance(source_digest, str) or not source_digest:
+            raise DatasetFormatError("scene annotation source digest is malformed")
+        if any(item.get("source_digest") != source_digest for item in records):
+            raise DatasetFormatError("annotation record source differs from scene source")
+        if any(item.get("source_digest") != source_digest for item in matches):
+            raise DatasetFormatError("annotation match source differs from scene source")
+        if any(item.get("source_digest") != source_digest for item in windows):
+            raise DatasetFormatError("annotation window source differs from scene source")
         return deepcopy(
             {
                 "scene": summary,

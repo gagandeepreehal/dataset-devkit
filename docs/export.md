@@ -4,7 +4,10 @@
 It recomputes scenario selection, scene splits, and every recording scene graph before writing.
 The resolved global scenario/split configuration and dataset namespace must match that evidence.
 The destination must be absent or an empty real directory; existing content is never
-overwritten. Task 9 owns sibling staging, validation, and atomic publication.
+overwritten. Every destination write uses pinned no-follow directory descriptors and exclusive
+leaf creation. A failed export may leave a partial staging root for audit; direct callers must
+remove that root before retrying. Task 9 owns sibling-staging cleanup, validation, and atomic
+publication.
 
 ## Official layout
 
@@ -56,6 +59,7 @@ duplicate tokens. Its stable methods are:
 - `split(scene_token)` and `scenes_in_split("train" | "test")`;
 - `recordings()` and `validation_report()`.
 
-Camera lookup requires exactly one row for the requested sample/channel and rejects missing or
-ambiguous evidence. Every returned table, record, traversal, or extension value is a defensive
-deep copy, so caller mutation cannot alter cached indexes or subsequent queries.
+Camera lookup uses a load-time validated `(sample_token, channel)` index, requires exactly one row,
+and rejects missing, malformed, or ambiguous references. Every returned table, record, traversal,
+or extension value is a defensive deep copy, so caller mutation cannot alter cached indexes or
+subsequent queries.
