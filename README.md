@@ -8,7 +8,8 @@ selection, GNSS interpolation, and verified JPEG staging are a separate focused 
 validity/sanity policy, safe quarantine reports, independent-recording partial-export gating,
 deterministic automatic/annotation/hybrid scene graphs, real-timestamp features and tags,
 exact-quota scenario selection, and auditable scene-level train/test splitting are implemented.
-Export and publication remain later stages.
+Deterministic nuScenes export and an indexed read-only Dataset SDK are also implemented;
+validation and atomic publication remain later stages.
 
 ## Install for development
 
@@ -73,6 +74,9 @@ hybrid exclusion, UUIDv5 identities, per-camera chains, and structural graph val
 See [selection.md](docs/selection.md) for real-timestamp trajectory features, complete-evidence
 filtering, and deterministic exact-quota scenario rules.
 
+See [export.md](docs/export.md) for the official nuScenes table layout, exact timestamp and image
+copy rules, extension tables, exporter evidence boundary, and Dataset SDK methods.
+
 ## Scene-level train/test split
 
 `split_selected_scenes` validates the complete Task 6 feature population and scenario-selection
@@ -96,6 +100,10 @@ from pathlib import Path
 from dataset_devkit import Dataset
 
 dataset = Dataset(dataroot=Path("DATASET"), version="v1.0-trainval")
+scene = dataset.table("scene")[0]
+samples = dataset.scene_samples(scene["token"])
+front = dataset.camera(samples[0]["token"], "CAM_FRONT")
+pose = dataset.ego_pose(front["token"])
 ```
 
 See [configuration.md](docs/configuration.md) for the complete configuration contract and

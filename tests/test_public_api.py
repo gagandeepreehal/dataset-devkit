@@ -10,10 +10,14 @@ import dataset_devkit
 
 def test_dataset_is_a_stable_import_boundary(tmp_path: Path) -> None:
     assert hasattr(dataset_devkit, "Dataset")
-    dataset = dataset_devkit.Dataset(dataroot=tmp_path, version="v1.0-trainval")
+    with pytest.raises(dataset_devkit.DatasetFormatError, match="missing JSON"):
+        dataset_devkit.Dataset(dataroot=tmp_path, version="v1.0-trainval")
 
-    assert dataset.dataroot == tmp_path.resolve()
-    assert dataset.version == "v1.0-trainval"
+
+def test_export_functions_are_stable_import_boundaries() -> None:
+    assert callable(dataset_devkit.export_dataset)
+    assert hasattr(dataset_devkit, "ExportEvidence")
+    assert hasattr(dataset_devkit, "ExportResult")
 
 
 def test_scene_split_functions_are_stable_import_boundaries() -> None:
