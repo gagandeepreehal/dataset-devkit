@@ -69,7 +69,9 @@ def _camera(tmp_path: Path, logical: int, channel: str, real: int) -> ExtractedC
         (4, 3),
         batch_ordinal=logical,
     )
-    interpolation = GnssInterpolation(real, True, None, None, 0.0, 0, 0)
+    interpolation = GnssInterpolation(
+        real, True, None, None, 0.0, 0, 0, source_validity=(True, True)
+    )
     pose = EgoPose(real, True, (1.0, 2.0, 3.0), (1.0, 0.0, 0.0, 0.0), interpolation)
     calibration = CameraCalibration(
         CameraIntrinsic(1.0, 1.0, 1.0, 1.0, 0.0, 0.0, (), 4.0, 3.0),

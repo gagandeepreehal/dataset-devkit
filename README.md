@@ -69,6 +69,9 @@ sanity modes, quarantine reports, and the partial-export authorization gate.
 See [scenes.md](docs/scenes.md) for exact greedy segmentation, strict annotation JSONL matching,
 hybrid exclusion, UUIDv5 identities, per-camera chains, and structural graph validation.
 
+See [selection.md](docs/selection.md) for real-timestamp trajectory features, complete-evidence
+filtering, and deterministic exact-quota scenario rules.
+
 The stable Python import is:
 
 ```python

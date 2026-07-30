@@ -57,11 +57,16 @@ are not treated as credentials merely because their text contains words such as 
   model-validation callers use `Decimal`; `load_config` remains the authoritative JSON boundary.
 - `annotations`: safely resolved relative JSONL path, nearest-match tolerance, and before/after
   windows. See [scenes.md](scenes.md) for the strict line format and matching algorithm.
-- `tags`: stationary-speed and turn-angle thresholds.
-- `filters`: valid-sample fraction and tags required for export.
-- `scenarios`: deterministic seed and uniquely named typed rules. Tag lists contain nonblank,
-  unique values; required and excluded tags cannot overlap. Each rule has a sampling fraction in
-  `(0, 1]` plus an optional positive scene cap.
+- `tags`: exact reference-camera/fallback policy, stationary speed in m/s, minimum movement in
+  meters, and ordered straight/curvature/turn net-heading thresholds in degrees. The required
+  relationship is `straight_max_heading_change_deg < curvature_min_heading_change_deg <
+  turn_min_heading_change_deg`.
+- `filters`: optional duration seconds, scene-valid and camera-coverage ratios, per-channel
+  coverage, maximum sync error milliseconds, distance meters, computed-tag and human-label
+  predicates, and exact scene/source/blob blacklists. Empty means accept all.
+- `scenarios`: deterministic integer seed, strict exact-quota policy, and uniquely named ordered
+  rules. Rules keep computed tags and human labels separate and may add the same metric filters.
+  Required and excluded predicates cannot overlap; quotas are nonnegative integers.
 - `split`: deterministic test fraction in `(0, 1)`, seed, and stratification switch.
 - `execution`: positive worker count and partial-export policy.
 - `quarantine`: mandatory `enabled: true`, an isolated output directory, and a basename-only

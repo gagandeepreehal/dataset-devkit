@@ -36,6 +36,41 @@ def _token(namespace: UUID, kind: str, identity: object) -> str:
     return str(uuid5(namespace, f"dataset-devkit/{kind}/{canonical_json(identity)}"))
 
 
+def _feature_evidence_token(
+    namespace: UUID,
+    source: SourceFingerprint,
+    source_samples: tuple[SourceSampleRecord, ...],
+    sample_data: tuple[SampleDataRecord, ...],
+) -> str:
+    return _token(
+        namespace,
+        "feature-evidence",
+        [
+            source.to_dict(),
+            [
+                [
+                    item.timestamp_ns,
+                    item.batch_timestamp_ns,
+                    item.expected_channels,
+                    item.present_channels,
+                    item.source_gnss_valid,
+                    item.grid_signed_sync_error_ns,
+                ]
+                for item in source_samples
+            ],
+            [
+                [
+                    item.token,
+                    item.grid_signed_sync_error_ns,
+                    item.camera_signed_sync_error_ns,
+                    item.gnss_source_validity,
+                ]
+                for item in sample_data
+            ],
+        ],
+    )
+
+
 def _validate_input(
     report: ValidityReport, source: SourceFingerprint
 ) -> tuple[LogicalSampleAudit, ...]:
@@ -570,6 +605,9 @@ def _materialize(
                         camera.ego_pose,
                         "" if data_index == 0 else data_tokens[data_index - 1],
                         "" if data_index == len(data_tokens) - 1 else data_tokens[data_index + 1],
+                        camera.batch_timestamp_ns - camera.grid_target_timestamp_ns,
+                        camera.camera_timestamp_ns - camera.grid_target_timestamp_ns,
+                        tuple(camera.ego_pose.interpolation.source_validity or ()),
                     )
                 )
         scenes.append(
@@ -672,12 +710,24 @@ def build_recording_scenes(
     scenes, samples, sample_data = _materialize(
         ordered_candidates, source, settings, config.scenes.dataset_namespace
     )
+    observed_channels = tuple(
+        sorted({camera.camera_name for item in final_samples for camera in item.samples})
+    )
+    expected_channels = tuple(
+        sorted(set(config.frame_validity.required_cameras) | set(observed_channels))
+    )
     source_samples = tuple(
         SourceSampleRecord(
             item.grid_target_timestamp_ns,
             item.batch_timestamp_ns,
-            tuple(sorted(camera.camera_name for camera in item.samples)),
+            expected_channels,
             index.run_id_by_position[position],
+            tuple(sorted(camera.camera_name for camera in item.samples)),
+            all(
+                all(camera.ego_pose.interpolation.source_validity or ())
+                for camera in item.samples
+            ),
+            item.batch_timestamp_ns - item.grid_target_timestamp_ns,
         )
         for position, item in enumerate(final_samples)
     )
@@ -706,6 +756,12 @@ def build_recording_scenes(
             config.scenes.dataset_namespace,
             "scene-build-config",
             settings.identity(),
+        ),
+        _feature_evidence_token(
+            config.scenes.dataset_namespace,
+            source,
+            source_samples,
+            sample_data,
         ),
     )
     validate_scene_graph(result)
@@ -775,6 +831,19 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             raise StructuralExtractionError(
                 "source sample expected channel coverage is empty, duplicated, or noncanonical"
             )
+        if source_record.present_channels != tuple(sorted(set(source_record.present_channels))):
+            raise StructuralExtractionError(
+                "source sample present channel evidence is noncanonical"
+            )
+        if not set(source_record.present_channels) <= set(source_record.expected_channels):
+            raise StructuralExtractionError(
+                "source sample present channels exceed expected coverage"
+            )
+        if (
+            source_record.grid_signed_sync_error_ns
+            != source_record.batch_timestamp_ns - source_record.timestamp_ns
+        ):
+            raise StructuralExtractionError("source sample grid sync evidence is inconsistent")
     settings = _BuildSettings.from_result(result)
     if (
         settings.mode not in {"automatic", "annotation_only", "hybrid"}
@@ -1138,6 +1207,9 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             / f"{expected_data_token}.jpg"
         ).as_posix()
         filename = PurePosixPath(item.filename)
+        selected_sample = samples.get(item.sample_token)
+        if selected_sample is None or selected_sample.scene_token != item.scene_token:
+            raise StructuralExtractionError("sample_data has a foreign or cross-scene reference")
         if (
             item.token != expected_data_token
             or item.filename != expected_filename
@@ -1155,12 +1227,15 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             or item.staged_image.camera_index != item.camera_index
             or item.staged_image.timestamp_ns != item.timestamp_ns
             or item.staged_image.path.suffix.lower() != ".jpg"
+            or item.grid_signed_sync_error_ns
+            != selected_sample.batch_timestamp_ns - selected_sample.grid_timestamp_ns
+            or item.camera_signed_sync_error_ns
+            != item.timestamp_ns - selected_sample.grid_timestamp_ns
+            or item.gnss_source_validity
+            != tuple(item.ego_pose.interpolation.source_validity or ())
         ):
             raise StructuralExtractionError("sample_data staged camera evidence is inconsistent")
         verify_staged_image_identity(item.staged_image)
-        selected_sample = samples.get(item.sample_token)
-        if selected_sample is None or selected_sample.scene_token != item.scene_token:
-            raise StructuralExtractionError("sample_data has a foreign or cross-scene reference")
         if item.ego_pose.timestamp_ns != item.timestamp_ns:
             raise StructuralExtractionError("sample_data does not preserve real pose timestamp")
         data_groups[(item.scene_token, item.channel)].append(item)
@@ -1172,8 +1247,13 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         actual_channels = tuple(item.channel for item in data_by_sample[sample.token])
         if len(actual_channels) != len(set(actual_channels)):
             raise StructuralExtractionError("sample_data contains a duplicate sample channel")
-        if set(actual_channels) != set(expected.expected_channels):
+        if set(actual_channels) != set(expected.present_channels):
             raise StructuralExtractionError("sample_data channel coverage is missing or extra")
+        data = data_by_sample[sample.token]
+        if expected.source_gnss_valid != all(
+            all(item.gnss_source_validity) for item in data
+        ):
+            raise StructuralExtractionError("source sample GNSS validity evidence is inconsistent")
     for data_group in data_groups.values():
         ordered = sorted(data_group, key=lambda item: samples[item.sample_token].timestamp_ns)
         if any(
@@ -1226,3 +1306,10 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         annotation_scene_windows
     ) != sorted(windows):
         raise StructuralExtractionError("annotation windows do not have exactly one scene")
+    if result.feature_evidence_token != _feature_evidence_token(
+        result.dataset_namespace,
+        result.source,
+        result.source_samples,
+        result.sample_data,
+    ):
+        raise StructuralExtractionError("scene graph feature evidence seal is inconsistent")

@@ -102,24 +102,215 @@
     "FiltersConfig": {
       "additionalProperties": false,
       "properties": {
-        "min_valid_ratio": {
-          "maximum": 1,
-          "minimum": 0,
-          "title": "Min Valid Ratio",
-          "type": "number"
-        },
-        "required_tags": {
+        "blacklisted_blob_paths": {
           "items": {
             "type": "string"
           },
-          "title": "Required Tags",
+          "title": "Blacklisted Blob Paths",
+          "type": "array"
+        },
+        "blacklisted_scene_tokens": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Blacklisted Scene Tokens",
+          "type": "array"
+        },
+        "blacklisted_source_digests": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Blacklisted Source Digests",
+          "type": "array"
+        },
+        "excluded_labels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Excluded Labels",
+          "type": "array"
+        },
+        "excluded_tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Excluded Tags",
+          "type": "array"
+        },
+        "max_camera_coverage_by_channel": {
+          "patternProperties": {
+            "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$": {
+              "type": "number"
+            }
+          },
+          "propertyNames": {
+            "minLength": 1
+          },
+          "title": "Max Camera Coverage By Channel",
+          "type": "object"
+        },
+        "max_camera_coverage_ratio": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Camera Coverage Ratio"
+        },
+        "max_distance_m": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Distance M"
+        },
+        "max_duration_s": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Duration S"
+        },
+        "max_scene_valid_ratio": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Scene Valid Ratio"
+        },
+        "max_sync_error_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Sync Error Ms"
+        },
+        "min_camera_coverage_by_channel": {
+          "patternProperties": {
+            "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$": {
+              "type": "number"
+            }
+          },
+          "propertyNames": {
+            "minLength": 1
+          },
+          "title": "Min Camera Coverage By Channel",
+          "type": "object"
+        },
+        "min_camera_coverage_ratio": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Camera Coverage Ratio"
+        },
+        "min_distance_m": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Distance M"
+        },
+        "min_duration_s": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Duration S"
+        },
+        "min_scene_valid_ratio": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Scene Valid Ratio"
+        },
+        "required_all_labels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required All Labels",
+          "type": "array"
+        },
+        "required_all_tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required All Tags",
+          "type": "array"
+        },
+        "required_any_labels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Any Labels",
+          "type": "array"
+        },
+        "required_any_tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Any Tags",
           "type": "array"
         }
       },
-      "required": [
-        "min_valid_ratio",
-        "required_tags"
-      ],
       "title": "FiltersConfig",
       "type": "object"
     },
@@ -324,35 +515,6 @@
       "title": "QuarantineConfig",
       "type": "object"
     },
-    "SamplingConfig": {
-      "additionalProperties": false,
-      "properties": {
-        "fraction": {
-          "exclusiveMinimum": 0,
-          "maximum": 1,
-          "title": "Fraction",
-          "type": "number"
-        },
-        "max_scenes": {
-          "anyOf": [
-            {
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Max Scenes"
-        }
-      },
-      "required": [
-        "fraction"
-      ],
-      "title": "SamplingConfig",
-      "type": "object"
-    },
     "SanityChecksConfig": {
       "additionalProperties": false,
       "properties": {
@@ -403,6 +565,13 @@
     "ScenarioRuleConfig": {
       "additionalProperties": false,
       "properties": {
+        "excluded_labels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Excluded Labels",
+          "type": "array"
+        },
         "excluded_tags": {
           "items": {
             "type": "string"
@@ -410,25 +579,59 @@
           "title": "Excluded Tags",
           "type": "array"
         },
+        "filters": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FiltersConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "name": {
           "minLength": 1,
           "title": "Name",
           "type": "string"
         },
-        "required_tags": {
+        "quota": {
+          "minimum": 0,
+          "title": "Quota",
+          "type": "integer"
+        },
+        "required_all_labels": {
           "items": {
             "type": "string"
           },
-          "title": "Required Tags",
+          "title": "Required All Labels",
           "type": "array"
         },
-        "sampling": {
-          "$ref": "#/$defs/SamplingConfig"
+        "required_all_tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required All Tags",
+          "type": "array"
+        },
+        "required_any_labels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Any Labels",
+          "type": "array"
+        },
+        "required_any_tags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Any Tags",
+          "type": "array"
         }
       },
       "required": [
         "name",
-        "sampling"
+        "quota"
       ],
       "title": "ScenarioRuleConfig",
       "type": "object"
@@ -446,6 +649,11 @@
         "seed": {
           "title": "Seed",
           "type": "integer"
+        },
+        "strict_quotas": {
+          "default": true,
+          "title": "Strict Quotas",
+          "type": "boolean"
         }
       },
       "required": [
@@ -539,21 +747,64 @@
     "TagsConfig": {
       "additionalProperties": false,
       "properties": {
+        "curvature_min_heading_change_deg": {
+          "exclusiveMaximum": 180,
+          "exclusiveMinimum": 0,
+          "title": "Curvature Min Heading Change Deg",
+          "type": "number"
+        },
+        "minimum_movement_m": {
+          "minimum": 0,
+          "title": "Minimum Movement M",
+          "type": "number"
+        },
+        "reference_camera_channel": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "pattern": "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reference Camera Channel"
+        },
+        "reference_camera_policy": {
+          "default": "lexicographic_fallback",
+          "enum": [
+            "require",
+            "lexicographic_fallback"
+          ],
+          "title": "Reference Camera Policy",
+          "type": "string"
+        },
         "stationary_speed_mps": {
           "minimum": 0,
           "title": "Stationary Speed Mps",
           "type": "number"
         },
-        "turn_angle_deg": {
-          "maximum": 180,
+        "straight_max_heading_change_deg": {
+          "exclusiveMaximum": 180,
           "minimum": 0,
-          "title": "Turn Angle Deg",
+          "title": "Straight Max Heading Change Deg",
+          "type": "number"
+        },
+        "turn_min_heading_change_deg": {
+          "exclusiveMinimum": 0,
+          "maximum": 180,
+          "title": "Turn Min Heading Change Deg",
           "type": "number"
         }
       },
       "required": [
         "stationary_speed_mps",
-        "turn_angle_deg"
+        "minimum_movement_m",
+        "straight_max_heading_change_deg",
+        "curvature_min_heading_change_deg",
+        "turn_min_heading_change_deg"
       ],
       "title": "TagsConfig",
       "type": "object"

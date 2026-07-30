@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from decimal import Decimal
 from pathlib import Path
@@ -370,30 +371,117 @@ class AnnotationsConfig(StrictModel):
 
 
 class TagsConfig(StrictModel):
+    reference_camera_channel: SafeSegment | None = None
+    reference_camera_policy: Literal["require", "lexicographic_fallback"] = (
+        "lexicographic_fallback"
+    )
     stationary_speed_mps: float = Field(ge=0)
-    turn_angle_deg: float = Field(ge=0, le=180)
+    minimum_movement_m: float = Field(ge=0)
+    straight_max_heading_change_deg: float = Field(ge=0, lt=180)
+    curvature_min_heading_change_deg: float = Field(gt=0, lt=180)
+    turn_min_heading_change_deg: float = Field(gt=0, le=180)
+
+    @model_validator(mode="after")
+    def validate_heading_threshold_order(self) -> TagsConfig:
+        if self.reference_camera_channel is None and self.reference_camera_policy == "require":
+            raise ValueError(
+                "reference_camera_channel is required when reference_camera_policy is require"
+            )
+        if not (
+            self.straight_max_heading_change_deg
+            < self.curvature_min_heading_change_deg
+            < self.turn_min_heading_change_deg
+        ):
+            raise ValueError(
+                "straight_max_heading_change_deg < curvature_min_heading_change_deg "
+                "< turn_min_heading_change_deg is required"
+            )
+        return self
 
 
 class FiltersConfig(StrictModel):
-    min_valid_ratio: float = Field(ge=0, le=1)
-    required_tags: list[str]
+    min_duration_s: float | None = Field(default=None, ge=0)
+    max_duration_s: float | None = Field(default=None, ge=0)
+    min_scene_valid_ratio: float | None = Field(default=None, ge=0, le=1)
+    max_scene_valid_ratio: float | None = Field(default=None, ge=0, le=1)
+    min_camera_coverage_ratio: float | None = Field(default=None, ge=0, le=1)
+    max_camera_coverage_ratio: float | None = Field(default=None, ge=0, le=1)
+    min_camera_coverage_by_channel: dict[SafeSegment, float] = Field(default_factory=dict)
+    max_camera_coverage_by_channel: dict[SafeSegment, float] = Field(default_factory=dict)
+    max_sync_error_ms: float | None = Field(default=None, ge=0)
+    min_distance_m: float | None = Field(default=None, ge=0)
+    max_distance_m: float | None = Field(default=None, ge=0)
+    required_any_tags: list[str] = Field(default_factory=list)
+    required_all_tags: list[str] = Field(default_factory=list)
+    excluded_tags: list[str] = Field(default_factory=list)
+    required_any_labels: list[str] = Field(default_factory=list)
+    required_all_labels: list[str] = Field(default_factory=list)
+    excluded_labels: list[str] = Field(default_factory=list)
+    blacklisted_scene_tokens: list[str] = Field(default_factory=list)
+    blacklisted_source_digests: list[str] = Field(default_factory=list)
+    blacklisted_blob_paths: list[str] = Field(default_factory=list)
 
-    @field_validator("required_tags")
+    @field_validator(
+        "required_any_tags",
+        "required_all_tags",
+        "excluded_tags",
+        "required_any_labels",
+        "required_all_labels",
+        "excluded_labels",
+        "blacklisted_scene_tokens",
+        "blacklisted_source_digests",
+        "blacklisted_blob_paths",
+    )
     @classmethod
-    def validate_required_tags(cls, values: list[str]) -> list[str]:
+    def validate_string_lists(cls, values: list[str]) -> list[str]:
         return _validate_tag_list(values)
 
+    @field_validator("min_camera_coverage_by_channel", "max_camera_coverage_by_channel")
+    @classmethod
+    def validate_channel_ratios(cls, values: dict[SafeSegment, float]) -> dict[SafeSegment, float]:
+        if any(not math.isfinite(value) or not 0 <= value <= 1 for value in values.values()):
+            raise ValueError("per-channel camera coverage ratios must be finite in [0, 1]")
+        return values
 
-class SamplingConfig(StrictModel):
-    fraction: float = Field(gt=0, le=1)
-    max_scenes: int | None = Field(default=None, ge=1)
+    @model_validator(mode="after")
+    def validate_ranges_and_predicates(self) -> FiltersConfig:
+        for minimum_name, maximum_name in (
+            ("min_duration_s", "max_duration_s"),
+            ("min_scene_valid_ratio", "max_scene_valid_ratio"),
+            ("min_camera_coverage_ratio", "max_camera_coverage_ratio"),
+            ("min_distance_m", "max_distance_m"),
+        ):
+            minimum = getattr(self, minimum_name)
+            maximum = getattr(self, maximum_name)
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError(f"{minimum_name} must be <= {maximum_name}")
+        for channel in set(self.min_camera_coverage_by_channel) & set(
+            self.max_camera_coverage_by_channel
+        ):
+            if (
+                self.min_camera_coverage_by_channel[channel]
+                > self.max_camera_coverage_by_channel[channel]
+            ):
+                raise ValueError(f"camera coverage minimum exceeds maximum for {channel}")
+        for kind in ("tags", "labels"):
+            required_any = set(getattr(self, f"required_any_{kind}"))
+            required_all = set(getattr(self, f"required_all_{kind}"))
+            excluded = set(getattr(self, f"excluded_{kind}"))
+            if (required_any | required_all) & excluded:
+                raise ValueError(f"required and excluded {kind} overlap")
+        return self
 
 
 class ScenarioRuleConfig(StrictModel):
     name: str = Field(min_length=1)
-    required_tags: list[str] = Field(default_factory=list)
+    quota: int = Field(ge=0)
+    required_any_tags: list[str] = Field(default_factory=list)
+    required_all_tags: list[str] = Field(default_factory=list)
     excluded_tags: list[str] = Field(default_factory=list)
-    sampling: SamplingConfig
+    required_any_labels: list[str] = Field(default_factory=list)
+    required_all_labels: list[str] = Field(default_factory=list)
+    excluded_labels: list[str] = Field(default_factory=list)
+    filters: FiltersConfig | None = None
 
     @field_validator("name")
     @classmethod
@@ -402,20 +490,32 @@ class ScenarioRuleConfig(StrictModel):
             raise ValueError("rule name must be nonblank with no surrounding whitespace")
         return value
 
-    @field_validator("required_tags", "excluded_tags")
+    @field_validator(
+        "required_any_tags",
+        "required_all_tags",
+        "excluded_tags",
+        "required_any_labels",
+        "required_all_labels",
+        "excluded_labels",
+    )
     @classmethod
     def validate_tags(cls, values: list[str]) -> list[str]:
         return _validate_tag_list(values)
 
     @model_validator(mode="after")
     def validate_tag_sets_do_not_overlap(self) -> ScenarioRuleConfig:
-        if set(self.required_tags) & set(self.excluded_tags):
-            raise ValueError("required and excluded tags overlap")
+        for kind in ("tags", "labels"):
+            required = set(getattr(self, f"required_any_{kind}")) | set(
+                getattr(self, f"required_all_{kind}")
+            )
+            if required & set(getattr(self, f"excluded_{kind}")):
+                raise ValueError(f"required and excluded {kind} overlap")
         return self
 
 
 class ScenariosConfig(StrictModel):
     seed: int
+    strict_quotas: bool = True
     rules: list[ScenarioRuleConfig]
 
     @model_validator(mode="after")

@@ -1,0 +1,13 @@
+{
+  "seed": 42,
+  "strict_quotas": true,
+  "rules": [
+    {"name": "Straight", "quota": 0, "required_all_tags": ["straight", "moving"]},
+    {"name": "Stopping", "quota": 0, "required_all_tags": ["stopping"]},
+    {"name": "Left Turn", "quota": 0, "required_all_tags": ["left_turn"]},
+    {"name": "Right Turn", "quota": 0, "required_all_tags": ["right_turn"]},
+    {"name": "Left Curvature", "quota": 0, "required_all_tags": ["left_curvature"]},
+    {"name": "Right Curvature", "quota": 0, "required_all_tags": ["right_curvature"]},
+    {"name": "Annotation Category", "quota": 0, "required_all_labels": ["category/replace-me"]}
+  ]
+}

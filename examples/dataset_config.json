@@ -63,24 +63,26 @@
     "after_s": 20.0
   },
   "tags": {
+    "reference_camera_channel": "front",
+    "reference_camera_policy": "require",
     "stationary_speed_mps": 0.2,
-    "turn_angle_deg": 45.0
+    "minimum_movement_m": 0.1,
+    "straight_max_heading_change_deg": 5.0,
+    "curvature_min_heading_change_deg": 10.0,
+    "turn_min_heading_change_deg": 45.0
   },
   "filters": {
-    "min_valid_ratio": 0.95,
-    "required_tags": []
+    "min_scene_valid_ratio": 0.95
   },
   "scenarios": {
     "seed": 42,
+    "strict_quotas": true,
     "rules": [
       {
-        "name": "turns",
-        "required_tags": ["turn"],
-        "excluded_tags": ["stationary"],
-        "sampling": {
-          "fraction": 0.5,
-          "max_scenes": 100
-        }
+        "name": "Left Turn",
+        "quota": 100,
+        "required_all_tags": ["left_turn"],
+        "excluded_tags": ["stationary"]
       }
     ]
   },

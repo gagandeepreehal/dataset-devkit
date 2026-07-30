@@ -100,6 +100,9 @@ class SampleDataRecord:
     ego_pose: EgoPose
     prev: str
     next: str
+    grid_signed_sync_error_ns: int = 0
+    camera_signed_sync_error_ns: int = 0
+    gnss_source_validity: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,9 @@ class SourceSampleRecord:
     batch_timestamp_ns: int
     expected_channels: tuple[str, ...]
     valid_run_id: int
+    present_channels: tuple[str, ...] = ()
+    source_gnss_valid: bool = True
+    grid_signed_sync_error_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -145,6 +151,7 @@ class RecordingSceneResult:
     annotation_window_merge_semantics: Literal["same_run_overlap_or_touch_v1"]
     dataset_namespace: UUID
     build_config_token: str
+    feature_evidence_token: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return _jsonable(self)  # type: ignore[return-value]

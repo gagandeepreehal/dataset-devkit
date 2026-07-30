@@ -53,9 +53,17 @@ def minimal_config() -> dict[str, object]:
             "before_s": 20.0,
             "after_s": 20.0,
         },
-        "tags": {"stationary_speed_mps": 0.2, "turn_angle_deg": 45.0},
-        "filters": {"min_valid_ratio": 1.0, "required_tags": []},
-        "scenarios": {"seed": 42, "rules": []},
+        "tags": {
+            "reference_camera_channel": "front",
+            "reference_camera_policy": "require",
+            "stationary_speed_mps": 0.2,
+            "minimum_movement_m": 0.1,
+            "straight_max_heading_change_deg": 5.0,
+            "curvature_min_heading_change_deg": 10.0,
+            "turn_min_heading_change_deg": 45.0,
+        },
+        "filters": {},
+        "scenarios": {"seed": 42, "strict_quotas": True, "rules": []},
         "split": {"test_fraction": 0.2, "seed": 42, "stratify": True},
         "execution": {"workers": 2, "allow_partial_export": False},
         "publication": {"version": "v1.0-trainval", "refuse_overwrite": True},
@@ -127,9 +135,9 @@ def test_jpeg_quality_must_be_in_valid_range(tmp_path: Path, quality: int) -> No
         ("annotations.before_s", -1),
         ("annotations.after_s", -1),
         ("tags.stationary_speed_mps", -1),
-        ("tags.turn_angle_deg", 181),
-        ("filters.min_valid_ratio", -0.1),
-        ("filters.min_valid_ratio", 1.1),
+        ("tags.turn_min_heading_change_deg", 181),
+        ("filters.min_scene_valid_ratio", -0.1),
+        ("filters.min_scene_valid_ratio", 1.1),
         ("split.test_fraction", 0),
         ("split.test_fraction", 1),
         ("execution.workers", 0),
@@ -568,11 +576,11 @@ def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> N
     data["scenarios"] = {
         "seed": 42,
         "rules": [
-            {
-                "name": "turns",
-                "required_tags": ["turn"],
-                "sampling": {"fraction": 0.5, "max_scenes": 100},
-            }
+                {
+                    "name": "turns",
+                    "quota": 100,
+                    "required_all_tags": ["left_turn"],
+                }
         ],
     }
     data["quarantine"] = {
@@ -583,16 +591,16 @@ def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> N
 
     config = load_config(write_config(tmp_path, data))
 
-    assert config.scenarios.rules[0].sampling.fraction == 0.5
+    assert config.scenarios.rules[0].quota == 100
     assert config.quarantine.directory == (tmp_path / "quarantine").resolve()
 
 
 @pytest.mark.parametrize("required_tags", [[""], [" turn "], ["turn", "turn"]])
 def test_filter_tags_must_be_nonempty_and_unique(tmp_path: Path, required_tags: list[str]) -> None:
     data = minimal_config()
-    set_nested(data, "filters.required_tags", required_tags)
+    set_nested(data, "filters.required_all_tags", required_tags)
 
-    with pytest.raises(ValidationError, match="required_tags"):
+    with pytest.raises(ValidationError, match="required_all_tags"):
         load_config(write_config(tmp_path, data))
 
 
@@ -614,9 +622,9 @@ def test_scenario_rule_tags_are_valid_sets(
         "rules": [
             {
                 "name": "turns",
-                "required_tags": required_tags,
+                "quota": 1,
+                "required_all_tags": required_tags,
                 "excluded_tags": excluded_tags,
-                "sampling": {"fraction": 0.5},
             }
         ],
     }
@@ -630,8 +638,8 @@ def test_scenario_rule_names_must_be_nonblank_and_unique(tmp_path: Path) -> None
     data["scenarios"] = {
         "seed": 42,
         "rules": [
-            {"name": "turns", "sampling": {"fraction": 0.5}},
-            {"name": "turns", "sampling": {"fraction": 0.5}},
+            {"name": "turns", "quota": 1},
+            {"name": "turns", "quota": 1},
         ],
     }
 
@@ -644,7 +652,7 @@ def test_scenario_rule_name_must_be_nonblank(tmp_path: Path, name: str) -> None:
     data = minimal_config()
     data["scenarios"] = {
         "seed": 42,
-        "rules": [{"name": name, "sampling": {"fraction": 0.5}}],
+        "rules": [{"name": name, "quota": 1}],
     }
 
     with pytest.raises(ValidationError, match="name"):
@@ -721,21 +729,21 @@ def test_unknown_keys_are_rejected_in_every_nested_section(tmp_path: Path, secti
         load_config(write_config(tmp_path, data))
 
 
-@pytest.mark.parametrize("nested", ["rule", "sampling", "quarantine"])
+@pytest.mark.parametrize("nested", ["rule", "rule_filters", "quarantine"])
 def test_unknown_keys_are_rejected_in_extended_nested_models(tmp_path: Path, nested: str) -> None:
     data = minimal_config()
     rule: dict[str, object] = {
         "name": "turns",
-        "required_tags": ["turn"],
-        "sampling": {"fraction": 0.5},
+        "quota": 1,
+        "required_all_tags": ["left_turn"],
     }
     data["scenarios"] = {"seed": 42, "rules": [rule]}
     data["quarantine"] = {"unknown_key": True}
     if nested == "rule":
         rule["unknown_key"] = True
         data["quarantine"] = {}
-    elif nested == "sampling":
-        rule["sampling"] = {"fraction": 0.5, "unknown_key": True}
+    elif nested == "rule_filters":
+        rule["filters"] = {"min_distance_m": 1.0, "unknown_key": True}
         data["quarantine"] = {}
 
     with pytest.raises(ValidationError, match="unknown_key"):
