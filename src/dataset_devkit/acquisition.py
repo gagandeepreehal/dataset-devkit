@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -77,6 +78,7 @@ class CachePaths:
     directory: Path
     final: Path
     manifest: Path
+    extraction_manifest: Path
     partial: Path
     partial_sidecar: Path
 
@@ -85,12 +87,30 @@ class CachePaths:
 class AcquisitionResult:
     artifact_path: Path
     manifest_path: Path
+    extraction_manifest_path: Path
     manifest: AcquisitionManifest
+
+
+def _open_regular_for_read(path: Path) -> IO[bytes]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise AcquisitionError(f"cache path is not a regular file: {path}")
+    return os.fdopen(descriptor, "rb")
+
+
+def _regular_file_size(path: Path) -> int | None:
+    try:
+        file_stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    return file_stat.st_size if stat.S_ISREG(file_stat.st_mode) else None
 
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with _open_regular_for_read(path) as stream:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
@@ -98,7 +118,7 @@ def _sha256_file(path: Path) -> str:
 
 def _md5_file(path: Path) -> bytes:
     digest = hashlib.md5(usedforsecurity=False)
-    with path.open("rb") as stream:
+    with _open_regular_for_read(path) as stream:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.digest()
@@ -191,6 +211,7 @@ class AzureBlobAcquirer:
             directory=directory,
             final=directory / f"{stem}.mcap",
             manifest=directory / f"{stem}.manifest.json",
+            extraction_manifest=directory / f"{stem}.extraction.manifest.json",
             partial=directory / "download.partial",
             partial_sidecar=directory / "download.partial.json",
         )
@@ -202,8 +223,11 @@ class AzureBlobAcquirer:
             raise AcquisitionError(f"failed to read Azure properties for {blob_path!r}") from error
 
     def _load_partial_source(self, path: Path) -> SourceFingerprint | None:
+        if _regular_file_size(path) is None:
+            return None
         try:
-            return SourceFingerprint.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            with _open_regular_for_read(path) as stream:
+                return SourceFingerprint.from_dict(json.load(stream))
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             return None
 
@@ -217,15 +241,19 @@ class AzureBlobAcquirer:
         source: SourceFingerprint,
         properties: BlobPropertiesProtocol,
     ) -> AcquisitionManifest | None:
-        manifest = load_manifest(paths.manifest)
+        final_size = _regular_file_size(paths.final)
+        manifest = (
+            load_manifest(paths.manifest)
+            if _regular_file_size(paths.manifest) is not None and final_size is not None
+            else None
+        )
         expected_relative = paths.final.relative_to(self.cache_dir).as_posix()
         valid = bool(
             manifest is not None
             and manifest.source == source
             and manifest.artifact.cache_relative_path == expected_relative
             and manifest.artifact.size == source.size
-            and paths.final.is_file()
-            and paths.final.stat().st_size == source.size
+            and final_size == source.size
             and _sha256_file(paths.final) == manifest.artifact.sha256
         )
         expected_md5 = _content_md5(properties)
@@ -250,7 +278,9 @@ class AzureBlobAcquirer:
         after_md5 = _content_md5(after)
         if after_source != source or before_md5 != after_md5:
             raise BlobChangedError(f"Azure blob changed while downloading {source.blob_path!r}")
-        actual_size = paths.partial.stat().st_size
+        actual_size = _regular_file_size(paths.partial)
+        if actual_size is None:
+            raise IntegrityError(f"download partial is not a regular file: {source.blob_path!r}")
         if actual_size != source.size:
             raise IntegrityError(
                 f"downloaded size mismatch for {source.blob_path!r}: "
@@ -282,26 +312,40 @@ class AzureBlobAcquirer:
             cache_hit = replace(
                 cached,
                 status="cache_hit",
-                extraction_config_hash=self.extraction_config_hash,
+                requested_extraction_config_hash=self.extraction_config_hash,
             )
             write_manifest(paths.manifest, cache_hit)
-            return AcquisitionResult(paths.final, paths.manifest, cache_hit)
+            return AcquisitionResult(
+                paths.final,
+                paths.manifest,
+                paths.extraction_manifest,
+                cache_hit,
+            )
 
-        partial_source = self._load_partial_source(paths.partial_sidecar)
+        partial_size = _regular_file_size(paths.partial)
+        sidecar_is_regular = _regular_file_size(paths.partial_sidecar) is not None
+        partial_source = (
+            self._load_partial_source(paths.partial_sidecar) if sidecar_is_regular else None
+        )
         compatible = bool(
             partial_source == source
-            and paths.partial.is_file()
-            and paths.partial.stat().st_size <= source.size
+            and partial_size is not None
+            and partial_size <= source.size
         )
         if not compatible:
             self._discard_partial(paths)
             _atomic_write_text(paths.partial_sidecar, canonical_json(source.to_dict()) + "\n")
-        offset = paths.partial.stat().st_size if paths.partial.exists() else 0
+        offset = _regular_file_size(paths.partial) or 0
         resumed = offset > 0
 
         try:
             if offset < source.size:
-                with paths.partial.open("ab") as stream:
+                flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(paths.partial, flags, 0o600)
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    os.close(descriptor)
+                    raise AcquisitionError("download partial must be a regular file")
+                with os.fdopen(descriptor, "ab") as stream:
                     download = client.download_blob(
                         offset=offset,
                         etag=source.etag,
@@ -331,15 +375,24 @@ class AzureBlobAcquirer:
             status="resumed" if resumed else "downloaded",
             artifact=artifact,
             integrity=integrity,
-            extraction_config_hash=self.extraction_config_hash,
+            requested_extraction_config_hash=self.extraction_config_hash,
         )
         try:
+            if _regular_file_size(paths.partial) != source.size:
+                raise AcquisitionError("refusing to finalize an unsafe download partial")
             os.replace(paths.partial, paths.final)
+            if _regular_file_size(paths.final) != source.size:
+                raise AcquisitionError("final cache artifact is not a regular file")
             write_manifest(paths.manifest, manifest)
-        except OSError as error:
+        except (OSError, AcquisitionError) as error:
             paths.final.unlink(missing_ok=True)
             message = f"failed to finalize cache artifact for {blob_path!r}"
             raise AcquisitionError(message) from error
         finally:
             paths.partial_sidecar.unlink(missing_ok=True)
-        return AcquisitionResult(paths.final, paths.manifest, manifest)
+        return AcquisitionResult(
+            paths.final,
+            paths.manifest,
+            paths.extraction_manifest,
+            manifest,
+        )

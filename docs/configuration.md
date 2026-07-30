@@ -95,9 +95,16 @@ size plus stable ETag was the available integrity check.
 
 Each recording manifest is canonical JSON and contains the source fingerprint, download status
 (`downloaded`, `resumed`, or `cache_hit`), cache-relative artifact path, local size and SHA-256,
-integrity method/result, and extraction-config hash. An extraction cache is reusable only when
-both its source fingerprint and extraction-config hash match. Missing or malformed manifests are
-cache misses.
+integrity method/result, and `requested_extraction_config_hash`. This acquisition field describes
+the current request; it does not claim that extraction completed. After producing actual output,
+the extraction stage must explicitly call `record_extraction_complete` to atomically write the
+separate extraction-completion manifest. Only that file proves a source fingerprint and
+extraction-config hash pair. Acquisition cache hits can update acquisition request/status
+provenance but never write or replace extraction-completion provenance. Missing, malformed, or
+symlinked completion manifests are cache misses.
+
+Cache artifacts, partials, sidecars, and manifests are required to be regular files within the
+configured cache. Unsafe symlinks are never followed or promoted into final cache objects.
 
 ## Managed-identity smoke check
 

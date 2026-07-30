@@ -41,7 +41,10 @@ tokens, or connection strings. Verified downloads are cached by the exact accoun
 blob path, ETag, and size. Compatible `.partial` downloads can resume, while incompatible
 partials restart. Each finalized recording has a canonical provenance manifest recording its
 source fingerprint, local SHA-256 and size, Azure MD5 verification when available (or the
-size-and-stable-ETag fallback), result status, and extraction-config hash.
+size-and-stable-ETag fallback), result status, and requested extraction-config hash. That request
+hash is not proof that extraction ran. Extraction reuse becomes valid only when the extraction
+stage explicitly records a separate completion manifest for the source fingerprint and config
+hash; acquisition cache hits never create that proof.
 
 See [configuration.md](docs/configuration.md#managed-identity-smoke-check) for authentication and
 an optional one-blob smoke check.

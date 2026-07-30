@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -132,8 +133,8 @@ class AcquisitionManifest:
     status: DownloadStatus
     artifact: ArtifactIdentity
     integrity: IntegrityVerification
-    extraction_config_hash: str
-    manifest_version: Literal[1] = 1
+    requested_extraction_config_hash: str
+    manifest_version: Literal[2] = 2
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -146,16 +147,16 @@ class AcquisitionManifest:
             "status",
             "artifact",
             "integrity",
-            "extraction_config_hash",
+            "requested_extraction_config_hash",
         }:
             raise ValueError("invalid acquisition manifest")
-        if value["manifest_version"] != 1 or value["status"] not in {
+        if value["manifest_version"] != 2 or value["status"] not in {
             "downloaded",
             "resumed",
             "cache_hit",
         }:
             raise ValueError("unsupported acquisition manifest")
-        config_hash = value["extraction_config_hash"]
+        config_hash = value["requested_extraction_config_hash"]
         if not isinstance(config_hash, str) or len(config_hash) != 64:
             raise ValueError("invalid extraction config hash")
         return cls(
@@ -163,6 +164,38 @@ class AcquisitionManifest:
             status=cast(DownloadStatus, value["status"]),
             artifact=ArtifactIdentity.from_dict(value["artifact"]),
             integrity=IntegrityVerification.from_dict(value["integrity"]),
+            requested_extraction_config_hash=config_hash,
+        )
+
+
+@dataclass(frozen=True)
+class ExtractionManifest:
+    """Proof recorded only after extraction output has completed."""
+
+    source: SourceFingerprint
+    extraction_config_hash: str
+    manifest_version: Literal[1] = 1
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: object) -> ExtractionManifest:
+        if not isinstance(value, dict) or set(value) != {
+            "manifest_version",
+            "source",
+            "extraction_config_hash",
+        }:
+            raise ValueError("invalid extraction manifest")
+        config_hash = value["extraction_config_hash"]
+        if (
+            value["manifest_version"] != 1
+            or not isinstance(config_hash, str)
+            or len(config_hash) != 64
+        ):
+            raise ValueError("unsupported extraction manifest")
+        return cls(
+            source=SourceFingerprint.from_dict(value["source"]),
             extraction_config_hash=config_hash,
         )
 
@@ -181,14 +214,13 @@ def extraction_config_hash(config: GlobalConfig) -> str:
     return canonical_hash(extraction_config)
 
 
-def write_manifest(path: Path, manifest: AcquisitionManifest) -> None:
-    """Atomically write a canonical acquisition manifest."""
+def _write_canonical_manifest(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(canonical_json(manifest.to_dict()))
+            stream.write(canonical_json(value))
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -197,11 +229,51 @@ def write_manifest(path: Path, manifest: AcquisitionManifest) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def write_manifest(path: Path, manifest: AcquisitionManifest) -> None:
+    """Atomically write a canonical acquisition manifest."""
+    _write_canonical_manifest(path, manifest.to_dict())
+
+
+def _load_manifest_value(path: Path) -> object:
+    file_stat = path.lstat()
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError("manifest is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ValueError("manifest is not a regular file")
+    with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+        return json.load(stream)
+
+
 def load_manifest(path: Path) -> AcquisitionManifest | None:
     """Load a manifest; missing, malformed, and incompatible files are cache misses."""
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = _load_manifest_value(path)
         return AcquisitionManifest.from_dict(value)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
+def record_extraction_complete(
+    path: Path,
+    source: SourceFingerprint,
+    completed_extraction_config_hash: str,
+) -> None:
+    """Atomically record provenance only after extraction output has completed."""
+    manifest = ExtractionManifest(
+        source=source,
+        extraction_config_hash=completed_extraction_config_hash,
+    )
+    validated = ExtractionManifest.from_dict(manifest.to_dict())
+    _write_canonical_manifest(path, validated.to_dict())
+
+
+def load_extraction_manifest(path: Path) -> ExtractionManifest | None:
+    """Load completed-extraction provenance; unsafe or malformed files are misses."""
+    try:
+        return ExtractionManifest.from_dict(_load_manifest_value(path))
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
         return None
 
@@ -212,7 +284,7 @@ def extraction_cache_reusable(
     expected_extraction_config_hash: str,
 ) -> bool:
     """Decide whether extraction output provenance exactly matches this request."""
-    manifest = load_manifest(manifest_path)
+    manifest = load_extraction_manifest(manifest_path)
     return bool(
         manifest is not None
         and manifest.source == source

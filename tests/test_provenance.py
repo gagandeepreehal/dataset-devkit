@@ -11,12 +11,15 @@ from dataset_devkit.config import GlobalConfig
 from dataset_devkit.provenance import (
     AcquisitionManifest,
     ArtifactIdentity,
+    ExtractionManifest,
     IntegrityVerification,
     SourceFingerprint,
     canonical_json,
     extraction_cache_reusable,
     extraction_config_hash,
+    load_extraction_manifest,
     load_manifest,
+    record_extraction_complete,
     write_manifest,
 )
 
@@ -79,7 +82,7 @@ def _manifest(tmp_path: Path) -> AcquisitionManifest:
             cache_relative_path="objects/item.mcap", size=3, sha256="a" * 64
         ),
         integrity=IntegrityVerification(method="size_etag", verified=True, content_md5=None),
-        extraction_config_hash="b" * 64,
+        requested_extraction_config_hash="b" * 64,
     )
 
 
@@ -98,9 +101,13 @@ def test_manifest_round_trip_and_malformed_manifest_is_a_cache_miss(tmp_path: Pa
 def test_extraction_cache_requires_exact_source_and_config_hash(tmp_path: Path) -> None:
     path = tmp_path / "manifest.json"
     manifest = _manifest(tmp_path)
-    write_manifest(path, manifest)
+    record_extraction_complete(
+        path, manifest.source, manifest.requested_extraction_config_hash
+    )
 
-    assert extraction_cache_reusable(path, manifest.source, manifest.extraction_config_hash)
+    assert extraction_cache_reusable(
+        path, manifest.source, manifest.requested_extraction_config_hash
+    )
     assert not extraction_cache_reusable(
         path,
         SourceFingerprint(
@@ -110,8 +117,52 @@ def test_extraction_cache_requires_exact_source_and_config_hash(tmp_path: Path) 
             etag='"changed"',
             size=manifest.source.size,
         ),
-        manifest.extraction_config_hash,
+        manifest.requested_extraction_config_hash,
     )
     assert not extraction_cache_reusable(path, manifest.source, "c" * 64)
     path.write_text("[]", encoding="utf-8")
-    assert not extraction_cache_reusable(path, manifest.source, manifest.extraction_config_hash)
+    assert not extraction_cache_reusable(
+        path, manifest.source, manifest.requested_extraction_config_hash
+    )
+
+
+def test_extraction_completion_manifest_round_trip(tmp_path: Path) -> None:
+    acquisition = _manifest(tmp_path)
+    path = tmp_path / "extraction.manifest.json"
+
+    record_extraction_complete(
+        path, acquisition.source, acquisition.requested_extraction_config_hash
+    )
+
+    assert load_extraction_manifest(path) == ExtractionManifest(
+        source=acquisition.source,
+        extraction_config_hash=acquisition.requested_extraction_config_hash,
+    )
+
+
+def test_extraction_manifest_symlink_is_a_miss_and_completion_replaces_link(
+    tmp_path: Path,
+) -> None:
+    acquisition = _manifest(tmp_path)
+    outside = tmp_path / "outside-extraction-manifest"
+    record_extraction_complete(
+        outside, acquisition.source, acquisition.requested_extraction_config_hash
+    )
+    outside_content = outside.read_text(encoding="utf-8")
+    link = tmp_path / "extraction.manifest.json"
+    link.symlink_to(outside)
+
+    assert not extraction_cache_reusable(
+        link, acquisition.source, acquisition.requested_extraction_config_hash
+    )
+
+    record_extraction_complete(
+        link, acquisition.source, acquisition.requested_extraction_config_hash
+    )
+
+    assert outside.read_text(encoding="utf-8") == outside_content
+    assert link.is_file()
+    assert not link.is_symlink()
+    assert extraction_cache_reusable(
+        link, acquisition.source, acquisition.requested_extraction_config_hash
+    )

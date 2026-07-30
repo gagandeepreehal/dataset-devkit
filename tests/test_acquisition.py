@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
@@ -18,7 +19,13 @@ from dataset_devkit.acquisition import (
     IntegrityError,
 )
 from dataset_devkit.config import AzureConfig
-from dataset_devkit.provenance import SourceFingerprint, canonical_json, load_manifest
+from dataset_devkit.provenance import (
+    SourceFingerprint,
+    canonical_json,
+    extraction_cache_reusable,
+    load_manifest,
+    record_extraction_complete,
+)
 
 
 @dataclass(frozen=True)
@@ -84,7 +91,11 @@ def properties(payload: bytes, etag: str = '"etag-1"', *, md5: bool = True) -> F
     return FakeProperties(len(payload), etag, FakeContentSettings(digest))
 
 
-def acquirer(tmp_path: Path, client: FakeBlobClient) -> AzureBlobAcquirer:
+def acquirer(
+    tmp_path: Path,
+    client: FakeBlobClient,
+    extraction_hash: str = "a" * 64,
+) -> AzureBlobAcquirer:
     azure = AzureConfig(
         account_url="https://data.blob.core.windows.net",
         container="recordings",
@@ -93,7 +104,7 @@ def acquirer(tmp_path: Path, client: FakeBlobClient) -> AzureBlobAcquirer:
     return AzureBlobAcquirer(
         azure=azure,
         cache_dir=tmp_path / "cache",
-        extraction_config_hash="a" * 64,
+        extraction_config_hash=extraction_hash,
         service_client=FakeBlobServiceClient(client),
     )
 
@@ -354,3 +365,152 @@ def test_cache_layout_rejects_a_preexisting_directory_symlink_escape(tmp_path: P
 
     with pytest.raises(AcquisitionError, match="escape"):
         downloader.paths_for(source)
+
+
+def test_partial_symlink_is_unlinked_without_modifying_target_and_download_restarts(
+    tmp_path: Path,
+) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    client = FakeBlobClient(payload, [prop, prop])
+    downloader = acquirer(tmp_path, client)
+    source = downloader.fingerprint_for("mcap-h265/a.mcap", prop)
+    paths = downloader.paths_for(source)
+    paths.directory.mkdir(parents=True)
+    outside = tmp_path / "outside-partial"
+    outside.write_bytes(b"evil")
+    paths.partial.symlink_to(outside)
+    paths.partial_sidecar.write_text(
+        canonical_json(source.to_dict()) + "\n", encoding="utf-8"
+    )
+
+    result = downloader.acquire(source.blob_path)
+
+    assert outside.read_bytes() == b"evil"
+    assert client.download_offsets == [0]
+    assert result.artifact_path.read_bytes() == payload
+    assert result.artifact_path.is_file()
+    assert not result.artifact_path.is_symlink()
+
+
+def test_partial_sidecar_symlink_is_not_read_and_download_restarts(tmp_path: Path) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    client = FakeBlobClient(payload, [prop, prop])
+    downloader = acquirer(tmp_path, client)
+    source = downloader.fingerprint_for("mcap-h265/a.mcap", prop)
+    paths = downloader.paths_for(source)
+    paths.directory.mkdir(parents=True)
+    paths.partial.write_bytes(payload[:4])
+    outside = tmp_path / "outside-sidecar"
+    outside.write_text(canonical_json(source.to_dict()) + "\n", encoding="utf-8")
+    paths.partial_sidecar.symlink_to(outside)
+
+    result = downloader.acquire(source.blob_path)
+
+    assert outside.read_text(encoding="utf-8") == canonical_json(source.to_dict()) + "\n"
+    assert client.download_offsets == [0]
+    assert result.artifact_path.read_bytes() == payload
+    assert not result.artifact_path.is_symlink()
+
+
+def test_existing_final_symlink_is_not_read_or_exposed_as_cache_hit(tmp_path: Path) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    client = FakeBlobClient(payload, [prop, prop, prop, prop])
+    downloader = acquirer(tmp_path, client)
+    first = downloader.acquire("mcap-h265/a.mcap")
+    outside = tmp_path / "outside-final"
+    outside.write_bytes(payload)
+    first.artifact_path.unlink()
+    first.artifact_path.symlink_to(outside)
+
+    second = downloader.acquire("mcap-h265/a.mcap")
+
+    assert outside.read_bytes() == payload
+    assert client.download_offsets == [0, 0]
+    assert second.manifest.status == "downloaded"
+    assert second.artifact_path.read_bytes() == payload
+    assert not second.artifact_path.is_symlink()
+
+
+def test_acquisition_manifest_symlink_is_not_read_or_persisted(tmp_path: Path) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    client = FakeBlobClient(payload, [prop, prop, prop, prop])
+    downloader = acquirer(tmp_path, client)
+    first = downloader.acquire("mcap-h265/a.mcap")
+    serialized_manifest = first.manifest_path.read_text(encoding="utf-8")
+    outside = tmp_path / "outside-manifest"
+    outside.write_text(serialized_manifest, encoding="utf-8")
+    first.manifest_path.unlink()
+    first.manifest_path.symlink_to(outside)
+
+    second = downloader.acquire("mcap-h265/a.mcap")
+
+    assert outside.read_text(encoding="utf-8") == serialized_manifest
+    assert client.download_offsets == [0, 0]
+    assert second.manifest_path.is_file()
+    assert not second.manifest_path.is_symlink()
+    assert not second.artifact_path.is_symlink()
+
+
+def test_cache_hit_does_not_claim_extraction_complete_for_new_config(tmp_path: Path) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    client = FakeBlobClient(payload, [prop, prop, prop])
+    hash_a = "a" * 64
+    hash_b = "b" * 64
+    first = acquirer(tmp_path, client, hash_a).acquire("mcap-h265/a.mcap")
+
+    assert not extraction_cache_reusable(
+        first.extraction_manifest_path, first.manifest.source, hash_a
+    )
+    record_extraction_complete(first.extraction_manifest_path, first.manifest.source, hash_a)
+    assert extraction_cache_reusable(
+        first.extraction_manifest_path, first.manifest.source, hash_a
+    )
+
+    second = acquirer(tmp_path, client, hash_b).acquire("mcap-h265/a.mcap")
+
+    assert second.manifest.status == "cache_hit"
+    assert second.manifest.requested_extraction_config_hash == hash_b
+    assert not extraction_cache_reusable(
+        second.extraction_manifest_path, second.manifest.source, hash_b
+    )
+    assert extraction_cache_reusable(
+        second.extraction_manifest_path, second.manifest.source, hash_a
+    )
+
+
+def test_unsafe_leaf_swap_during_finalization_is_cleaned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    client = FakeBlobClient(payload, [prop, prop])
+    downloader = acquirer(tmp_path, client)
+    source = downloader.fingerprint_for("mcap-h265/a.mcap", prop)
+    paths = downloader.paths_for(source)
+    outside = tmp_path / "outside-finalization"
+    outside.write_bytes(b"must-not-change")
+    real_replace = os.replace
+
+    def replace_with_symlink(
+        source_path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination_path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        if Path(os.fsdecode(destination_path)) == paths.final:
+            Path(os.fsdecode(source_path)).unlink()
+            paths.final.symlink_to(outside)
+            return
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(os, "replace", replace_with_symlink)
+
+    with pytest.raises(AcquisitionError, match="final"):
+        downloader.acquire(source.blob_path)
+
+    assert outside.read_bytes() == b"must-not-change"
+    assert not paths.final.exists()
+    assert not paths.final.is_symlink()
