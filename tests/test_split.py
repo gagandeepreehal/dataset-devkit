@@ -8,12 +8,19 @@ from pathlib import Path
 import pytest
 
 from conftest import FeatureFactory
-from dataset_devkit.config import GlobalConfig, SplitConfig
+from dataset_devkit.config import (
+    GlobalConfig,
+    ScenarioRuleConfig,
+    ScenariosConfig,
+    SplitConfig,
+)
+from dataset_devkit.features import SceneFeatures
 from dataset_devkit.provenance import SourceFingerprint
-from dataset_devkit.scenario_selection import ScenarioAssignment, ScenarioSelectionResult
+from dataset_devkit.scenario_selection import ScenarioSelectionResult, select_scenarios
 from dataset_devkit.scene_models import RecordingSceneResult
 from dataset_devkit.scenes import build_recording_scenes
 from dataset_devkit.split import (
+    SceneSplitResult,
     split_extension_payload,
     split_selected_scenes,
     validate_scene_split,
@@ -62,20 +69,53 @@ def _selection(
         )
         for graph, scene in pairs
     )
-    assignments = tuple(
-        ScenarioAssignment(feature.scene_token, feature.source.digest, scenario, 0, f"r-{index}")
-        for index, (feature, scenario) in enumerate(zip(features, names, strict=True))
+    features = tuple(
+        replace(feature, computed_tags=(scenario,))
+        for feature, scenario in zip(features, names, strict=True)
     )
-    return ScenarioSelectionResult(
-        assignments,
-        features,
-        (),
-        (),
-        5,
-        "c" * 64,
-        "r" * 64,
-        "f" * 64,
-        True,
+    config = ScenariosConfig(
+        seed=5,
+        rules=[
+            ScenarioRuleConfig(
+                name=scenario,
+                quota=names.count(scenario),
+                required_all_tags=[scenario],
+            )
+            for scenario in dict.fromkeys(names)
+        ],
+    )
+    return select_scenarios(features, config)
+
+
+def _scenarios(selection: ScenarioSelectionResult) -> ScenariosConfig:
+    names = tuple(dict.fromkeys(item.primary_scenario for item in selection.assignments))
+    return ScenariosConfig(
+        seed=selection.seed,
+        rules=[
+            ScenarioRuleConfig(
+                name=name,
+                quota=sum(item.primary_scenario == name for item in selection.assignments),
+                required_all_tags=[name],
+            )
+            for name in names
+        ],
+    )
+
+
+def _split(
+    selection: ScenarioSelectionResult,
+    graphs: Sequence[RecordingSceneResult],
+    config: SplitConfig,
+    *,
+    features_population: Sequence[SceneFeatures] | None = None,
+    scenarios_config: ScenariosConfig | None = None,
+) -> SceneSplitResult:
+    return split_selected_scenes(
+        selection,
+        selection.selected_scenes if features_population is None else features_population,
+        scenarios_config or _scenarios(selection),
+        graphs,
+        config,
     )
 
 
@@ -88,16 +128,12 @@ def test_half_up_target_is_exact_and_input_order_independent(
     selection = _selection((graph,), feature_factory)
     config = SplitConfig(test_fraction=0.5, seed=17, stratify=False)
 
-    first = split_selected_scenes(selection, (graph,), config)
-    second = split_selected_scenes(
-        replace(
-            selection,
-            assignments=tuple(reversed(selection.assignments)),
-            selected_scenes=tuple(reversed(selection.selected_scenes)),
-        ),
-        (graph,),
-        config,
+    first = _split(selection, (graph,), config)
+    scenarios = _scenarios(selection)
+    reordered_selection = select_scenarios(
+        tuple(reversed(selection.selected_scenes)), scenarios
     )
+    second = _split(reordered_selection, (graph,), config)
 
     assert first.test_count == 3
     assert first.train_count == 2
@@ -118,7 +154,7 @@ def test_fraction_boundary_and_single_scene_semantics(
     expected: int,
 ) -> None:
     graph = _graph(tmp_path, config_factory(), f"edge-{count}-{fraction}", count)
-    result = split_selected_scenes(
+    result = _split(
         _selection((graph,), feature_factory),
         (graph,),
         SplitConfig(test_fraction=fraction, seed=1, stratify=True),
@@ -136,7 +172,7 @@ def test_stratification_and_small_stratum_fallback_are_audited(
     selection = _selection(
         (graph,), feature_factory, ("common", "common", "common", "common", "singleton")
     )
-    result = split_selected_scenes(
+    result = _split(
         selection, (graph,), SplitConfig(test_fraction=0.4, seed=9, stratify=True)
     )
 
@@ -154,7 +190,7 @@ def test_global_target_constraint_on_strata_is_explicit(
 ) -> None:
     graph = _graph(tmp_path, config_factory(), "limited", 4)
     selection = _selection((graph,), feature_factory, ("a", "a", "b", "b"))
-    result = split_selected_scenes(
+    result = _split(
         selection, (graph,), SplitConfig(test_fraction=0.01, seed=3, stratify=True)
     )
     assert result.test_count == 0
@@ -171,16 +207,28 @@ def test_full_disjoint_assignment_chain_ownership_and_recomputed_validation(
     graph = _graph(tmp_path, config_factory(), "chains", 4)
     selection = _selection((graph,), feature_factory)
     config = SplitConfig(test_fraction=0.5, seed=4, stratify=False)
-    result = split_selected_scenes(selection, (graph,), config)
+    result = _split(selection, (graph,), config)
 
-    validate_scene_split(result, selection, (graph,), config)
+    validate_scene_split(
+        result,
+        selection,
+        selection.selected_scenes,
+        _scenarios(selection),
+        (graph,),
+        config,
+    )
     by_scene = {item.scene_token: item.split for item in result.assignments}
     assert set(by_scene) == {item.token for item in graph.scenes}
     assert all(sample.scene_token in by_scene for sample in graph.samples)
     assert all(item.scene_token in by_scene for item in graph.sample_data)
-    with pytest.raises(ValueError, match="recomputed"):
+    with pytest.raises(ValueError):
         validate_scene_split(
-            replace(result, test_count=result.test_count + 1), selection, (graph,), config
+            replace(result, test_count=result.test_count + 1),
+            selection,
+            selection.selected_scenes,
+            _scenarios(selection),
+            (graph,),
+            config,
         )
 
 
@@ -213,9 +261,7 @@ def test_rejects_missing_foreign_duplicate_and_mutated_evidence(
         first = replace(first, source=replace(first.source, etag='"changed"'))
         graphs = (first,)
     with pytest.raises(ValueError):
-        split_selected_scenes(
-            selection, graphs, SplitConfig(test_fraction=0.5, seed=1, stratify=False)
-        )
+        _split(selection, graphs, SplitConfig(test_fraction=0.5, seed=1, stratify=False))
 
 
 def test_validation_rejects_config_selection_and_graph_replay_drift(
@@ -227,12 +273,14 @@ def test_validation_rejects_config_selection_and_graph_replay_drift(
     second = _graph(tmp_path, config_factory(), "replay-b", 2)
     selection = _selection((first,), feature_factory)
     config = SplitConfig(test_fraction=0.5, seed=11, stratify=True)
-    result = split_selected_scenes(selection, (first,), config)
+    result = _split(selection, (first,), config)
 
     with pytest.raises(ValueError, match="recomputed"):
         validate_scene_split(
             result,
             selection,
+            selection.selected_scenes,
+            _scenarios(selection),
             (first,),
             SplitConfig(test_fraction=0.5, seed=12, stratify=True),
         )
@@ -243,22 +291,71 @@ def test_validation_rejects_config_selection_and_graph_replay_drift(
             *selection.assignments[1:],
         ),
     )
-    with pytest.raises(ValueError, match="recomputed"):
-        validate_scene_split(result, changed_selection, (first,), config)
     with pytest.raises(ValueError):
-        validate_scene_split(result, selection, (second,), config)
+        validate_scene_split(
+            result,
+            changed_selection,
+            selection.selected_scenes,
+            _scenarios(selection),
+            (first,),
+            config,
+        )
+    with pytest.raises(ValueError):
+        validate_scene_split(
+            result,
+            selection,
+            selection.selected_scenes,
+            _scenarios(selection),
+            (second,),
+            config,
+        )
 
 
 def test_empty_selected_population_is_truthfully_complete() -> None:
-    selection = ScenarioSelectionResult(
-        (), (), (), (), 1, "c" * 64, "r" * 64, "f" * 64, True
-    )
+    scenarios = ScenariosConfig(seed=1, rules=[])
+    selection = select_scenarios((), scenarios)
     config = SplitConfig(test_fraction=0.5, seed=1, stratify=True)
-    result = split_selected_scenes(selection, (), config)
+    result = _split(selection, (), config)
     assert result.assignments == ()
     assert result.strata == ()
     assert (result.population_count, result.train_count, result.test_count) == (0, 0, 0)
     assert result.adjacent_scene_leakage.cross_split_pairs == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["primary_scenario", "rule_index", "rank", "rule_audit", "config", "rules", "candidate"],
+)
+def test_rejects_any_mutated_task6_selection_evidence(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    feature_factory: FeatureFactory,
+    mutation: str,
+) -> None:
+    graph = _graph(tmp_path, config_factory(), "upstream", 3)
+    selection = _selection((graph,), feature_factory)
+    assignment = selection.assignments[0]
+    if mutation == "primary_scenario":
+        changed = replace(assignment, primary_scenario="other")
+        selection = replace(selection, assignments=(changed, *selection.assignments[1:]))
+    elif mutation == "rule_index":
+        changed = replace(assignment, rule_index=9)
+        selection = replace(selection, assignments=(changed, *selection.assignments[1:]))
+    elif mutation == "rank":
+        changed = replace(assignment, rank="0" * 64)
+        selection = replace(selection, assignments=(changed, *selection.assignments[1:]))
+    elif mutation == "rule_audit":
+        audit = replace(selection.rule_audits[0], quota=99)
+        selection = replace(selection, rule_audits=(audit, *selection.rule_audits[1:]))
+    elif mutation == "config":
+        selection = replace(selection, config_fingerprint="0" * 64)
+    elif mutation == "rules":
+        selection = replace(selection, rules_fingerprint="0" * 64)
+    elif mutation == "candidate":
+        selection = replace(selection, candidate_fingerprint="0" * 64)
+
+    with pytest.raises(ValueError):
+        _split(selection, (graph,), SplitConfig(test_fraction=0.5, seed=3, stratify=True))
 
 
 def test_adjacent_cross_split_leakage_and_no_leakage_are_truthful(
@@ -268,10 +365,10 @@ def test_adjacent_cross_split_leakage_and_no_leakage_are_truthful(
 ) -> None:
     graph = _graph(tmp_path, config_factory(), "adjacent", 4)
     selection = _selection((graph,), feature_factory)
-    leaking = split_selected_scenes(
+    leaking = _split(
         selection, (graph,), SplitConfig(test_fraction=0.5, seed=1, stratify=False)
     )
-    none = split_selected_scenes(
+    none = _split(
         selection, (graph,), SplitConfig(test_fraction=0.01, seed=1, stratify=False)
     )
     assert leaking.adjacent_scene_leakage.checked is True
@@ -287,16 +384,46 @@ def test_canonical_extension_payload_and_writer_are_byte_deterministic(
     feature_factory: FeatureFactory,
 ) -> None:
     graph = _graph(tmp_path, config_factory(), "writer", 3)
-    result = split_selected_scenes(
-        _selection((graph,), feature_factory),
+    selection = _selection((graph,), feature_factory)
+    result = _split(
+        selection,
         (graph,),
         SplitConfig(test_fraction=0.5, seed=7, stratify=True),
     )
+    split_config = SplitConfig(test_fraction=0.5, seed=7, stratify=True)
+    scenarios = _scenarios(selection)
     path = tmp_path / "mz_extensions" / "split.json"
-    write_split_extension(path, result)
+    write_split_extension(
+        path,
+        result,
+        selection,
+        selection.selected_scenes,
+        scenarios,
+        (graph,),
+        split_config,
+    )
     first = path.read_bytes()
-    write_split_extension(path, result)
+    write_split_extension(
+        path,
+        result,
+        selection,
+        selection.selected_scenes,
+        scenarios,
+        (graph,),
+        split_config,
+    )
     assert path.read_bytes() == first
     assert json.loads(first) == split_extension_payload(result)
     assert first.endswith(b"\n")
     assert b"created_at" not in first
+    with pytest.raises(ValueError, match="recomputed"):
+        write_split_extension(
+            path,
+            replace(result, train_count=result.train_count + 1),
+            selection,
+            selection.selected_scenes,
+            scenarios,
+            (graph,),
+            split_config,
+        )
+    assert path.read_bytes() == first

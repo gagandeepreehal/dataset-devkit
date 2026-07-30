@@ -12,10 +12,14 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
-from dataset_devkit.config import SplitConfig
+from dataset_devkit.config import ScenariosConfig, SplitConfig
 from dataset_devkit.features import SceneFeatures
 from dataset_devkit.provenance import canonical_hash, canonical_json
-from dataset_devkit.scenario_selection import ScenarioAssignment, ScenarioSelectionResult
+from dataset_devkit.scenario_selection import (
+    ScenarioAssignment,
+    ScenarioSelectionResult,
+    validate_scenario_selection,
+)
 from dataset_devkit.scene_models import RecordingSceneResult, SceneRecord
 from dataset_devkit.scenes import validate_scene_graph
 
@@ -85,6 +89,7 @@ class SceneSplitResult:
     test_count: int
     rounding_rule: Literal["floor(n * test_fraction + 0.5)"]
     config_fingerprint: str
+    upstream_fingerprint: str
     candidate_fingerprint: str
     graph_fingerprint: str
 
@@ -128,8 +133,11 @@ def _half_up_target(count: int, fraction: Decimal) -> int:
 
 def _validate_inputs(
     selection: ScenarioSelectionResult,
+    features_population: Sequence[SceneFeatures],
+    scenarios_config: ScenariosConfig,
     graphs: Sequence[RecordingSceneResult],
 ) -> tuple[_Candidate, ...]:
+    validate_scenario_selection(selection, list(features_population), scenarios_config)
     features: dict[tuple[str, str], SceneFeatures] = {}
     for feature in selection.selected_scenes:
         identity = (feature.scene_token, feature.source.digest)
@@ -146,12 +154,18 @@ def _validate_inputs(
         raise ValueError("selected feature and scenario assignment identities differ")
 
     graph_by_source: dict[str, RecordingSceneResult] = {}
+    scene_by_identity: dict[tuple[str, str], SceneRecord] = {}
     for graph in graphs:
         validate_scene_graph(graph)
         digest = graph.source.digest
         if digest in graph_by_source:
             raise ValueError("recording graphs contain duplicate source identities")
         graph_by_source[digest] = graph
+        for scene in graph.scenes:
+            identity = (scene.token, digest)
+            if identity in scene_by_identity:
+                raise ValueError("recording graphs contain duplicate scene/source identities")
+            scene_by_identity[identity] = scene
     selected_sources = {identity[1] for identity in features}
     if set(graph_by_source) != selected_sources:
         raise ValueError("recording graph sources are missing or foreign to selected scenes")
@@ -163,14 +177,20 @@ def _validate_inputs(
         graph = graph_by_source[identity[1]]
         if feature.source != graph.source or feature.source_blob_path != graph.source.blob_path:
             raise ValueError("selected feature source evidence differs from its recording graph")
-        scenes = {scene.token: scene for scene in graph.scenes}
-        scene = scenes.get(identity[0])
-        if scene is None:
+        selected_scene = scene_by_identity.get(identity)
+        if selected_scene is None:
             raise ValueError("selected scene is missing from its recording graph")
-        if feature.scene_name != scene.name:
+        if feature.scene_name != selected_scene.name:
             raise ValueError("selected feature scene identity differs from its recording graph")
         candidates.append(
-            _Candidate(identity, assignment.primary_scenario, feature, assignment, graph, scene)
+            _Candidate(
+                identity,
+                assignment.primary_scenario,
+                feature,
+                assignment,
+                graph,
+                selected_scene,
+            )
         )
     return tuple(candidates)
 
@@ -250,10 +270,14 @@ def _apportion_strata(
 
 def _compute_split(
     selection: ScenarioSelectionResult,
+    features_population: Sequence[SceneFeatures],
+    scenarios_config: ScenariosConfig,
     graphs: Sequence[RecordingSceneResult],
     config: SplitConfig,
 ) -> SceneSplitResult:
-    candidates = _validate_inputs(selection, graphs)
+    candidates = _validate_inputs(
+        selection, features_population, scenarios_config, graphs
+    )
     fraction = Decimal(str(config.test_fraction))
     target = _half_up_target(len(candidates), fraction)
     groups_lists: dict[str, list[_Candidate]] = defaultdict(list)
@@ -367,6 +391,19 @@ def _compute_split(
         target,
         "floor(n * test_fraction + 0.5)",
         canonical_hash(config.model_dump(mode="json")),
+        canonical_hash(
+            {
+                "scenarios_config": scenarios_config.model_dump(mode="json"),
+                "features_population": [
+                    _jsonable(feature)
+                    for feature in sorted(
+                        features_population,
+                        key=lambda item: (item.scene_token, item.source.digest),
+                    )
+                ],
+                "validated_selection": _jsonable(selection),
+            }
+        ),
         _candidate_fingerprint(candidates),
         _graph_fingerprint(graphs),
     )
@@ -374,6 +411,8 @@ def _compute_split(
 
 def split_selected_scenes(
     selection: ScenarioSelectionResult,
+    features_population: Sequence[SceneFeatures],
+    scenarios_config: ScenariosConfig,
     graphs: Sequence[RecordingSceneResult],
     config: SplitConfig,
 ) -> SceneSplitResult:
@@ -384,19 +423,27 @@ def split_selected_scenes(
     across primary-scenario strata and then preserves both sides where the global
     target permits. Singleton and globally constrained strata are explicitly audited.
     """
-    result = _compute_split(selection, graphs, config)
-    validate_scene_split(result, selection, graphs, config)
+    result = _compute_split(
+        selection, features_population, scenarios_config, graphs, config
+    )
+    validate_scene_split(
+        result, selection, features_population, scenarios_config, graphs, config
+    )
     return result
 
 
 def validate_scene_split(
     result: SceneSplitResult,
     selection: ScenarioSelectionResult,
+    features_population: Sequence[SceneFeatures],
+    scenarios_config: ScenariosConfig,
     graphs: Sequence[RecordingSceneResult],
     config: SplitConfig,
 ) -> None:
     """Recompute the complete split and reject stale, replayed, or mutated evidence."""
-    expected = _compute_split(selection, graphs, config)
+    expected = _compute_split(
+        selection, features_population, scenarios_config, graphs, config
+    )
     if result != expected:
         raise ValueError("scene split differs from recomputed deterministic result")
     identities = [(item.scene_token, item.source_digest) for item in result.assignments]
@@ -423,8 +470,19 @@ def split_extension_payload(result: SceneSplitResult) -> dict[str, object]:
     return {"schema_version": 1, **value}
 
 
-def write_split_extension(path: Path, result: SceneSplitResult) -> None:
+def write_split_extension(
+    path: Path,
+    result: SceneSplitResult,
+    selection: ScenarioSelectionResult,
+    features_population: Sequence[SceneFeatures],
+    scenarios_config: ScenariosConfig,
+    graphs: Sequence[RecordingSceneResult],
+    config: SplitConfig,
+) -> None:
     """Atomically write deterministic canonical split extension bytes."""
+    validate_scene_split(
+        result, selection, features_population, scenarios_config, graphs, config
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)

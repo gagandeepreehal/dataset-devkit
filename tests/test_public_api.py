@@ -16,6 +16,12 @@ def test_dataset_is_a_stable_import_boundary(tmp_path: Path) -> None:
     assert dataset.version == "v1.0-trainval"
 
 
+def test_scene_split_functions_are_stable_import_boundaries() -> None:
+    assert callable(dataset_devkit.split_selected_scenes)
+    assert callable(dataset_devkit.validate_scene_split)
+    assert callable(dataset_devkit.write_split_extension)
+
+
 @pytest.mark.parametrize(
     "version",
     ["", ".", "..", "versions/v1", r"versions\v1", " v1 ", "CON.txt", "release."],

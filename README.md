@@ -6,8 +6,9 @@ configuration, CLI, and Python API boundaries. Azure acquisition is implemented 
 injectable service. Native MCAP/protobuf extraction, persistent HEVC decode, deterministic camera
 selection, GNSS interpolation, and verified JPEG staging are a separate focused service. Typed
 validity/sanity policy, safe quarantine reports, independent-recording partial-export gating,
-and deterministic automatic/annotation/hybrid scene graphs are implemented. Tags, split, export,
-and publication remain later stages.
+deterministic automatic/annotation/hybrid scene graphs, real-timestamp features and tags,
+exact-quota scenario selection, and auditable scene-level train/test splitting are implemented.
+Export and publication remain later stages.
 
 ## Install for development
 
@@ -71,6 +72,21 @@ hybrid exclusion, UUIDv5 identities, per-camera chains, and structural graph val
 
 See [selection.md](docs/selection.md) for real-timestamp trajectory features, complete-evidence
 filtering, and deterministic exact-quota scenario rules.
+
+## Scene-level train/test split
+
+`split_selected_scenes` validates the complete Task 6 feature population and scenario-selection
+result before assigning every selected scene exactly once. The exact test target is
+`floor(scene_count * test_fraction + 0.5)`. When configured, primary-scenario stratification uses
+deterministic SHA-256 ranking and largest-remainder apportionment; singleton strata and global
+targets that cannot preserve both train and test are recorded as explicit fallbacks. A scene's
+complete sample and per-camera sample-data chains always stay in its assigned split.
+
+`write_split_extension` revalidates all upstream evidence before atomically writing canonical,
+wall-clock-free `mz_extensions/split.json`. The extension records source-disambiguated
+assignments, exact counts, per-stratum audits, fingerprints, and chronological adjacent-scene
+cross-split evidence with a neighboring-context leakage warning. Use `validate_scene_split` to
+recompute and validate an in-memory result; these three functions are the public Task 7 APIs.
 
 The stable Python import is:
 
