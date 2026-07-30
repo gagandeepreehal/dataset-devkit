@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import dataset_devkit.extraction.staging as staging_module
 import dataset_devkit.validity as validity_module
 from dataset_devkit.config import GlobalConfig, InvalidationRulesConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
@@ -25,7 +26,11 @@ from dataset_devkit.extraction.models import (
     StagedImage,
 )
 from dataset_devkit.extraction.staging import remove_owned_staged_images
-from dataset_devkit.validity import INVALIDITY_CODES, evaluate_validity
+from dataset_devkit.validity import (
+    INVALIDITY_CODES,
+    InvalidityObservation,
+    evaluate_validity,
+)
 
 
 def _calibration() -> CameraCalibration:
@@ -549,28 +554,30 @@ def test_transactional_drop_rolls_back_after_first_tombstone_move(
 ) -> None:
     result = _result(tmp_path)
     images = tuple(sample.staged_image for sample in result.samples)
-    original_rename = os.rename
+    original_link = os.link
     calls = 0
 
-    def fail_second_rename(
+    def fail_second_link(
         source: str,
         destination: str,
         *,
         src_dir_fd: int | None = None,
         dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
     ) -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("injected second move")
-        original_rename(
+        original_link(
             source,
             destination,
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
         )
 
-    monkeypatch.setattr("dataset_devkit.extraction.staging.os.rename", fail_second_rename)
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.link", fail_second_link)
 
     with pytest.raises(StructuralExtractionError, match="tombstone|transaction"):
         remove_owned_staged_images(result.staging_root, images)
@@ -645,7 +652,7 @@ def test_post_commit_tombstone_cleanup_failure_is_explicit_and_retryable(
 
     def fail_first_unlink(path: str, *, dir_fd: int | None = None) -> None:
         nonlocal failed
-        if not failed:
+        if not failed and ".drop-" in path:
             failed = True
             raise OSError("injected tombstone cleanup")
         original_unlink(path, dir_fd=dir_fd)
@@ -656,11 +663,223 @@ def test_post_commit_tombstone_cleanup_failure_is_explicit_and_retryable(
         remove_owned_staged_images(result.staging_root, images)
 
     assert "cleanup" in str(caught.value)
-    tombstones = caught.value.owned_tombstones  # type: ignore[attr-defined]
+    tombstones = caught.value.tombstones  # type: ignore[attr-defined]
     assert tombstones
-    assert all(path.is_file() for path in tombstones)
+    first = tombstones[0]
+    assert first.invocation_root == result.staging_root
+    assert first.tombstone_name.startswith(".")
+    assert first.original_name == images[0].path.name
+    assert first.device == images[0].device
+    assert first.inode == images[0].inode
+    assert first.expected_regular and first.expected_single_link
+    assert all((item.invocation_root / item.tombstone_name).is_file() for item in tombstones)
     assert all(not image.path.exists() for image in images)
     assert external.read_bytes() == b"external"
+
+
+def _committed_cleanup_error(
+    result: RecordingExtractionResult,
+    monkeypatch: pytest.MonkeyPatch,
+) -> StructuralExtractionError:
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_unlink = os.unlink
+    failed = False
+
+    def fail_first_tombstone(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        if not failed and ".drop-" in path:
+            failed = True
+            raise OSError("injected cleanup retry state")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.staging.os.unlink", fail_first_tombstone
+    )
+    with pytest.raises(StructuralExtractionError) as caught:
+        remove_owned_staged_images(result.staging_root, images)
+    assert hasattr(caught.value, "tombstones")
+    return caught.value
+
+
+def test_retry_owned_tombstone_cleanup_succeeds_when_identity_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = _committed_cleanup_error(_result(tmp_path), monkeypatch)
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(error.tombstones)  # type: ignore[attr-defined]
+
+    assert outcome.cleaned == error.tombstones  # type: ignore[attr-defined]
+    assert outcome.remaining == ()
+    assert outcome.mismatched == ()
+    assert outcome.directory_fsynced
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "hardlink", "different_inode"])
+def test_retry_never_deletes_replaced_or_linked_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    result = _result(tmp_path)
+    error = _committed_cleanup_error(result, monkeypatch)
+    records = error.tombstones  # type: ignore[attr-defined]
+    record = records[0]
+    tombstone = record.invocation_root / record.tombstone_name
+    external = tmp_path / f"external-{replacement}"
+    external.write_bytes(b"external")
+    if replacement == "symlink":
+        tombstone.unlink()
+        tombstone.symlink_to(external)
+    elif replacement == "hardlink":
+        os.link(tombstone, external.with_suffix(".link"))
+    else:
+        tombstone.unlink()
+        tombstone.write_bytes(b"replacement")
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(records)
+
+    assert record in outcome.remaining
+    assert record in outcome.mismatched
+    assert tombstone.exists() or tombstone.is_symlink()
+    assert external.read_bytes() == b"external"
+
+
+def test_retry_is_safe_when_invocation_ancestor_is_swapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    error = _committed_cleanup_error(result, monkeypatch)
+    records = error.tombstones  # type: ignore[attr-defined]
+    moved_parent = tmp_path / "moved-staging"
+    result.staging_root.parent.rename(moved_parent)
+    replacement_root = result.staging_root
+    replacement_root.mkdir(parents=True)
+    replacement = replacement_root / records[0].tombstone_name
+    replacement.write_bytes(b"unowned")
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(records)
+
+    assert outcome.cleaned == ()
+    assert outcome.remaining == records
+    assert outcome.mismatched == records
+    assert replacement.read_bytes() == b"unowned"
+    assert all(
+        (moved_parent / result.staging_root.name / item.tombstone_name).is_file()
+        for item in records
+    )
+
+
+def test_retry_rejects_same_invocation_inode_moved_under_new_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    error = _committed_cleanup_error(result, monkeypatch)
+    records = error.tombstones  # type: ignore[attr-defined]
+    original_parent = result.staging_root.parent
+    moved_parent = tmp_path / "moved-parent"
+    original_parent.rename(moved_parent)
+    original_parent.mkdir()
+    (moved_parent / result.staging_root.name).rename(result.staging_root)
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(records)
+
+    assert outcome.cleaned == ()
+    assert outcome.remaining == records
+    assert outcome.mismatched == records
+    assert all(
+        (result.staging_root / item.tombstone_name).is_file() for item in records
+    )
+
+
+def test_retry_partial_state_is_deterministic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = _committed_cleanup_error(_result(tmp_path), monkeypatch)
+    records = error.tombstones  # type: ignore[attr-defined]
+    first = records[0]
+    first_path = first.invocation_root / first.tombstone_name
+    first_path.unlink()
+    first_path.write_bytes(b"replacement")
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(records)
+
+    assert outcome.cleaned == records[1:]
+    assert outcome.remaining == (first,)
+    assert outcome.mismatched == (first,)
+
+
+def test_tombstone_destination_race_does_not_clobber_or_drop_originals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_link = os.link
+    racing_path: Path | None = None
+
+    def race_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal racing_path
+        if ".drop-" in destination and racing_path is None:
+            racing_path = result.staging_root / destination
+            racing_path.write_bytes(b"racing-unowned")
+        original_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.link", race_link)
+
+    with pytest.raises(StructuralExtractionError, match="transaction"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert racing_path is not None
+    assert racing_path.read_bytes() == b"racing-unowned"
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+
+
+def test_failure_after_tombstone_link_rolls_back_without_partial_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_unlink = os.unlink
+    failed = False
+
+    def fail_first_source_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        if not failed and ".drop-" not in path:
+            failed = True
+            raise OSError("injected source unlink")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.staging.os.unlink", fail_first_source_unlink
+    )
+
+    with pytest.raises(StructuralExtractionError, match="transaction"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+    assert not list(result.staging_root.glob(".*.drop-*"))
 
 
 def _nested_orientation_result(tmp_path: Path) -> RecordingExtractionResult:
@@ -760,3 +979,51 @@ def test_orientation_policy_recurses_all_numeric_leaves_with_deterministic_max(
     assert observation.details["after_orientation_uncertainty"] == observation.details[
         "before_orientation_uncertainty"
     ]
+
+
+def test_invalidity_observation_details_use_bounded_cycle_detection() -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match=r"details\.self.*cycle",
+    ):
+        InvalidityObservation("grid_miss", "grid", details=cyclic)
+
+
+def test_invalidity_observation_details_use_shared_depth_limit() -> None:
+    root: dict[str, object] = {}
+    current = root
+    for _ in range(33):
+        child: dict[str, object] = {}
+        current["nested"] = child
+        current = child
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match=r"details(?:\.nested)+.*maximum depth 32",
+    ):
+        InvalidityObservation("grid_miss", "grid", details=root)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        SelectedGridEntry(2_000_000_000, 2_000_000_100, 99, 100),
+        SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 99),
+    ],
+)
+def test_grid_selection_rejects_inconsistent_sync_error_fields(
+    tmp_path: Path,
+    config_factory: object,
+    entry: SelectedGridEntry,
+) -> None:
+    result = _result(tmp_path)
+    result = replace(
+        result,
+        selected_grid=replace(result.selected_grid, entries=(entry,)),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="sync error"):
+        evaluate_validity(result, config_factory())  # type: ignore[operator]

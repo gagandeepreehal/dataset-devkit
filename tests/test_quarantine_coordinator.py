@@ -343,7 +343,7 @@ def test_committed_drop_cleanup_failure_becomes_structural_quarantine(
 
     def fail_first_unlink(path: str, *, dir_fd: int | None = None) -> None:
         nonlocal failed
-        if not failed:
+        if not failed and ".drop-" in path:
             failed = True
             raise OSError("injected cleanup")
         original_unlink(path, dir_fd=dir_fd)
@@ -366,7 +366,80 @@ def test_committed_drop_cleanup_failure_becomes_structural_quarantine(
     assert failure.quarantine is not None
     payload = json.loads(failure.quarantine.path.read_text(encoding="utf-8"))
     assert payload["artifact_handling"] == "preserved_in_place"
-    assert payload["deterministic_details"]["owned_tombstones"]
+    record = payload["deterministic_details"]["owned_tombstones"][0]
+    assert record["invocation_root"].endswith("/staging/recording-owned")
+    assert record["tombstone_name"].startswith(".")
+    assert record["original_name"].endswith(".jpg")
+    assert isinstance(record["device"], int)
+    assert isinstance(record["inode"], int)
+
+
+def test_coordinator_does_not_follow_replaced_tombstone_for_artifact_detection(
+    tmp_path: Path, config_factory: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _policy_config(config_factory)
+    toggles = {code: False for code in INVALIDITY_CODES}
+    toggles["gnss_source_invalid"] = True
+    config = config.model_copy(
+        update={
+            "frame_validity": config.frame_validity.model_copy(
+                update={
+                    "invalid_sample_policy": "drop",
+                    "invalidate_on": InvalidationRulesConfig.model_validate(toggles),
+                }
+            )
+        }
+    )
+    external = tmp_path / "external-owned-by-someone-else"
+    external.write_bytes(b"external")
+    original_unlink = os.unlink
+    replaced_name: str | None = None
+
+    def replace_first_tombstone(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal replaced_name
+        if replaced_name is None and ".drop-" in path:
+            original_unlink(path, dir_fd=dir_fd)
+            os.symlink(external, path, dir_fd=dir_fd)
+            replaced_name = path
+            raise OSError("injected replaced cleanup entry")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.staging.os.unlink", replace_first_tombstone
+    )
+
+    def single_sample_result(path: Path) -> object:
+        extracted = _result(tmp_path / "owned-replaced")
+        sample = extracted.samples[0]
+        selected_batch = replace(
+            extracted.camera_batches[1],
+            frames=(extracted.camera_batches[1].frames[0],),
+        )
+        return replace(
+            extracted,
+            source_path=path,
+            camera_batches=(extracted.camera_batches[0], selected_batch),
+            samples=(sample,),
+            ego_poses_by_timestamp={sample.camera_timestamp_ns: sample.ego_pose},
+        )
+
+    result = RecordingCoordinator(
+        config=config,
+        quarantine_directory=tmp_path / "quarantine-replaced",
+        extractor=single_sample_result,  # type: ignore[arg-type]
+    ).process(
+        (RecordingRequest("cleanup", tmp_path / "cleanup.mcap"),),
+        allow_partial_export=True,
+    )
+
+    failure = result.failures[0]
+    assert failure.quarantine is not None
+    payload = json.loads(failure.quarantine.path.read_text(encoding="utf-8"))
+    assert payload["artifact_handling"] == "no_owned_artifacts"
+    assert replaced_name is not None
+    replaced = tmp_path / "owned-replaced" / "staging" / "recording-owned" / replaced_name
+    assert replaced.is_symlink()
+    assert external.read_bytes() == b"external"
 
 
 def test_structural_failure_is_never_downgraded_by_sanity_policy(
@@ -496,6 +569,42 @@ def test_duplicate_identity_detection_is_linear_and_deterministic(
         coordinator.process(requests, allow_partial_export=True)
 
     assert CountingIdentity.comparisons < 10_000
+
+
+def test_broken_exception_string_never_aborts_later_recordings(
+    tmp_path: Path, config_factory: object
+) -> None:
+    class BrokenStringError(StructuralExtractionError):
+        def __str__(self) -> str:
+            raise RuntimeError("broken __str__")
+
+    calls: list[str] = []
+
+    def extract(path: Path) -> object:
+        calls.append(path.stem)
+        if path.stem == "first":
+            raise BrokenStringError()
+        return replace(_result(tmp_path / path.stem), source_path=path)
+
+    result = RecordingCoordinator(
+        config=_policy_config(config_factory),
+        quarantine_directory=tmp_path / "quarantine",
+        extractor=extract,  # type: ignore[arg-type]
+    ).process(
+        (
+            RecordingRequest("first", tmp_path / "first.mcap"),
+            RecordingRequest("second", tmp_path / "second.mcap"),
+        ),
+        allow_partial_export=True,
+    )
+
+    assert calls == ["first", "second"]
+    failure = result.failures[0]
+    assert failure.exception_type == "BrokenStringError"
+    assert "unprintable" in failure.exception_message
+    assert "RuntimeError" in failure.exception_message
+    assert failure.quarantine_persisted
+    assert result.authorized_recording_ids == ("second",)
 
 
 def test_real_task3_extraction_feeds_policy_and_coordinator(

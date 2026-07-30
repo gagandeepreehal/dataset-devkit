@@ -26,15 +26,39 @@ _FILE_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _Identity = tuple[int, int]
 
 
+@dataclass(frozen=True)
+class TombstoneRecord:
+    """Immutable inode-bound state for safe committed-drop cleanup retries."""
+
+    invocation_root: Path
+    directory_device: int
+    directory_inode: int
+    directory_chain_identities: tuple[_Identity, ...]
+    tombstone_name: str
+    original_name: str
+    device: int
+    inode: int
+    expected_regular: bool = True
+    expected_single_link: bool = True
+
+
+@dataclass(frozen=True)
+class TombstoneCleanupResult:
+    cleaned: tuple[TombstoneRecord, ...]
+    remaining: tuple[TombstoneRecord, ...]
+    mismatched: tuple[TombstoneRecord, ...]
+    directory_fsynced: bool
+
+
 class StagedImageCleanupError(StructuralExtractionError):
     """A committed drop has owned tombstones that require cleanup/retry."""
 
-    def __init__(self, staging_root: Path, owned_tombstones: tuple[Path, ...]) -> None:
-        self.staging_root = staging_root
-        self.owned_tombstones = owned_tombstones
+    def __init__(self, tombstones: tuple[TombstoneRecord, ...]) -> None:
+        self.tombstones = tombstones
+        self.owned_tombstones = tombstones
         super().__init__(
             "committed staged-image drop requires tombstone cleanup; "
-            f"{len(owned_tombstones)} owned tombstone(s) remain"
+            f"{len(tombstones)} owned tombstone(s) remain"
         )
 
 
@@ -214,8 +238,10 @@ def rollback_staging_invocation(invocation: StagingInvocation) -> None:
 
 def _open_verified_owned_images(
     staging_root: Path, images: tuple[StagedImage, ...]
-) -> tuple[int, tuple[tuple[str, _Identity], ...]]:
-    directory_fd, _ = _open_directory_chain(staging_root, create=False)
+) -> tuple[int, tuple[tuple[str, _Identity], ...], tuple[_Identity, ...]]:
+    directory_fd, directory_identities = _open_directory_chain(
+        staging_root, create=False
+    )
     verified: list[tuple[str, _Identity]] = []
     try:
         for image in images:
@@ -243,7 +269,7 @@ def _open_verified_owned_images(
                     "staged image ownership or identity changed"
                 )
             verified.append((image.path.name, expected))
-        return directory_fd, tuple(verified)
+        return directory_fd, tuple(verified), directory_identities
     except Exception:
         os.close(directory_fd)
         raise
@@ -253,7 +279,7 @@ def verify_owned_staged_images(
     staging_root: Path, images: tuple[StagedImage, ...]
 ) -> None:
     """Verify every image through a component-wise no-follow invocation directory."""
-    directory_fd, _ = _open_verified_owned_images(staging_root, images)
+    directory_fd, _, _ = _open_verified_owned_images(staging_root, images)
     os.close(directory_fd)
 
 
@@ -261,8 +287,11 @@ def remove_owned_staged_images(
     staging_root: Path, images: tuple[StagedImage, ...]
 ) -> None:
     """Transactionally hide verified images, then clean committed tombstones."""
-    directory_fd, verified = _open_verified_owned_images(staging_root, images)
-    moved: list[tuple[str, str, _Identity]] = []
+    directory_fd, verified, directory_identities = _open_verified_owned_images(
+        staging_root, images
+    )
+    directory_identity = _identity(os.fstat(directory_fd))
+    moved: list[tuple[TombstoneRecord, bool]] = []
     try:
         try:
             for filename, expected in verified:
@@ -277,23 +306,49 @@ def remove_owned_staged_images(
                     raise StructuralExtractionError(
                         "refusing to move changed or linked staged image"
                     )
-                while True:
-                    tombstone = f".{filename}.drop-{uuid.uuid4().hex}"
-                    try:
-                        os.stat(
-                            tombstone,
-                            dir_fd=directory_fd,
-                            follow_symlinks=False,
-                        )
-                    except FileNotFoundError:
-                        break
-                os.rename(
+                tombstone = f".{filename}.drop-{uuid.uuid4().hex}"
+                record = TombstoneRecord(
+                    invocation_root=staging_root,
+                    directory_device=directory_identity[0],
+                    directory_inode=directory_identity[1],
+                    directory_chain_identities=directory_identities,
+                    tombstone_name=tombstone,
+                    original_name=filename,
+                    device=expected[0],
+                    inode=expected[1],
+                )
+                os.link(
                     filename,
                     tombstone,
                     src_dir_fd=directory_fd,
                     dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
                 )
-                moved.append((filename, tombstone, expected))
+                moved.append((record, False))
+                tombstone_stat = os.stat(
+                    tombstone, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISREG(tombstone_stat.st_mode)
+                    or tombstone_stat.st_nlink != 2
+                    or _identity(tombstone_stat) != expected
+                ):
+                    raise StructuralExtractionError(
+                        "staged image tombstone identity changed"
+                    )
+                source_after_link = os.stat(
+                    filename, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISREG(source_after_link.st_mode)
+                    or source_after_link.st_nlink != 2
+                    or _identity(source_after_link) != expected
+                ):
+                    raise StructuralExtractionError(
+                        "staged image source identity changed after tombstone link"
+                    )
+                os.unlink(filename, dir_fd=directory_fd)
+                moved[-1] = (record, True)
                 tombstone_stat = os.stat(
                     tombstone, dir_fd=directory_fd, follow_symlinks=False
                 )
@@ -303,42 +358,61 @@ def remove_owned_staged_images(
                     or _identity(tombstone_stat) != expected
                 ):
                     raise StructuralExtractionError(
-                        "staged image tombstone identity changed"
+                        "staged image tombstone did not become exclusively owned"
                     )
             os.fsync(directory_fd)
         except Exception as transaction_error:
             rollback_error: Exception | None = None
-            for filename, tombstone, expected in reversed(moved):
+            for record, source_unlinked in reversed(moved):
                 try:
+                    expected = record.device, record.inode
                     tombstone_stat = os.stat(
-                        tombstone, dir_fd=directory_fd, follow_symlinks=False
+                        record.tombstone_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
                     )
-                    if (
-                        not stat.S_ISREG(tombstone_stat.st_mode)
-                        or tombstone_stat.st_nlink != 1
-                        or _identity(tombstone_stat) != expected
-                    ):
+                    expected_links = 1 if source_unlinked else 2
+                    if not _stat_matches(tombstone_stat, expected, expected_links):
                         raise StructuralExtractionError(
                             "cannot roll back changed staged image tombstone"
                         )
-                    try:
-                        os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-                    except FileNotFoundError:
-                        pass
-                    else:
-                        raise StructuralExtractionError(
-                            "cannot roll back over a replaced staged image name"
+                    if source_unlinked:
+                        try:
+                            os.stat(
+                                record.original_name,
+                                dir_fd=directory_fd,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise StructuralExtractionError(
+                                "cannot roll back over a replaced staged image name"
+                            )
+                        os.link(
+                            record.tombstone_name,
+                            record.original_name,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                            follow_symlinks=False,
                         )
-                    os.rename(
-                        tombstone,
-                        filename,
-                        src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd,
-                    )
+                    else:
+                        source = os.stat(
+                            record.original_name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                        if not _stat_matches(source, expected, 2):
+                            raise StructuralExtractionError(
+                                "cannot roll back changed staged image source"
+                            )
+                    os.unlink(record.tombstone_name, dir_fd=directory_fd)
                     restored = os.stat(
-                        filename, dir_fd=directory_fd, follow_symlinks=False
+                        record.original_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
                     )
-                    if _identity(restored) != expected:
+                    if not _stat_matches(restored, expected, 1):
                         raise StructuralExtractionError(
                             "rolled-back staged image identity changed"
                         )
@@ -356,46 +430,154 @@ def remove_owned_staged_images(
                 "staged image drop transaction rolled back before commit"
             ) from transaction_error
 
-        remaining = {tombstone: expected for _, tombstone, expected in moved}
+        records = tuple(record for record, _ in moved)
+        remaining = list(records)
         try:
-            for _, tombstone, expected in moved:
+            for record in records:
                 current = os.stat(
-                    tombstone, dir_fd=directory_fd, follow_symlinks=False
+                    record.tombstone_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
                 )
-                if (
-                    not stat.S_ISREG(current.st_mode)
-                    or current.st_nlink != 1
-                    or _identity(current) != expected
-                ):
+                if not _stat_matches(current, (record.device, record.inode), 1):
                     raise StructuralExtractionError(
                         "committed staged image tombstone identity changed"
                     )
-                os.unlink(tombstone, dir_fd=directory_fd)
-                remaining.pop(tombstone)
+                os.unlink(record.tombstone_name, dir_fd=directory_fd)
+                remaining.remove(record)
             os.fsync(directory_fd)
         except Exception as cleanup_error:
-            owned_paths = tuple(
-                staging_root / tombstone
-                for tombstone, expected in remaining.items()
-                if _relative_identity_matches(directory_fd, tombstone, expected)
-            )
-            raise StagedImageCleanupError(staging_root, owned_paths) from cleanup_error
+            raise StagedImageCleanupError(tuple(remaining)) from cleanup_error
     finally:
         os.close(directory_fd)
 
 
-def _relative_identity_matches(
-    directory_fd: int, filename: str, expected: _Identity
-) -> bool:
-    try:
-        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
+def _stat_matches(current: os.stat_result, expected: _Identity, links: int) -> bool:
     return (
         stat.S_ISREG(current.st_mode)
-        and current.st_nlink == 1
+        and current.st_nlink == links
         and _identity(current) == expected
     )
+
+
+def retry_owned_tombstone_cleanup(
+    records: tuple[TombstoneRecord, ...],
+) -> TombstoneCleanupResult:
+    """Safely retry inode-bound tombstone cleanup without following replacements."""
+    cleaned: list[TombstoneRecord] = []
+    mismatched: list[TombstoneRecord] = []
+    fsynced = True
+    groups: dict[
+        tuple[Path, tuple[_Identity, ...]], list[TombstoneRecord]
+    ] = {}
+    for record in records:
+        groups.setdefault(
+            (
+                record.invocation_root,
+                record.directory_chain_identities,
+            ),
+            [],
+        ).append(record)
+    for (root, expected_identities), group in groups.items():
+        try:
+            directory_fd, identities = _open_directory_chain(root, create=False)
+        except StructuralExtractionError:
+            mismatched.extend(group)
+            fsynced = False
+            continue
+        try:
+            if identities != expected_identities:
+                mismatched.extend(group)
+                fsynced = False
+                continue
+            group_cleaned = False
+            for record in group:
+                if (
+                    Path(record.tombstone_name).name != record.tombstone_name
+                    or Path(record.original_name).name != record.original_name
+                ):
+                    mismatched.append(record)
+                    continue
+                try:
+                    file_fd = os.open(
+                        record.tombstone_name,
+                        os.O_RDONLY | _FILE_NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                except OSError:
+                    mismatched.append(record)
+                    continue
+                try:
+                    opened = os.fstat(file_fd)
+                    current = os.stat(
+                        record.tombstone_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    expected = record.device, record.inode
+                    if (
+                        not _stat_matches(opened, expected, 1)
+                        or not _stat_matches(current, expected, 1)
+                    ):
+                        mismatched.append(record)
+                        continue
+                    os.unlink(record.tombstone_name, dir_fd=directory_fd)
+                    cleaned.append(record)
+                    group_cleaned = True
+                except OSError:
+                    mismatched.append(record)
+                finally:
+                    os.close(file_fd)
+            if group_cleaned:
+                try:
+                    os.fsync(directory_fd)
+                except OSError:
+                    fsynced = False
+        finally:
+            os.close(directory_fd)
+    remaining = tuple(record for record in records if record not in cleaned)
+    mismatch_tuple = tuple(record for record in records if record in mismatched)
+    return TombstoneCleanupResult(tuple(cleaned), remaining, mismatch_tuple, fsynced)
+
+
+def owned_tombstone_record_matches(record: TombstoneRecord) -> bool:
+    """Check one cleanup record through its trusted no-follow directory context."""
+    try:
+        directory_fd, identities = _open_directory_chain(
+            record.invocation_root, create=False
+        )
+    except StructuralExtractionError:
+        return False
+    try:
+        if (
+            not identities
+            or identities != record.directory_chain_identities
+            or Path(record.tombstone_name).name != record.tombstone_name
+        ):
+            return False
+        try:
+            file_fd = os.open(
+                record.tombstone_name,
+                os.O_RDONLY | _FILE_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+        except OSError:
+            return False
+        try:
+            opened = os.fstat(file_fd)
+            current = os.stat(
+                record.tombstone_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            expected = record.device, record.inode
+            return _stat_matches(opened, expected, 1) and _stat_matches(
+                current, expected, 1
+            )
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def stage_jpeg(

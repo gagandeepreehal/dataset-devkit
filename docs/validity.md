@@ -50,13 +50,21 @@ records and counts remain. Each owned staged JPEG is removed only after its dire
 parent, regular-file type, single-link count, and stored device/inode identity re-verify. Changed,
 linked, prior, external, cache, source-MCAP, and other-invocation files are never deleted.
 
-Multi-image drop is transactional. After one complete preflight, every owned image is renamed in
-the same trusted directory to a unique inode-verified tombstone. A move or commit-directory-fsync
-failure rolls every moved name back before a structural error is raised, so original sample names
-are not partially deleted. Only after all tombstone names are durably committed are they unlinked.
-A post-commit cleanup failure raises a dedicated retryable structural error carrying all remaining
-owned tombstone paths; coordinator handling quarantines that recording and reports those preserved
-artifacts explicitly.
+Multi-image drop is transactional. After one complete preflight, each owned image is hard-linked
+to an exclusive UUID tombstone in the same trusted directory, verified as the same two-link inode,
+then unlinked at its original name and reverified as a single-link tombstone. A racing destination
+therefore causes no overwrite. A link, source-unlink, identity, or commit-directory-fsync failure
+rolls every prepared image back before a structural error is raised, so original sample names are
+not partially deleted. Only after all tombstone names are durably committed are they unlinked.
+
+A post-commit cleanup failure raises a dedicated retryable structural error carrying immutable
+records for every remaining tombstone: trusted invocation root and full ancestor identity chain,
+relative tombstone/original names, device/inode, and expected regular single-link state. The retry
+helper component-wise reopens that chain without following symlinks, verifies both `lstat` and
+opened-file identity, deletes only exact matches, fsyncs changed directories, and returns explicit
+cleaned/remaining/mismatched state. Replaced, hard-linked, symlinked, or ancestor-moved entries are
+never deleted. Coordinator artifact detection uses the same record verification and reports the
+records rather than trusting path existence.
 
 ## Nonstructural sanity
 
@@ -112,6 +120,8 @@ records whether quarantine persisted, its optional final report path, and an exp
 error type/message/details. Any incomplete quarantine blocks all publication authorization—even
 when partial export was requested—and the aggregate blocked result retains successes plus both
 failure layers. Nested report details are defensively deep-frozen before canonical serialization.
+Exception messages are formatted defensively; an exception with a broken `__str__` retains its
+original type and receives a deterministic unprintable-message marker without aborting later work.
 
 After all recordings finish, any failure with `allow_partial_export=false` raises
 `PublicationBlockedError`. The exception carries every success/failure but explicitly authorizes

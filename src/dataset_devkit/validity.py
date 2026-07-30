@@ -6,7 +6,6 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Literal, cast
 
 from dataset_devkit.config import GlobalConfig
@@ -22,7 +21,7 @@ from dataset_devkit.extraction.staging import (
     remove_owned_staged_images,
     verify_owned_staged_images,
 )
-from dataset_devkit.extraction.uncertainty import bounded_leaf_items
+from dataset_devkit.extraction.uncertainty import bounded_freeze, bounded_leaf_items
 
 type InvalidityCode = Literal[
     "gnss_source_invalid",
@@ -48,14 +47,6 @@ INVALIDITY_CODES: tuple[InvalidityCode, ...] = (
 )
 
 
-def _freeze(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    return value
-
-
 @dataclass(frozen=True)
 class InvalidityObservation:
     code: InvalidityCode
@@ -70,8 +61,16 @@ class InvalidityObservation:
     enabled_as_invalidator: bool = False
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "measured_values", _freeze(self.measured_values))
-        object.__setattr__(self, "details", _freeze(self.details))
+        object.__setattr__(
+            self,
+            "measured_values",
+            bounded_freeze(self.measured_values, root_path="measured_values"),
+        )
+        object.__setattr__(
+            self,
+            "details",
+            bounded_freeze(self.details, root_path="details"),
+        )
 
 
 @dataclass(frozen=True)
@@ -229,6 +228,15 @@ def _build_result_indexes(result: RecordingExtractionResult) -> _ResultIndexes:
         raise StructuralExtractionError("selected grid targets are not strictly ordered")
     if any(timestamp not in batches for timestamp in selected_batches):
         raise StructuralExtractionError("selected grid references a missing camera batch")
+    for entry in entries:
+        signed_error = entry.batch_timestamp_ns - entry.target_timestamp_ns
+        if (
+            entry.signed_sync_error_ns != signed_error
+            or entry.absolute_sync_error_ns != abs(signed_error)
+        ):
+            raise StructuralExtractionError(
+                "selected grid sync error fields are inconsistent"
+            )
 
     miss_targets = tuple(miss.target_timestamp_ns for miss in result.selected_grid.misses)
     if len(set(miss_targets)) != len(miss_targets):

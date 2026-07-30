@@ -106,8 +106,10 @@ recursively frozen.
 Before validity policy runs, selected entries and misses must form one auditable target partition:
 target timestamps are unique, disjoint, and ordered within their streams; selected batches are
 unique source batches; and the unique unused-batch tuple exactly equals every source batch not
-selected. Contradictions are structural failures. Combined selected/miss audit output is always
-sorted by target timestamp.
+selected. Every selected entry's signed error must equal `batch_timestamp_ns -
+target_timestamp_ns`, and its absolute error must equal the magnitude of that signed error.
+Contradictions are structural failures. Combined selected/miss audit output is always sorted by
+target timestamp.
 
 ## Structural failures
 

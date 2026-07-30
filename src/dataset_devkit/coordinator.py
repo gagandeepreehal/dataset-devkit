@@ -19,7 +19,11 @@ from dataset_devkit.extraction.errors import (
     StructuralExtractionError,
 )
 from dataset_devkit.extraction.models import RecordingExtractionResult
-from dataset_devkit.extraction.staging import StagedImageCleanupError
+from dataset_devkit.extraction.staging import (
+    StagedImageCleanupError,
+    TombstoneRecord,
+    owned_tombstone_record_matches,
+)
 from dataset_devkit.quarantine import (
     FailureCategory,
     QuarantineArtifact,
@@ -104,6 +108,16 @@ class PublicationBlockedError(RuntimeError):
         )
 
 
+def _safe_exception_message(error: BaseException) -> str:
+    try:
+        return str(error)
+    except BaseException as formatting_error:
+        return (
+            f"<unprintable {type(error).__name__}: __str__ raised "
+            f"{type(formatting_error).__name__}>"
+        )
+
+
 def _observed_context(
     validity: ValidityReport | None, error: Exception
 ) -> tuple[dict[str, object], ...]:
@@ -141,7 +155,7 @@ def _has_owned_artifacts(
     error: Exception,
 ) -> bool:
     if isinstance(error, StagedImageCleanupError) and any(
-        path.is_file() for path in error.owned_tombstones
+        owned_tombstone_record_matches(record) for record in error.tombstones
     ):
         return True
     if extraction is None:
@@ -160,6 +174,21 @@ def _has_owned_artifacts(
         ):
             return True
     return False
+
+
+def _tombstone_details(record: TombstoneRecord) -> dict[str, object]:
+    return {
+        "invocation_root": str(record.invocation_root),
+        "directory_device": record.directory_device,
+        "directory_inode": record.directory_inode,
+        "directory_chain_identities": record.directory_chain_identities,
+        "tombstone_name": record.tombstone_name,
+        "original_name": record.original_name,
+        "device": record.device,
+        "inode": record.inode,
+        "expected_regular": record.expected_regular,
+        "expected_single_link": record.expected_single_link,
+    }
 
 
 class RecordingCoordinator:
@@ -203,6 +232,7 @@ class RecordingCoordinator:
         extraction: RecordingExtractionResult | None,
         validity: ValidityReport | None,
     ) -> RecordingFailure:
+        exception_message = _safe_exception_message(error)
         source_details: dict[str, object] = {}
         try:
             source_stat = request.source_path.stat(follow_symlinks=False)
@@ -224,7 +254,7 @@ class RecordingCoordinator:
         )
         if isinstance(error, StagedImageCleanupError):
             source_details["owned_tombstones"] = tuple(
-                str(path) for path in error.owned_tombstones
+                _tombstone_details(record) for record in error.tombstones
             )
         artifact: QuarantineArtifact | None = None
         quarantine_error: QuarantinePersistenceFailure | None = None
@@ -235,7 +265,7 @@ class RecordingCoordinator:
                 status="quarantined",
                 category=category,
                 exception_type=type(error).__name__,
-                exception_message=str(error),
+                exception_message=exception_message,
                 stage=stage,
                 deterministic_details=source_details,
                 observed_context=_observed_context(validity, error),
@@ -247,7 +277,7 @@ class RecordingCoordinator:
         except Exception as persistence_error:
             quarantine_error = QuarantinePersistenceFailure(
                 type(persistence_error).__name__,
-                str(persistence_error),
+                _safe_exception_message(persistence_error),
                 {
                     "stage": "quarantine_persistence",
                     "directory": str(self.quarantine_directory),
@@ -258,7 +288,7 @@ class RecordingCoordinator:
             category=category,
             stage=stage,
             exception_type=type(error).__name__,
-            exception_message=str(error),
+            exception_message=exception_message,
             quarantine=artifact,
             quarantine_persisted=artifact is not None,
             quarantine_report_path=None if artifact is None else artifact.path,
