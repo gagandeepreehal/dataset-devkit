@@ -10,6 +10,8 @@ from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from dataset_devkit.identifiers import SafeSegment
+
 _AZURE_ACCOUNT_KEY_PATTERN = re.compile(
     r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{86}==(?=$|[^A-Za-z0-9+/=])"
 )
@@ -47,6 +49,20 @@ _CREDENTIAL_KEY_NAMES = {
     "storagekey",
 }
 _CREDENTIAL_QUERY_KEYS = _CREDENTIAL_KEY_NAMES | {"sig", "signature"}
+_AZURE_BLOB_HOST_SUFFIXES = (
+    ".blob.core.windows.net",
+    ".blob.core.usgovcloudapi.net",
+    ".blob.core.chinacloudapi.cn",
+    ".blob.core.cloudapi.de",
+)
+_PATH_FIELD_LOCATIONS = {
+    "config.azure.blob_list",
+    "config.paths.work_dir",
+    "config.paths.cache_dir",
+    "config.paths.output_dir",
+    "config.annotations.path",
+    "config.quarantine.directory",
+}
 
 
 def _is_credential_key(key: object) -> bool:
@@ -90,16 +106,27 @@ def _looks_like_opaque_bearer_token(value: str) -> bool:
     if bearer_match is None:
         return False
     payload = bearer_match.group("payload")
-    explicit_path_prefixes = ("/", "\\", "./", "../", ".\\", "..\\")
-    has_drive_prefix = re.match(r"^[A-Za-z]:[\\/]", payload) is not None
-    separator_count = payload.count("/") + payload.count("\\")
-    if payload.startswith(explicit_path_prefixes) or has_drive_prefix or separator_count >= 2:
-        return False
     return _BEARER_TOKEN_PATTERN.fullmatch(payload) is not None
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first in second.parents or second in first.parents
+
+
+def _validate_tag_list(values: list[str]) -> list[str]:
+    if any(not value.strip() or value != value.strip() for value in values):
+        raise ValueError("tags must be nonempty and have no surrounding whitespace")
+    if len(values) != len(set(values)):
+        raise ValueError("tags must be unique")
+    return values
+
+
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, strict=True)
+
+
+class ConfigRootError(ValueError):
+    """Raised when a JSON configuration does not contain an object root."""
 
 
 class AzureConfig(StrictModel):
@@ -111,10 +138,28 @@ class AzureConfig(StrictModel):
     @classmethod
     def reject_url_userinfo(cls, value: str) -> str:
         parsed = urlsplit(value)
+        hostname = parsed.hostname
+        is_blob_host = hostname is not None and hostname.endswith(_AZURE_BLOB_HOST_SUFFIXES)
+        if parsed.scheme != "https" or not is_blob_host:
+            raise ValueError("account_url must be an HTTPS Azure Blob service URL")
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("account_url must not contain credential userinfo")
         if _has_credential_url_query(value):
             raise ValueError("account_url must not contain credential query parameters")
+        return value
+
+    @field_validator("container")
+    @classmethod
+    def validate_container_name(cls, value: str) -> str:
+        valid = (
+            3 <= len(value) <= 63
+            and re.fullmatch(r"[a-z0-9-]+", value) is not None
+            and value[0].isalnum()
+            and value[-1].isalnum()
+            and "--" not in value
+        )
+        if not valid:
+            raise ValueError("container must follow Azure container naming rules")
         return value
 
 
@@ -133,12 +178,7 @@ class PathsConfig(StrictModel):
         items = list(named_paths.items())
         for index, (first_name, first_path) in enumerate(items):
             for second_name, second_path in items[index + 1 :]:
-                overlaps = (
-                    first_path == second_path
-                    or first_path in second_path.parents
-                    or second_path in first_path.parents
-                )
-                if overlaps:
+                if _paths_overlap(first_path, second_path):
                     raise ValueError(f"unsafe path overlap between {first_name} and {second_name}")
         return self
 
@@ -146,6 +186,13 @@ class PathsConfig(StrictModel):
 class TopicsConfig(StrictModel):
     camera: str
     gnss: str
+
+    @field_validator("camera", "gnss")
+    @classmethod
+    def validate_nonblank_topic(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("topic name must be nonblank")
+        return value
 
 
 class DownsamplingConfig(StrictModel):
@@ -211,6 +258,11 @@ class FiltersConfig(StrictModel):
     min_valid_ratio: float = Field(ge=0, le=1)
     required_tags: list[str]
 
+    @field_validator("required_tags")
+    @classmethod
+    def validate_required_tags(cls, values: list[str]) -> list[str]:
+        return _validate_tag_list(values)
+
 
 class SamplingConfig(StrictModel):
     fraction: float = Field(gt=0, le=1)
@@ -223,10 +275,35 @@ class ScenarioRuleConfig(StrictModel):
     excluded_tags: list[str] = Field(default_factory=list)
     sampling: SamplingConfig
 
+    @field_validator("name")
+    @classmethod
+    def validate_rule_name(cls, value: str) -> str:
+        if not value.strip() or value != value.strip():
+            raise ValueError("rule name must be nonblank with no surrounding whitespace")
+        return value
+
+    @field_validator("required_tags", "excluded_tags")
+    @classmethod
+    def validate_tags(cls, values: list[str]) -> list[str]:
+        return _validate_tag_list(values)
+
+    @model_validator(mode="after")
+    def validate_tag_sets_do_not_overlap(self) -> ScenarioRuleConfig:
+        if set(self.required_tags) & set(self.excluded_tags):
+            raise ValueError("required and excluded tags overlap")
+        return self
+
 
 class ScenariosConfig(StrictModel):
     seed: int
     rules: list[ScenarioRuleConfig]
+
+    @model_validator(mode="after")
+    def validate_unique_rule_names(self) -> ScenariosConfig:
+        names = [rule.name for rule in self.rules]
+        if len(names) != len(set(names)):
+            raise ValueError("scenario rule names must be unique")
+        return self
 
 
 class SplitConfig(StrictModel):
@@ -243,11 +320,11 @@ class ExecutionConfig(StrictModel):
 class QuarantineConfig(StrictModel):
     enabled: bool = True
     directory: Path = Path("quarantine")
-    manifest_name: str = Field(default="rejected.jsonl", min_length=1)
+    manifest_name: SafeSegment = "rejected.jsonl"
 
 
 class PublicationConfig(StrictModel):
-    version: str
+    version: SafeSegment
     refuse_overwrite: bool
 
 
@@ -271,6 +348,20 @@ class GlobalConfig(StrictModel):
     quarantine: QuarantineConfig = Field(default_factory=QuarantineConfig)
     publication: PublicationConfig
 
+    @model_validator(mode="after")
+    def validate_quarantine_isolation(self) -> GlobalConfig:
+        if not self.quarantine.enabled:
+            return self
+        quarantine_dir = self.quarantine.directory
+        for name, destructive_path in (
+            ("work_dir", self.paths.work_dir),
+            ("cache_dir", self.paths.cache_dir),
+            ("output_dir", self.paths.output_dir),
+        ):
+            if _paths_overlap(quarantine_dir, destructive_path):
+                raise ValueError(f"quarantine directory overlaps {name}")
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def reject_embedded_credentials(cls, value: object) -> object:
@@ -285,8 +376,9 @@ class GlobalConfig(StrictModel):
             elif isinstance(item, list):
                 for index, nested in enumerate(item):
                     inspect(nested, f"{location}[{index}]")
-            elif isinstance(item, str):
-                lowered = item.lower()
+            elif isinstance(item, (str, Path)):
+                text = str(item)
+                lowered = text.lower()
                 has_secret_assignment = any(
                     marker in lowered
                     for marker in (
@@ -298,11 +390,14 @@ class GlobalConfig(StrictModel):
                 )
                 if (
                     has_secret_assignment
-                    or _has_credential_url_query(item)
-                    or _looks_like_opaque_bearer_token(item)
-                    or _AZURE_ACCOUNT_KEY_PATTERN.search(item) is not None
-                    or _JWT_PATTERN.search(item) is not None
-                    or re.fullmatch(r"sk-[A-Za-z0-9_-]{20,}", item) is not None
+                    or _has_credential_url_query(text)
+                    or (
+                        location not in _PATH_FIELD_LOCATIONS
+                        and _looks_like_opaque_bearer_token(text)
+                    )
+                    or _AZURE_ACCOUNT_KEY_PATTERN.search(text) is not None
+                    or _JWT_PATTERN.search(text) is not None
+                    or re.fullmatch(r"sk-[A-Za-z0-9_-]{20,}", text) is not None
                     or "-----begin private key-----" in lowered
                 ):
                     raise ValueError(f"embedded credential value is prohibited at {location}")
@@ -315,6 +410,8 @@ def load_config(path: Path) -> GlobalConfig:
     """Load configuration and resolve paths relative to its JSON file."""
     config_path = path.resolve()
     data = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ConfigRootError("configuration must be a top-level JSON object")
     base = config_path.parent
     quarantine_data = data.setdefault("quarantine", {})
     if isinstance(quarantine_data, dict):
@@ -330,5 +427,5 @@ def load_config(path: Path) -> GlobalConfig:
         section_data = data.get(section)
         if isinstance(section_data, dict) and isinstance(section_data.get(field), str):
             value = Path(section_data[field])
-            section_data[field] = str(value if value.is_absolute() else (base / value).resolve())
+            section_data[field] = value if value.is_absolute() else (base / value).resolve()
     return GlobalConfig.model_validate(data)

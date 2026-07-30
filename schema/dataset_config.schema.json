@@ -245,6 +245,7 @@
           "type": "boolean"
         },
         "version": {
+          "minLength": 1,
           "title": "Version",
           "type": "string"
         }

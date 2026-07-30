@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from dataset_devkit.identifiers import validate_safe_segment
+
 
 @dataclass(frozen=True, slots=True)
 class Dataset:
@@ -18,3 +20,4 @@ class Dataset:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dataroot", self.dataroot.resolve())
+        validate_safe_segment(self.version)

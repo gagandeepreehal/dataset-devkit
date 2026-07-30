@@ -54,4 +54,8 @@ ruff check .
 mypy
 PYTHONPATH=src python -m dataset_devkit.schema
 git diff --exit-code schema/dataset_config.schema.json
+python -m build --wheel --no-isolation
+python -m venv --system-site-packages /tmp/dataset-devkit-smoke
+/tmp/dataset-devkit-smoke/bin/pip install --no-deps dist/dataset_devkit-0.1.0-py3-none-any.whl
+/tmp/dataset-devkit-smoke/bin/dataset-devkit --help
 ```

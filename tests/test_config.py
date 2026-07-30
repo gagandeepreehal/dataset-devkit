@@ -66,6 +66,14 @@ def write_config(tmp_path: Path, data: dict[str, object]) -> Path:
     return config_path
 
 
+def test_load_config_requires_top_level_json_object(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="top-level JSON object"):
+        load_config(config_path)
+
+
 def set_nested(data: dict[str, object], dotted_key: str, value: object) -> None:
     target: dict[str, Any] = data
     parts = dotted_key.split(".")
@@ -132,6 +140,27 @@ def test_invalid_numeric_thresholds_are_rejected(tmp_path: Path, field: str, val
         load_config(write_config(tmp_path / field.replace(".", "_"), data))
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("execution.workers", "2"),
+        ("execution.workers", 2.0),
+        ("execution.workers", True),
+        ("downsampling.target_fps", "2.0"),
+        ("downsampling.target_fps", True),
+        ("execution.allow_partial_export", "false"),
+        ("execution.allow_partial_export", 0),
+        ("topics.camera", 123),
+    ],
+)
+def test_runtime_primitives_are_not_coerced(tmp_path: Path, field: str, value: object) -> None:
+    data = minimal_config()
+    set_nested(data, field, value)
+
+    with pytest.raises(ValidationError, match=field.rsplit(".", 1)[-1]):
+        load_config(write_config(tmp_path / field.replace(".", "_"), data))
+
+
 def test_scene_max_duration_cannot_be_less_than_minimum(tmp_path: Path) -> None:
     data = minimal_config()
     set_nested(data, "scenes.min_duration_s", 30)
@@ -168,6 +197,37 @@ def test_work_cache_and_output_paths_must_not_overlap(
 
 
 @pytest.mark.parametrize(
+    "directory",
+    ["../work", "../cache/rejected", "../output", "../output/dataset/quarantine"],
+)
+def test_enabled_quarantine_directory_must_not_overlap_destructive_paths(
+    tmp_path: Path, directory: str
+) -> None:
+    data = minimal_config()
+    data["quarantine"] = {
+        "enabled": True,
+        "directory": directory,
+        "manifest_name": "rejected.jsonl",
+    }
+
+    with pytest.raises(ValidationError, match="quarantine.*overlap|overlap.*quarantine"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_disabled_quarantine_directory_may_overlap_output(tmp_path: Path) -> None:
+    data = minimal_config()
+    data["quarantine"] = {
+        "enabled": False,
+        "directory": "../output/dataset",
+        "manifest_name": "rejected.jsonl",
+    }
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.quarantine.directory == config.paths.output_dir
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("azure.client_secret", "do-not-store-this"),
@@ -201,6 +261,14 @@ def test_ordinary_urls_and_secret_named_paths_are_allowed(tmp_path: Path) -> Non
     assert config.annotations.path.name == "annotations.jsonl"
 
 
+def test_non_bearer_credentials_remain_rejected_in_path_fields(tmp_path: Path) -> None:
+    data = minimal_config()
+    set_nested(data, "annotations.path", "AccountKey=embedded/annotations.jsonl")
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
 @pytest.mark.parametrize(
     "account_url",
     [
@@ -213,6 +281,61 @@ def test_account_url_rejects_url_userinfo(tmp_path: Path, account_url: str) -> N
     set_nested(data, "azure.account_url", account_url)
 
     with pytest.raises(ValidationError, match="credential|userinfo"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "account_url",
+    [
+        "https://account.blob.core.windows.net",
+        "https://account.blob.core.usgovcloudapi.net",
+        "https://account.privatelink.blob.core.windows.net",
+    ],
+)
+def test_azure_blob_service_urls_are_accepted(tmp_path: Path, account_url: str) -> None:
+    data = minimal_config()
+    set_nested(data, "azure.account_url", account_url)
+
+    assert load_config(write_config(tmp_path, data)).azure.account_url == account_url
+
+
+@pytest.mark.parametrize(
+    "account_url",
+    [
+        "http://account.blob.core.windows.net",
+        "ftp://account.blob.core.windows.net",
+        "https://example.com",
+        "https://blob.evil.com",
+        "https:///missing-host",
+    ],
+)
+def test_account_url_requires_https_azure_blob_service(tmp_path: Path, account_url: str) -> None:
+    data = minimal_config()
+    set_nested(data, "azure.account_url", account_url)
+
+    with pytest.raises(ValidationError, match="account_url"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "container",
+    ["ab", "A-container", "-container", "container-", "bad--container", "bad_name"],
+)
+def test_azure_container_name_rules_are_enforced(tmp_path: Path, container: str) -> None:
+    data = minimal_config()
+    set_nested(data, "azure.container", container)
+
+    with pytest.raises(ValidationError, match="container"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("field", ["topics.camera", "topics.gnss"])
+@pytest.mark.parametrize("value", ["", "   ", "\t"])
+def test_topic_names_must_be_nonblank(tmp_path: Path, field: str, value: str) -> None:
+    data = minimal_config()
+    set_nested(data, field, value)
+
+    with pytest.raises(ValidationError, match=field.rsplit(".", 1)[-1]):
         load_config(write_config(tmp_path, data))
 
 
@@ -255,13 +378,11 @@ def test_explicit_credential_field_names_are_rejected(
 
 def test_bearer_prefixed_ordinary_strings_and_paths_are_allowed(tmp_path: Path) -> None:
     data = minimal_config()
-    set_nested(data, "azure.container", "bearer recordings")
     set_nested(data, "annotations.path", "bearer archive/annotations.jsonl")
     set_nested(data, "publication.version", "bearer migration archive for July recordings")
 
     config = load_config(write_config(tmp_path, data))
 
-    assert config.azure.container == "bearer recordings"
     assert config.annotations.path.name == "annotations.jsonl"
     assert config.publication.version == "bearer migration archive for July recordings"
 
@@ -300,11 +421,11 @@ def test_rfc6750_b64token_characters_are_rejected(tmp_path: Path, token: str) ->
 
 def test_bearer_prefixed_path_with_digits_is_allowed(tmp_path: Path) -> None:
     data = minimal_config()
-    set_nested(data, "publication.version", "bearer archive/2026/annotations.jsonl")
+    set_nested(data, "annotations.path", "bearer archive/2026/annotations.jsonl")
 
     config = load_config(write_config(tmp_path, data))
 
-    assert config.publication.version.endswith("annotations.jsonl")
+    assert config.annotations.path.name == "annotations.jsonl"
 
 
 @pytest.mark.parametrize(
@@ -334,11 +455,20 @@ def test_standalone_bearer_token_shapes_are_rejected(tmp_path: Path, token: str)
 )
 def test_clearly_path_like_bearer_values_are_allowed(tmp_path: Path, value: str) -> None:
     data = minimal_config()
-    set_nested(data, "publication.version", value)
+    set_nested(data, "annotations.path", value)
 
     config = load_config(write_config(tmp_path, data))
 
-    assert config.publication.version == value
+    assert config.annotations.path.name == Path(value).name
+
+
+def test_multi_separator_bearer_token_is_rejected_in_non_path_field(tmp_path: Path) -> None:
+    data = minimal_config()
+    value = "Bearer abcdefghijklmno/pqrstuvwxyzABCDE/FGHIJ"
+    set_nested(data, "publication.version", value)
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
 
 
 @pytest.mark.parametrize(
@@ -396,7 +526,7 @@ def test_standalone_sas_metadata_query_parameters_are_allowed(
     set_nested(
         data,
         "azure.account_url",
-        f"https://example.test/search?{query_key}={query_value}",
+        f"https://example.blob.core.windows.net/search?{query_key}={query_value}",
     )
 
     config = load_config(write_config(tmp_path, data))
@@ -439,6 +569,100 @@ def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> N
 
     assert config.scenarios.rules[0].sampling.fraction == 0.5
     assert config.quarantine.directory == (tmp_path / "quarantine").resolve()
+
+
+@pytest.mark.parametrize("required_tags", [[""], [" turn "], ["turn", "turn"]])
+def test_filter_tags_must_be_nonempty_and_unique(tmp_path: Path, required_tags: list[str]) -> None:
+    data = minimal_config()
+    set_nested(data, "filters.required_tags", required_tags)
+
+    with pytest.raises(ValidationError, match="required_tags"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("required_tags", "excluded_tags"),
+    [
+        ([""], []),
+        (["turn", "turn"], []),
+        ([], ["stationary", "stationary"]),
+        (["turn"], ["turn"]),
+    ],
+)
+def test_scenario_rule_tags_are_valid_sets(
+    tmp_path: Path, required_tags: list[str], excluded_tags: list[str]
+) -> None:
+    data = minimal_config()
+    data["scenarios"] = {
+        "seed": 42,
+        "rules": [
+            {
+                "name": "turns",
+                "required_tags": required_tags,
+                "excluded_tags": excluded_tags,
+                "sampling": {"fraction": 0.5},
+            }
+        ],
+    }
+
+    with pytest.raises(ValidationError, match="tags|overlap"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_scenario_rule_names_must_be_nonblank_and_unique(tmp_path: Path) -> None:
+    data = minimal_config()
+    data["scenarios"] = {
+        "seed": 42,
+        "rules": [
+            {"name": "turns", "sampling": {"fraction": 0.5}},
+            {"name": "turns", "sampling": {"fraction": 0.5}},
+        ],
+    }
+
+    with pytest.raises(ValidationError, match="rule names"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("name", ["   ", " turns "])
+def test_scenario_rule_name_must_be_nonblank(tmp_path: Path, name: str) -> None:
+    data = minimal_config()
+    data["scenarios"] = {
+        "seed": 42,
+        "rules": [{"name": name, "sampling": {"fraction": 0.5}}],
+    }
+
+    with pytest.raises(ValidationError, match="name"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("quarantine.manifest_name", ""),
+        ("quarantine.manifest_name", "."),
+        ("quarantine.manifest_name", ".."),
+        ("quarantine.manifest_name", "../rejected.jsonl"),
+        ("quarantine.manifest_name", "nested/rejected.jsonl"),
+        ("quarantine.manifest_name", r"nested\rejected.jsonl"),
+        ("publication.version", ""),
+        ("publication.version", ".."),
+        ("publication.version", "versions/v1"),
+        ("publication.version", " v1 "),
+    ],
+)
+def test_manifest_and_publication_identifiers_are_safe_segments(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    data = minimal_config()
+    data["quarantine"] = {
+        "enabled": True,
+        "directory": "../quarantine",
+        "manifest_name": "rejected.jsonl",
+    }
+    set_nested(data, field, value)
+
+    with pytest.raises(ValidationError, match=field.rsplit(".", 1)[-1]):
+        load_config(write_config(tmp_path / field.replace(".", "_"), data))
 
 
 @pytest.mark.parametrize(
