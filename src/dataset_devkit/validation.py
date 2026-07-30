@@ -614,6 +614,12 @@ def _validate_pipeline_audit(
     sequence_ids = {
         (item["scene_token"], item["source_digest"]) for item in typed_sequence
     }
+    selected_sources = {source for _, source in selected_ids}
+    sequence_sources = {source for _, source in sequence_ids}
+    filtered_ids = accepted_ids | rejected_ids
+    expected_sequence_ids = {
+        identity for identity in filtered_ids if identity[1] in selected_sources
+    }
     published_ids = {(token, source) for token, source in scene_to_source.items()}
     split_assignments = split.get("assignments") if isinstance(split, dict) else None
     split_ids = (
@@ -640,7 +646,8 @@ def _validate_pipeline_audit(
         or typed_sequence != canonical_sequence
         or accepted_ids & rejected_ids
         or selected_ids & unselected_ids
-        or accepted_ids | rejected_ids != sequence_ids
+        or sequence_sources != selected_sources
+        or sequence_ids != expected_sequence_ids
         or selected_ids | unselected_ids != accepted_ids
         or selected_ids != published_ids
         or selected_ids != split_ids
@@ -786,6 +793,121 @@ def _validate_split_extension(
         )
         if item.get("rank") != expected_rank:
             fail("split assignment rank differs")
+
+    expected_test_identities: set[tuple[str, str]] = set()
+    quotas: dict[str, int] = {}
+    if len(groups) > 0 and sum(map(len, groups.values())) == population:
+        if stratify:
+            remainders: list[tuple[Decimal, str, str]] = []
+            for scenario in sorted(groups):
+                ideal = Decimal(len(groups[scenario])) * Decimal(str(fraction))
+                floor = int(ideal.to_integral_value(rounding=ROUND_FLOOR))
+                quotas[scenario] = floor
+                tie = canonical_hash(
+                    {
+                        "seed": seed,
+                        "primary_scenario": scenario,
+                        "purpose": "apportion",
+                    }
+                )
+                remainders.append((ideal - Decimal(floor), tie, scenario))
+            remaining = target - sum(quotas.values())
+            for _, _, scenario in sorted(
+                remainders, key=lambda item: (-item[0], item[1], item[2])
+            )[:remaining]:
+                quotas[scenario] += 1
+
+            for scenario in sorted(groups):
+                count = len(groups[scenario])
+                if count >= 2 and quotas[scenario] == 0:
+                    donors = [
+                        name
+                        for name in groups
+                        if quotas[name] > (1 if len(groups[name]) >= 2 else 0)
+                    ]
+                    if donors:
+                        donor = min(
+                            donors,
+                            key=lambda name: canonical_hash(
+                                {
+                                    "seed": seed,
+                                    "from": name,
+                                    "to": scenario,
+                                    "purpose": "rebalance",
+                                }
+                            ),
+                        )
+                        quotas[donor] -= 1
+                        quotas[scenario] += 1
+            for scenario in sorted(groups):
+                count = len(groups[scenario])
+                if count >= 2 and quotas[scenario] == count:
+                    recipients = [
+                        name
+                        for name in groups
+                        if quotas[name]
+                        < (len(groups[name]) - 1 if len(groups[name]) >= 2 else 1)
+                    ]
+                    if recipients:
+                        recipient = min(
+                            recipients,
+                            key=lambda name: canonical_hash(
+                                {
+                                    "seed": seed,
+                                    "from": scenario,
+                                    "to": name,
+                                    "purpose": "rebalance",
+                                }
+                            ),
+                        )
+                        quotas[scenario] -= 1
+                        quotas[recipient] += 1
+
+            for scenario, items in groups.items():
+                ranked = sorted(
+                    items,
+                    key=lambda item: (
+                        canonical_hash(
+                            {
+                                "seed": seed,
+                                "primary_scenario": scenario,
+                                "scene_token": item["scene_token"],
+                                "source_digest": item["source_digest"],
+                            }
+                        ),
+                        (item["scene_token"], item["source_digest"]),
+                    ),
+                )
+                expected_test_identities.update(
+                    (item["scene_token"], item["source_digest"])
+                    for item in ranked[: quotas[scenario]]
+                )
+        else:
+            ranked = sorted(
+                typed,
+                key=lambda item: (
+                    canonical_hash(
+                        {
+                            "seed": seed,
+                            "primary_scenario": "__all__",
+                            "scene_token": item["scene_token"],
+                            "source_digest": item["source_digest"],
+                        }
+                    ),
+                    (item["scene_token"], item["source_digest"]),
+                ),
+            )
+            expected_test_identities.update(
+                (item["scene_token"], item["source_digest"])
+                for item in ranked[:target]
+            )
+        submitted_test_identities = {
+            (item["scene_token"], item["source_digest"])
+            for item in typed
+            if item.get("split") == "test"
+        }
+        if submitted_test_identities != expected_test_identities:
+            fail("split membership differs from deterministic apportionment")
     strata = split.get("strata")
     stratum_keys = {
         "primary_scenario",
@@ -812,8 +934,13 @@ def _validate_split_extension(
             if audit is None:
                 continue
             count = len(items)
-            tests = sum(item.get("split") == "test" for item in items)
-            applied = bool(stratify and count >= 2 and 0 < tests < count)
+            expected_tests = sum(
+                (item["scene_token"], item["source_digest"])
+                in expected_test_identities
+                for item in items
+            )
+            target_tests = quotas.get(scenario, expected_tests)
+            applied = bool(stratify and count >= 2 and 0 < expected_tests < count)
             fallback = (
                 "stratification_disabled"
                 if not stratify
@@ -827,9 +954,9 @@ def _validate_split_extension(
                 audit.get("population_count") != count
                 or audit.get("expected_test_count")
                 != str(Decimal(count) * Decimal(str(fraction)))
-                or audit.get("target_test_count") != tests
-                or audit.get("actual_test_count") != tests
-                or audit.get("actual_train_count") != count - tests
+                or audit.get("target_test_count") != target_tests
+                or audit.get("actual_test_count") != expected_tests
+                or audit.get("actual_train_count") != count - expected_tests
                 or audit.get("stratification_applied") is not applied
                 or audit.get("fallback_reason") != fallback
             ):
@@ -1109,6 +1236,23 @@ def _extensions(
                     "scene extension coverage differs from scenes",
                 )
             )
+        if isinstance(value, list) and any(
+            isinstance(item, dict)
+            and (
+                item.get("source_digest") not in recording_sources
+                or scene_to_source.get(cast(str, item.get("scene_token")))
+                != item.get("source_digest")
+            )
+            for item in value
+        ):
+            findings.append(
+                ValidationFinding(
+                    "error",
+                    "extension_reference",
+                    name,
+                    "scene extension source differs from recording ownership",
+                )
+            )
     sample_by_token = {cast(str, item["token"]): item for item in tables["sample"]}
     data_by_token = {cast(str, item["token"]): item for item in tables["sample_data"]}
     calibration_by_token = {
@@ -1302,23 +1446,6 @@ def _extensions(
                 "validity evidence is malformed or differs from official scene ownership",
             )
         )
-        if isinstance(value, list) and any(
-            not isinstance(item, dict)
-            or (
-                item.get("source_digest") not in recording_sources
-                or scene_to_source.get(cast(str, item.get("scene_token")))
-                != item.get("source_digest")
-            )
-            for item in value
-        ):
-            findings.append(
-                ValidationFinding(
-                    "error",
-                    "extension_reference",
-                    name,
-                    "scene extension source differs from recording ownership",
-                )
-            )
     gnss = loaded["gnss"]
     gnss_keys = {
         "sample_data_token",

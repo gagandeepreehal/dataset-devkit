@@ -293,6 +293,11 @@ def test_manifest_detects_tamper_extra_and_symlink(
             "extension_value",
         ),
         (
+            "mz_extensions/tags.json",
+            lambda value: value[0].update(source_digest="0" * 64),
+            "extension_reference",
+        ),
+        (
             "mz_extensions/validity.json",
             lambda value: value.append(dict(value[0])),
             "extension_reference",
@@ -301,6 +306,11 @@ def test_manifest_detects_tamper_extra_and_symlink(
             "mz_extensions/validity.json",
             lambda value: value[0].update(scene_valid_ratio=2.0),
             "extension_value",
+        ),
+        (
+            "mz_extensions/validity.json",
+            lambda value: value[0].update(source_digest="0" * 64),
+            "extension_reference",
         ),
         (
             "mz_extensions/validity.json",

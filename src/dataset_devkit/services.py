@@ -300,18 +300,22 @@ def _build_evidence(
     selection = select_scenarios(filtered.accepted, config.scenarios)
     if not selection.selected_scenes:
         raise BuildOperationalError("scenario selection produced an empty dataset")
+    selected_sources = {item.source_digest for item in selection.assignments}
+    selected_graphs = tuple(
+        graph for graph in graphs if graph.source.digest in selected_sources
+    )
     split = split_selected_scenes(
         selection,
         filtered.accepted,
         config.scenarios,
-        tuple(graphs),
+        selected_graphs,
         config.split,
     )
     evidence = ExportEvidence(
         filtered.accepted,
         config.scenarios,
         selection,
-        tuple(graphs),
+        selected_graphs,
         config.split,
         split,
         config,
@@ -345,7 +349,9 @@ def _build_evidence(
                 "rule_audits": [asdict(item) for item in selection.rule_audits],
                 "unselected": [asdict(item) for item in selection.unselected],
             },
-            "graph_scene_sequence": pipeline_graph_scene_sequence(tuple(graphs)),
+            "graph_scene_sequence": pipeline_graph_scene_sequence(
+                tuple(graphs), selection
+            ),
         },
     )
     return evidence, tuple(failures)

@@ -327,8 +327,10 @@ class _ExportIndex:
 
 def pipeline_graph_scene_sequence(
     graphs: Sequence[RecordingSceneResult],
+    selection: ScenarioSelectionResult,
 ) -> list[dict[str, object]]:
-    """Return the compact complete Task 5 scene chronology used by validation."""
+    """Return complete chronology only for sources contributing selected scenes."""
+    selected_sources = {item.source_digest for item in selection.assignments}
     return [
         {
             "source_digest": graph.source.digest,
@@ -339,6 +341,7 @@ def pipeline_graph_scene_sequence(
             "last_timestamp_ns": scene.last_timestamp_ns,
         }
         for graph in sorted(graphs, key=lambda item: item.source.digest)
+        if graph.source.digest in selected_sources
         for scene in sorted(
             graph.scenes,
             key=lambda item: (
@@ -1026,7 +1029,9 @@ def _export_into(
             "rule_audits": _jsonable(evidence.selection.rule_audits),
             "unselected": _jsonable(evidence.selection.unselected),
         },
-        "graph_scene_sequence": pipeline_graph_scene_sequence(evidence.graphs),
+        "graph_scene_sequence": pipeline_graph_scene_sequence(
+            evidence.graphs, evidence.selection
+        ),
     }
     _write_json(
         writer,
