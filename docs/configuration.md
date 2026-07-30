@@ -175,6 +175,12 @@ error and blocks publication; per-recording quarantine records report the tree a
 `preserved_in_place` with its expected path/device/inode and original failure cause. Only such
 preserved evidence intentionally survives cleanup.
 
+Python callers receive `OwnedDirectoryCleanupError` with its structured identity evidence so an
+operator can inspect and recover the preserved tree. The CLI deliberately does not expose those
+local paths or identifiers: it exits 1, writes the single line
+`dataset-devkit: error: owned working-tree cleanup failed; manual cleanup required` to stderr,
+writes no normal stdout result, and does not produce a traceback.
+
 ## Managed-identity smoke check
 
 After assigning the VM identity Blob Data Reader access and placing one valid path in the

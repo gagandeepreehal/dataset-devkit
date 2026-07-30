@@ -40,6 +40,10 @@ Each command prints one concise deterministic JSON object to stdout. Configurati
 exit 2; operational or validation failures exit 1 with one safe stderr diagnostic and no normal
 traceback. A successful build publishes at `paths.output_dir/v1.0-trainval`; the dataroot itself
 contains the `v1.0-trainval/`, `samples/`, `maps/`, and `mz_extensions/` children.
+If identity-safe working-tree cleanup fails, the CLI emits only
+`dataset-devkit: error: owned working-tree cleanup failed; manual cleanup required`; local paths
+and identity evidence remain available through the structured Python exception and quarantine
+report, but are not printed at the command boundary.
 
 Builds run in a uniquely named sibling `.v1.0-trainval.staging-*` directory. Tables, assets,
 extensions, official-SDK smoke loading, and the final manifest are validated before one atomic

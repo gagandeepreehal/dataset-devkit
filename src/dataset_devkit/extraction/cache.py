@@ -24,7 +24,11 @@ from dataset_devkit.extraction.staging import (
     staged_directory_metadata,
 )
 from dataset_devkit.provenance import SourceFingerprint, canonical_json
-from dataset_devkit.publication import cleanup_pinned_directory
+from dataset_devkit.publication import (
+    OwnedDirectoryAuthority,
+    OwnedDirectoryCleanupError,
+    cleanup_pinned_directory,
+)
 
 _ADAPTER = TypeAdapter(RecordingExtractionResult)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -656,6 +660,20 @@ class ExtractionResultCache:
         """Copy a verified immutable generation into a unique caller-owned invocation."""
         self.path_for(source, config_hash)
         invocation = None
+        working_authority: OwnedDirectoryAuthority | None = None
+
+        def rollback_after(error: BaseException) -> None:
+            if invocation is None:
+                return
+            try:
+                rollback_staging_invocation(invocation)
+            except Exception:
+                if working_authority is None:
+                    raise
+                raise OwnedDirectoryCleanupError(
+                    (working_authority.cleanup_failure(),)
+                ) from error
+
         try:
             lease = _CacheRootLease.open(self.cache_dir, create=False)
             try:
@@ -678,6 +696,7 @@ class ExtractionResultCache:
                         if generation_identity != cached.generation_identity:
                             raise ValueError("cache generation changed before materialization")
                         invocation = create_staging_invocation(working_root, recording_id)
+                        working_authority = OwnedDirectoryAuthority.capture(invocation.path)
                         destination_fd = os.open(invocation.path, _DIRECTORY_FLAGS)
                         try:
                             for index, image in enumerate(cached.images):
@@ -700,9 +719,10 @@ class ExtractionResultCache:
                     os.close(source_fd)
             finally:
                 lease.close()
-        except (OSError, ValueError):
-            if invocation is not None:
-                rollback_staging_invocation(invocation)
+        except OwnedDirectoryCleanupError:
+            raise
+        except (OSError, ValueError) as error:
+            rollback_after(error)
             return None
         try:
             if invocation is None:
@@ -739,8 +759,8 @@ class ExtractionResultCache:
                 staging_root=invocation.path,
                 samples=tuple(samples),
             )
-        except Exception:
-            rollback_staging_invocation(invocation)
+        except Exception as error:
+            rollback_after(error)
             raise
 
     def store(

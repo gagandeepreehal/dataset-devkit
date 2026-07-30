@@ -85,6 +85,7 @@ class RecordingFailure:
     quarantine_persisted: bool
     quarantine_report_path: Path | None
     quarantine_error: QuarantinePersistenceFailure | None
+    cleanup_complete: bool
 
 
 RecordingOutcome = RecordingSuccess | RecordingFailure
@@ -95,6 +96,7 @@ class CoordinatorResult:
     outcomes: tuple[RecordingOutcome, ...]
     successes: tuple[RecordingSuccess, ...]
     failures: tuple[RecordingFailure, ...]
+    cleanup_complete: bool
     publish_authorized: bool
     authorized_recording_ids: tuple[str, ...]
 
@@ -310,6 +312,9 @@ class RecordingCoordinator:
             quarantine_persisted=artifact is not None,
             quarantine_report_path=None if artifact is None else artifact.path,
             quarantine_error=quarantine_error,
+            cleanup_complete=not isinstance(
+                error, (OwnedDirectoryCleanupError, StagedImageCleanupError)
+            ),
         )
 
     def quarantine_failure(
@@ -374,13 +379,22 @@ class RecordingCoordinator:
             else allow_partial_export
         )
         quarantine_incomplete = any(not failure.quarantine_persisted for failure in failures)
-        if failures and (not partial or quarantine_incomplete):
-            blocked = CoordinatorResult(tuple(outcomes), successes, failures, False, ())
+        cleanup_incomplete = any(not failure.cleanup_complete for failure in failures)
+        if failures and (not partial or quarantine_incomplete or cleanup_incomplete):
+            blocked = CoordinatorResult(
+                tuple(outcomes),
+                successes,
+                failures,
+                not cleanup_incomplete,
+                False,
+                (),
+            )
             raise PublicationBlockedError(blocked)
         return CoordinatorResult(
             tuple(outcomes),
             successes,
             failures,
+            True,
             True,
             tuple(item.recording_id for item in successes),
         )

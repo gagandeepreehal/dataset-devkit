@@ -244,6 +244,17 @@ class OwnedDirectoryAuthority:
         finally:
             os.close(parent_fd)
 
+    def cleanup_failure(self) -> OwnedDirectoryCleanupFailure:
+        """Return serializable identity evidence for a failed cleanup."""
+        return OwnedDirectoryCleanupFailure(
+            self.root,
+            self.root_identity[0],
+            self.root_identity[1],
+            self.parent_identity[0],
+            self.parent_identity[1],
+            self.parent_chain,
+        )
+
 
 @dataclass(frozen=True)
 class OwnedDirectoryCleanupFailure:
@@ -252,12 +263,18 @@ class OwnedDirectoryCleanupFailure:
     path: Path
     expected_device: int
     expected_inode: int
+    expected_parent_device: int
+    expected_parent_inode: int
+    expected_parent_chain: tuple[tuple[int, int], ...]
 
     def to_dict(self) -> dict[str, object]:
         return {
             "path": str(self.path),
             "expected_device": self.expected_device,
             "expected_inode": self.expected_inode,
+            "expected_parent_device": self.expected_parent_device,
+            "expected_parent_inode": self.expected_parent_inode,
+            "expected_parent_chain": [list(item) for item in self.expected_parent_chain],
         }
 
 

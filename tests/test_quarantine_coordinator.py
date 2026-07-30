@@ -24,6 +24,10 @@ from dataset_devkit.coordinator import (
 )
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.service import RecordingExtractor
+from dataset_devkit.publication import (
+    OwnedDirectoryAuthority,
+    OwnedDirectoryCleanupError,
+)
 from dataset_devkit.quarantine import (
     QuarantineReport,
     write_quarantine_report,
@@ -495,6 +499,49 @@ def test_coordinator_finishes_all_inputs_then_blocks_or_authorizes_partial(
     assert partial.authorized_recording_ids == ("second",)
 
 
+def test_partial_export_never_authorizes_incomplete_owned_cleanup(
+    tmp_path: Path, config_factory: object
+) -> None:
+    working = tmp_path / "working" / "bad-invocation"
+    working.mkdir(parents=True)
+    (working / "owned.jpg").write_bytes(b"owned")
+    authority = OwnedDirectoryAuthority.capture(working)
+
+    def extract(path: Path) -> object:
+        if path.stem == "bad":
+            original = RuntimeError("cache materialization failed")
+            cleanup = OwnedDirectoryCleanupError((authority.cleanup_failure(),))
+            raise cleanup from original
+        return replace(_result(tmp_path / "good-owned"), source_path=path)
+
+    coordinator = RecordingCoordinator(
+        config=_policy_config(config_factory),
+        quarantine_directory=tmp_path / "quarantine",
+        extractor=extract,  # type: ignore[arg-type]
+    )
+    requests = (
+        RecordingRequest("good", tmp_path / "good.mcap"),
+        RecordingRequest("bad", tmp_path / "bad.mcap"),
+    )
+
+    with pytest.raises(PublicationBlockedError) as caught:
+        coordinator.process(requests, allow_partial_export=True)
+
+    result = caught.value.result
+    assert [item.recording_id for item in result.successes] == ["good"]
+    assert not result.cleanup_complete
+    assert not result.publish_authorized
+    assert result.authorized_recording_ids == ()
+    failure = result.failures[0]
+    assert not failure.cleanup_complete
+    assert failure.quarantine is not None
+    payload = json.loads(failure.quarantine.path.read_text(encoding="utf-8"))
+    assert payload["artifact_handling"] == "preserved_in_place"
+    tree = payload["deterministic_details"]["owned_working_trees"][0]
+    assert tree["path"] == str(working)
+    assert tree["expected_parent_chain"]
+
+
 def test_quarantine_failure_retains_original_and_continues_but_blocks_partial(
     tmp_path: Path, config_factory: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -578,20 +625,27 @@ def test_committed_drop_cleanup_failure_becomes_structural_quarantine(
         original_unlink(path, dir_fd=dir_fd)
 
     monkeypatch.setattr("dataset_devkit.extraction.staging.os.unlink", fail_first_unlink)
-    result = RecordingCoordinator(
+    coordinator = RecordingCoordinator(
         config=config,
         quarantine_directory=tmp_path / "quarantine",
         extractor=lambda path: replace(_result(tmp_path / "owned"), source_path=path),
-    ).process(
-        (RecordingRequest("cleanup", tmp_path / "cleanup.mcap"),),
-        allow_partial_export=True,
     )
+    with pytest.raises(PublicationBlockedError) as caught:
+        coordinator.process(
+            (RecordingRequest("cleanup", tmp_path / "cleanup.mcap"),),
+            allow_partial_export=True,
+        )
 
+    result = caught.value.result
     failure = result.failures[0]
     assert failure.category == "structural"
     assert failure.stage == "validity"
     assert "tombstone cleanup" in failure.exception_message
     assert failure.quarantine_persisted
+    assert not failure.cleanup_complete
+    assert not result.cleanup_complete
+    assert not result.publish_authorized
+    assert result.authorized_recording_ids == ()
     assert failure.quarantine is not None
     payload = json.loads(failure.quarantine.path.read_text(encoding="utf-8"))
     assert payload["artifact_handling"] == "preserved_in_place"
@@ -652,16 +706,22 @@ def test_coordinator_does_not_follow_replaced_tombstone_for_artifact_detection(
             ego_poses_by_timestamp={sample.camera_timestamp_ns: sample.ego_pose},
         )
 
-    result = RecordingCoordinator(
+    coordinator = RecordingCoordinator(
         config=config,
         quarantine_directory=tmp_path / "quarantine-replaced",
         extractor=single_sample_result,  # type: ignore[arg-type]
-    ).process(
-        (RecordingRequest("cleanup", tmp_path / "cleanup.mcap"),),
-        allow_partial_export=True,
     )
+    with pytest.raises(PublicationBlockedError) as caught:
+        coordinator.process(
+            (RecordingRequest("cleanup", tmp_path / "cleanup.mcap"),),
+            allow_partial_export=True,
+        )
 
+    result = caught.value.result
     failure = result.failures[0]
+    assert not failure.cleanup_complete
+    assert not result.publish_authorized
+    assert result.authorized_recording_ids == ()
     assert failure.quarantine is not None
     payload = json.loads(failure.quarantine.path.read_text(encoding="utf-8"))
     assert payload["artifact_handling"] == "no_owned_artifacts"

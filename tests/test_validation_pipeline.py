@@ -10,7 +10,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -1234,6 +1236,50 @@ def test_cache_materialization_rolls_back_a_partial_stream(
     assert not working.exists() or not tuple(working.iterdir())
 
 
+def test_cache_materialization_rollback_failure_preserves_structured_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recording, extracted, source = _cache_security_case(tmp_path)
+    cache = ExtractionResultCache(tmp_path / "cache")
+    config_hash = "a" * 64
+    cache.store(source, config_hash, extracted)
+    from dataset_devkit.extraction import cache as cache_module
+
+    original_copy = cache_module._copy_verified_image_at
+    copied = 0
+
+    def fail_second_copy(*args: object, **kwargs: object) -> os.stat_result:
+        nonlocal copied
+        copied += 1
+        if copied == 2:
+            raise ValueError("injected materialization failure")
+        return original_copy(*args, **kwargs)  # type: ignore[arg-type]
+
+    def fail_rollback(_invocation: object) -> None:
+        raise StructuralExtractionError("injected rollback failure")
+
+    monkeypatch.setattr(cache_module, "_copy_verified_image_at", fail_second_copy)
+    monkeypatch.setattr(cache_module, "rollback_staging_invocation", fail_rollback)
+    working = tmp_path / "working"
+
+    with pytest.raises(OwnedDirectoryCleanupError) as captured:
+        cache.materialize(
+            source,
+            config_hash,
+            recording,
+            working,
+            "recording-000000",
+        )
+
+    assert isinstance(captured.value.__cause__, ValueError)
+    assert str(captured.value.__cause__) == "injected materialization failure"
+    failure = captured.value.failures[0]
+    assert failure.path.parent == working
+    assert failure.expected_inode > 0
+    assert failure.expected_parent_chain
+    assert failure.path.is_dir()
+
+
 @pytest.mark.parametrize("failure_point", ["store", "marker"])
 def test_failed_cache_completion_cleans_owned_working_extraction(
     tmp_path: Path,
@@ -1307,23 +1353,104 @@ def test_failed_cache_completion_reports_uncleaned_owned_working_tree(
         official_smoke=False,
     )
 
-    with pytest.raises(BuildOperationalError, match="publication blocked"):
+    with pytest.raises(OwnedDirectoryCleanupError) as captured:
         build_dataset(config, runtime=runtime)
 
-    manifest = config.quarantine.directory / config.quarantine.manifest_name
-    rows = [json.loads(line) for line in manifest.read_text().splitlines()]
-    assert rows[0]["exception_type"] == "OwnedDirectoryCleanupError"
-    assert rows[0]["artifact_handling"] == "preserved_in_place"
-    tree = rows[0]["deterministic_details"]["owned_working_trees"][0]
+    assert isinstance(captured.value.__cause__, BuildOperationalError)
+    reports = tuple(config.quarantine.directory.glob("*.quarantine.json"))
+    row = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert row["exception_type"] == "OwnedDirectoryCleanupError"
+    assert row["artifact_handling"] == "preserved_in_place"
+    tree = row["deterministic_details"]["owned_working_trees"][0]
     assert tree["path"].startswith(str(config.paths.work_dir))
     assert tree["expected_device"] >= 0
     assert tree["expected_inode"] > 0
-    original = rows[0]["deterministic_details"]["cleanup_original_cause"]
+    original = row["deterministic_details"]["cleanup_original_cause"]
     assert original == {
         "exception_type": "RuntimeError",
         "exception_message": f"injected {failure_point} failure",
     }
     assert tuple(config.paths.work_dir.iterdir())
+
+
+def test_partial_pipeline_never_publishes_after_owned_cleanup_failure(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+) -> None:
+    good_recording = tmp_path / "good.mcap"
+    bad_recording = tmp_path / "bad.mcap"
+    payloads = tuple(
+        camera_message(
+            timestamp,
+            (timestamp + 10, timestamp + 20),
+            camera_names=("front", "rear"),
+        )
+        for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
+    )
+    write_mcap(good_recording, camera_payloads=payloads)
+    write_mcap(bad_recording, camera_payloads=payloads)
+    good_blob = "mcap-h265/good.mcap"
+    bad_blob = "mcap-h265/bad.mcap"
+    config = _pipeline_config(
+        config_factory(), tmp_path, (good_blob, bad_blob), partial=True
+    )
+    acquirer = _FakeAcquirer(
+        {good_blob: good_recording, bad_blob: bad_recording}
+    )
+    extraction_hash = extraction_config_hash(config)
+    for blob in (good_blob, bad_blob):
+        acquirer.record_extraction_complete(
+            acquirer.acquire(blob).manifest.source, extraction_hash
+        )
+    good_extraction = RecordingExtractor(
+        camera_topic=config.topics.camera,
+        gnss_topic=config.topics.gnss,
+        target_fps=Fraction(str(config.downsampling.target_fps)),
+        tolerance_ns=int(config.downsampling.tolerance_ms * 1_000_000),
+        staging_root=config.paths.work_dir,
+        decoder_factory=DeterministicDecoder,
+    ).extract(good_recording)
+    failed_working = config.paths.work_dir / "bad-owned-invocation"
+    failed_working.mkdir()
+    (failed_working / "partial.jpg").write_bytes(b"owned")
+    failed_authority = OwnedDirectoryAuthority.capture(failed_working)
+
+    class CleanupFailingCache:
+        def materialize(
+            self,
+            source: SourceFingerprint,
+            _config_hash: str,
+            _source_path: Path,
+            _working_root: Path,
+            _recording_id: str,
+        ) -> RecordingExtractionResult:
+            if source.blob_path == bad_blob:
+                original = ValueError("injected cache materialization failure")
+                cleanup = OwnedDirectoryCleanupError(
+                    (failed_authority.cleanup_failure(),)
+                )
+                raise cleanup from original
+            return good_extraction
+
+    fake_cache = cast(ExtractionResultCache, CleanupFailingCache())
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: acquirer,
+        decoder_factory=DeterministicDecoder,
+        extraction_cache_factory=lambda _path: fake_cache,
+        official_smoke=False,
+    )
+
+    with pytest.raises(BuildOperationalError, match="zero recordings are authorized"):
+        build_dataset(config, runtime=runtime)
+
+    assert not (config.paths.output_dir / config.publication.version).exists()
+    assert failed_working.is_dir()
+    reports = tuple(config.quarantine.directory.glob("*.quarantine.json"))
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["artifact_handling"] == "preserved_in_place"
+    assert payload["deterministic_details"]["owned_working_trees"][0]["path"] == str(
+        failed_working
+    )
 
 
 def test_post_export_working_cleanup_failure_blocks_publication(

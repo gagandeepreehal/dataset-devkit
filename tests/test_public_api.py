@@ -103,3 +103,49 @@ def test_build_main_returns_concise_config_diagnostics(
     assert "dataset-devkit: error:" in error
     assert "Traceback" not in error
     assert len(error.splitlines()) == 1
+
+
+def test_build_main_redacts_structured_cleanup_evidence(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataset_devkit import cli
+    from dataset_devkit.publication import (
+        OwnedDirectoryCleanupError,
+        OwnedDirectoryCleanupFailure,
+    )
+
+    cleanup_error = OwnedDirectoryCleanupError(
+        (
+            OwnedDirectoryCleanupFailure(
+                path=Path("/private/operator\nsecret/work-tree"),
+                expected_device=17,
+                expected_inode=29,
+                expected_parent_device=31,
+                expected_parent_inode=43,
+                expected_parent_chain=((31, 43),),
+            ),
+        )
+    )
+    monkeypatch.setattr(cli, "validate_config_schema_and_runtime", lambda _path: object())
+
+    def fail_build(_config: object) -> None:
+        raise cleanup_error
+
+    monkeypatch.setattr(cli, "build_dataset", fail_build)
+
+    result = cli.main(["build", "--config", "unused.json"])
+    captured = capsys.readouterr()
+
+    assert result == 1
+    assert captured.out == ""
+    assert (
+        captured.err
+        == "dataset-devkit: error: owned working-tree cleanup failed; "
+        "manual cleanup required\n"
+    )
+    assert "/private/operator" not in captured.err
+    assert "17" not in captured.err
+    assert "29" not in captured.err
+    assert "Traceback" not in captured.err
+    assert len(captured.err.splitlines()) == 1

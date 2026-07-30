@@ -15,6 +15,7 @@ from dataset_devkit.config import ConfigRootError, validate_config_schema_and_ru
 from dataset_devkit.dataset import DatasetFormatError
 from dataset_devkit.identifiers import validate_safe_segment
 from dataset_devkit.provenance import canonical_json
+from dataset_devkit.publication import OwnedDirectoryCleanupError
 from dataset_devkit.services import (
     BuildOperationalError,
     build_dataset,
@@ -102,6 +103,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             summary = inspect_dataset(args.dataroot, args.version)
             print(canonical_json(summary.to_dict()))
+    except OwnedDirectoryCleanupError:
+        print(
+            "dataset-devkit: error: owned working-tree cleanup failed; "
+            "manual cleanup required",
+            file=sys.stderr,
+        )
+        return 1
     except (
         OSError,
         BuildOperationalError,

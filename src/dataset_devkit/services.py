@@ -138,11 +138,7 @@ class _WorkingExtractionRegistry:
 
     @staticmethod
     def _failure(authority: OwnedDirectoryAuthority) -> OwnedDirectoryCleanupFailure:
-        return OwnedDirectoryCleanupFailure(
-            authority.root,
-            authority.root_identity[0],
-            authority.root_identity[1],
-        )
+        return authority.cleanup_failure()
 
     def cleanup(self, recording_id: str) -> None:
         with self._lock:
@@ -416,6 +412,7 @@ def _build_evidence_owned(
         ):
             working.preserve(failure.recording_id)
     quarantine_complete = all(item.quarantine_persisted for item in all_failures)
+    cleanup_complete = all(item.cleanup_complete for item in all_failures)
     if all_failures and quarantine_complete:
         try:
             write_rejection_manifest(
@@ -433,7 +430,11 @@ def _build_evidence_owned(
         blobs[int(item.recording_id.removeprefix("recording-"))]
         for item in all_failures
     )
-    if failures and (not config.execution.allow_partial_export or not quarantine_complete):
+    if failures and (
+        not config.execution.allow_partial_export
+        or not quarantine_complete
+        or not cleanup_complete
+    ):
         raise BuildOperationalError(
             f"publication blocked after {len(failures)} quarantined recording failure(s)"
         )
