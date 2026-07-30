@@ -197,6 +197,25 @@ def test_sanity_error_is_quarantined_with_validity_audit_context(
     assert payload["artifact_handling"] == "preserved_in_place"
     context_codes = {item["code"] for item in payload["observed_context"]}
     assert context_codes == {*INVALIDITY_CODES, "empty_final_candidates"}
+    position = next(
+        item for item in payload["observed_context"]
+        if item["code"] == "position_sigma_exceeded"
+    )
+    assert position["scope"] == "pose"
+    assert position["measured_values"]["east_sigma_m"] == pytest.approx(1.2)
+    assert position["threshold"] == 0.5
+    assert position["details"]["before_position_uncertainty"]["east_sigma_m"] == 1.2
+    assert position["grid_target_timestamp_ns"] == 2_000_000_000
+    assert position["batch_timestamp_ns"] == 2_000_000_100
+    assert position["camera_timestamp_ns"] in {100, 2_000_000_100}
+    assert position["camera_name"] in {"front", "rear", "extra"}
+    assert position["enabled_as_invalidator"] is True
+    sanity = next(
+        item for item in payload["observed_context"]
+        if item["code"] == "empty_final_candidates"
+    )
+    assert sanity["policy"] == "error"
+    assert sanity["details"] == {"count": 0}
 
 
 def test_coordinator_rejects_empty_and_duplicate_identities(

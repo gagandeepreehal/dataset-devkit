@@ -238,9 +238,14 @@ def _validate_result(result: RecordingExtractionResult) -> None:
 
 def _camera_timeline_observations(
     result: RecordingExtractionResult, config: GlobalConfig
-) -> dict[int, list[InvalidityObservation]]:
+) -> tuple[tuple[InvalidityObservation, ...], dict[int, list[InvalidityObservation]]]:
+    all_observations: list[InvalidityObservation] = []
     by_batch: dict[int, list[InvalidityObservation]] = {}
     previous: dict[str, int] = {}
+    target_by_batch = {
+        entry.batch_timestamp_ns: entry.target_timestamp_ns
+        for entry in result.selected_grid.entries
+    }
     gap_threshold_ns = int(config.frame_validity.camera_timestamp_gap_max_ms * 1_000_000)
     for batch in result.camera_batches:
         for frame in batch.frames:
@@ -256,25 +261,26 @@ def _camera_timeline_observations(
                     "delta_ns": delta,
                 },
                 "details": {"camera_index": frame.camera_index},
+                "grid_target_timestamp_ns": target_by_batch.get(batch.rec_timestamp_ns),
                 "batch_timestamp_ns": batch.rec_timestamp_ns,
                 "camera_timestamp_ns": frame.camera_timestamp_ns,
                 "camera_name": frame.camera_name,
             }
             if delta <= 0:
-                by_batch.setdefault(batch.rec_timestamp_ns, []).append(
-                    _observation(
-                        config, "camera_timestamp_non_monotonic", "camera",
-                        threshold=0, **common,
-                    )
+                observation = _observation(
+                    config, "camera_timestamp_non_monotonic", "camera",
+                    threshold=0, **common,
                 )
+                all_observations.append(observation)
+                by_batch.setdefault(batch.rec_timestamp_ns, []).append(observation)
             if delta > gap_threshold_ns:
-                by_batch.setdefault(batch.rec_timestamp_ns, []).append(
-                    _observation(
-                        config, "camera_timestamp_gap_exceeded", "camera",
-                        threshold=gap_threshold_ns, **common,
-                    )
+                observation = _observation(
+                    config, "camera_timestamp_gap_exceeded", "camera",
+                    threshold=gap_threshold_ns, **common,
                 )
-    return by_batch
+                all_observations.append(observation)
+                by_batch.setdefault(batch.rec_timestamp_ns, []).append(observation)
+    return tuple(all_observations), by_batch
 
 
 def _pose_observations(
@@ -288,6 +294,17 @@ def _pose_observations(
         "camera_name": sample.camera_name,
     }
     observed: list[InvalidityObservation] = []
+    endpoint_details = {
+        "interpolation_fraction": interpolation.fraction,
+        "sync_gap_before_ns": interpolation.sync_gap_before_ns,
+        "sync_gap_after_ns": interpolation.sync_gap_after_ns,
+        "before_timestamp_ns": (
+            None if interpolation.before is None else interpolation.before.timestamp_ns
+        ),
+        "after_timestamp_ns": (
+            None if interpolation.after is None else interpolation.after.timestamp_ns
+        ),
+    }
     if not interpolation.available or (
         interpolation.source_validity is not None
         and not all(interpolation.source_validity)
@@ -305,12 +322,22 @@ def _pose_observations(
                     "after_valid": -1 if after_valid is None else int(after_valid),
                 },
                 details={
-                    "fraction": interpolation.fraction,
-                    "before_timestamp_ns": (
-                        None if interpolation.before is None else interpolation.before.timestamp_ns
+                    **endpoint_details,
+                    "before_position_uncertainty": (
+                        {} if interpolation.before is None
+                        else interpolation.before.position_uncertainty
                     ),
-                    "after_timestamp_ns": (
-                        None if interpolation.after is None else interpolation.after.timestamp_ns
+                    "after_position_uncertainty": (
+                        {} if interpolation.after is None
+                        else interpolation.after.position_uncertainty
+                    ),
+                    "before_orientation_uncertainty": (
+                        {} if interpolation.before is None
+                        else interpolation.before.orientation_uncertainty
+                    ),
+                    "after_orientation_uncertainty": (
+                        {} if interpolation.after is None
+                        else interpolation.after.orientation_uncertainty
                     ),
                 },
                 **common,
@@ -327,7 +354,20 @@ def _pose_observations(
                 config, "position_sigma_exceeded", "pose",
                 measured_values=position,
                 threshold=config.gnss.position_sigma_max_m,
-                details={"position_uncertainty": interpolation.position_uncertainty},
+                details={
+                    **endpoint_details,
+                    "before_position_uncertainty": (
+                        {} if interpolation.before is None
+                        else interpolation.before.position_uncertainty
+                    ),
+                    "after_position_uncertainty": (
+                        {} if interpolation.after is None
+                        else interpolation.after.position_uncertainty
+                    ),
+                    "interpolated_position_uncertainty": (
+                        interpolation.position_uncertainty
+                    ),
+                },
                 **common,
             )
         )
@@ -345,7 +385,11 @@ def _pose_observations(
                 measured_values={**variances, "maximum_variance": maximum},
                 threshold=config.gnss.orientation_variance_max,
                 details={
+                    **endpoint_details,
                     "orientation_uncertainty": orientation_details,
+                    "interpolated_orientation_uncertainty": (
+                        interpolation.orientation_uncertainty
+                    ),
                     "before_orientation_uncertainty": (
                         {} if interpolation.before is None
                         else interpolation.before.orientation_uncertainty
@@ -374,7 +418,7 @@ def _pose_observations(
                     "maximum_endpoint_gap_ns": maximum_gap,
                 },
                 threshold=threshold_ns,
-                details={"fraction": interpolation.fraction},
+                details=endpoint_details,
                 **common,
             )
         )
@@ -389,14 +433,15 @@ def evaluate_validity(
     samples_by_batch: dict[int, list[ExtractedCameraSample]] = {}
     for sample in result.samples:
         samples_by_batch.setdefault(sample.batch_timestamp_ns, []).append(sample)
-    timeline = _camera_timeline_observations(result, config)
-    all_observations: list[InvalidityObservation] = []
+    timeline_observations, timeline_by_batch = _camera_timeline_observations(result, config)
+    all_observations: list[InvalidityObservation] = list(timeline_observations)
     sample_audits: list[LogicalSampleAudit] = []
     grid_audits: list[GridAuditRecord] = []
     required = tuple(config.frame_validity.required_cameras)
     for entry in result.selected_grid.entries:
         samples = tuple(samples_by_batch.get(entry.batch_timestamp_ns, ()))
-        observations = list(timeline.get(entry.batch_timestamp_ns, ()))
+        observations = list(timeline_by_batch.get(entry.batch_timestamp_ns, ()))
+        timeline_count = len(observations)
         present = {sample.camera_name for sample in samples}
         missing = tuple(name for name in required if name not in present)
         if missing:
@@ -427,7 +472,7 @@ def evaluate_validity(
             GridAuditRecord(entry.target_timestamp_ns, entry.batch_timestamp_ns, cameras,
                             tuple(observations), valid)
         )
-        all_observations.extend(observations)
+        all_observations.extend(observations[timeline_count:])
     for miss in result.selected_grid.misses:
         observation = _observation(
             config,

@@ -245,7 +245,9 @@ class InvalidationRulesConfig(StrictModel):
 
 class FrameValidityConfig(StrictModel):
     invalid_sample_policy: Literal["retain_for_audit", "drop"] = "retain_for_audit"
-    required_cameras: list[SafeSegment] = Field(default_factory=list)
+    required_cameras: list[SafeSegment] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
     camera_timestamp_gap_max_ms: float = Field(gt=0)
     invalidate_on: InvalidationRulesConfig = Field(default_factory=InvalidationRulesConfig)
 

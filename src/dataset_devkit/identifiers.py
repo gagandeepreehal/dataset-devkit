@@ -32,4 +32,18 @@ def validate_safe_segment(value: str) -> str:
     return value
 
 
-SafeSegment = Annotated[str, Field(min_length=1), AfterValidator(validate_safe_segment)]
+SafeSegment = Annotated[
+    str,
+    Field(
+        min_length=1,
+        json_schema_extra={
+            "pattern": (
+                r"^(?!\.{1,2}$)(?!\s)(?!.*(?:\.|\s)$)"
+                r"(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|"
+                r"[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\.|$))"
+                r"[^\u0000-\u001f/\\<>:\"|?*]+$"
+            )
+        },
+    ),
+    AfterValidator(validate_safe_segment),
+]

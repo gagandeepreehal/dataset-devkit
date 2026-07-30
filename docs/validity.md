@@ -20,10 +20,10 @@ misses. Threshold equality is accepted; `*_exceeded` means strict `measured > th
 | Code | Measurement and semantics |
 | --- | --- |
 | `gnss_source_invalid` | Interpolation is unavailable or either preserved endpoint/source has `is_valid == false`; availability, endpoint booleans/timestamps, and interpolation fraction are retained. |
-| `position_sigma_exceeded` | Any interpolated `east_sigma_m`, `north_sigma_m`, or `up_sigma_m` strictly exceeds `gnss.position_sigma_max_m`; all available axes are reported. |
-| `orientation_variance_exceeded` | The conservative maximum across every finite numeric `orientation_error` field whose name contains `variance` strictly exceeds `gnss.orientation_variance_max`; interpolated and both raw endpoint mappings remain in details. |
+| `position_sigma_exceeded` | Any interpolated `east_sigma_m`, `north_sigma_m`, or `up_sigma_m` strictly exceeds `gnss.position_sigma_max_m`; all interpolated axes plus both raw endpoint uncertainty mappings, fraction, timestamps, and endpoint gaps are reported. |
+| `orientation_variance_exceeded` | The conservative maximum across every finite numeric `orientation_error` field whose name contains `variance` strictly exceeds `gnss.orientation_variance_max`; interpolated and both raw endpoint mappings, fraction, timestamps, and endpoint gaps remain in details. |
 | `gnss_sync_gap_exceeded` | The maximum of the preserved before/after bracket gaps strictly exceeds `gnss.sync_gap_max_ms`; each gap and the maximum are reported in nanoseconds. |
-| `camera_timestamp_non_monotonic` | For one exact camera identity across the recording, current minus previous real camera timestamp is zero or negative. Previous/current/delta are reported. Batch/grid times are not substituted. |
+| `camera_timestamp_non_monotonic` | For one exact camera identity across the recording, current minus previous real camera timestamp is zero or negative. Previous/current/delta are reported for selected and unselected batches. Batch/grid times are not substituted. |
 | `camera_timestamp_gap_exceeded` | That per-camera real timestamp delta strictly exceeds `frame_validity.camera_timestamp_gap_max_ms`. |
 | `missing_required_camera` | A configured exact `required_cameras` identity is absent from the selected logical sample. Present, required, and missing identities are reported; extras stay in the sample. |
 | `grid_miss` | A target grid timestamp has no batch inside extraction tolerance. The target remains auditable although no sample exists. |
@@ -55,16 +55,22 @@ quarantine. The implemented checks are:
 - `all_gnss_sources_invalid`: every source GNSS message is marked invalid;
 - `zero_required_camera_coverage`: no configured required camera appears in any selected sample.
 
+Required-camera coverage uses the immutable extraction/source sample presence, before retain/drop
+filtering, so changing audit retention cannot create a false zero-coverage finding.
+
 These checks are nonstructural warnings about usable coverage. They do not downgrade malformed
 MCAP/protobuf/descriptors, impossible arrays/calibration/schema, corrupt or undecodable video,
 decoder frame-count mismatch, unsafe/unverifiable JPEG staging, invalid timestamps/nonfinite poses,
-or inconsistent internal/final references. Those always raise `StructuralExtractionError`.
+or inconsistent internal/final references. All present scalar, repeated, and nested
+`orientation_error` numeric values must also be finite, and nonnumeric uncertainty descriptor
+fields are rejected. These conditions always raise `StructuralExtractionError`.
 
 ## Quarantine report contract
 
 Every coordinator failure is classified as `structural`, `sanity`, or `unexpected` and gets a
 canonical JSON report with `schema_version: "1.0"`, recording/source identity, quarantined status,
-category, exception type/message, stage, deterministic source details, validity/audit context,
+category, exception type/message, stage, deterministic source details, complete validity/audit
+context (measurements, thresholds, raw details, timestamps, camera, and enabled flag),
 available source/extraction config hashes, and `artifact_handling`. Deterministic content has no
 wall-clock field. Runtime logging may add time separately, but it is not part of this report.
 

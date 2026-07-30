@@ -91,12 +91,11 @@ def _all_gnss_invalid(
 def _zero_required_coverage(
     result: RecordingExtractionResult, validity: ValidityReport, config: GlobalConfig
 ) -> _CheckResult:
-    del result
+    del validity
     required = tuple(config.frame_validity.required_cameras)
     covered = {
         sample.camera_name
-        for audit in validity.sample_audits
-        for sample in audit.samples
+        for sample in result.samples
         if sample.camera_name in required
     }
     return _CheckResult(

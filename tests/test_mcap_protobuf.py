@@ -70,6 +70,30 @@ def descriptor_with_optional_numeric(message_name: str, field_name: str) -> byte
     raise AssertionError(f"message {message_name!r} not found")
 
 
+def descriptor_with_nested_orientation_variances() -> bytes:
+    file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
+    calibration = next(file for file in file_set.file if file.name == "calibration.proto")
+    orientation_error = next(
+        message for message in calibration.message_type
+        if message.name == "OrientationError"
+    )
+    axis = orientation_error.nested_type.add(name="AxisVariance")
+    variance = axis.field.add(
+        name="variance",
+        number=1,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE,
+    )
+    variance.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+    samples = orientation_error.field.add(
+        name="samples",
+        number=4,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        type_name=".autonome.OrientationError.AxisVariance",
+    )
+    samples.label = descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED
+    return file_set.SerializeToString()
+
+
 def descriptor_with_top_level_camera_types() -> bytes:
     file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
     telemetry = next(file for file in file_set.file if file.name == "telemetry.proto")
@@ -474,6 +498,81 @@ def test_gnss_message_requires_nested_numeric_when_descriptor_exposes_presence(
     )
 
     with pytest.raises(StructuralExtractionError, match="position_error.hdop"):
+        read_recording(path, "rec_cameras", "gnss")
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_gnss_orientation_error_nonfinite_value_is_structural(
+    tmp_path: Path, value: float
+) -> None:
+    _, gnss_type = message_classes()
+    message = gnss_type.FromString(gnss_message(900_000_000, 0))
+    message.orientation_error.yaw_variance = value
+    path = tmp_path / "nonfinite-orientation-error.mcap"
+    write_mcap(path, gnss_payloads=(bytes(message.SerializeToString()),))
+
+    with pytest.raises(StructuralExtractionError, match="orientation_error.*finite"):
+        read_recording(path, "rec_cameras", "gnss")
+
+
+def test_gnss_orientation_error_descriptor_rejects_nonnumeric_field(
+    tmp_path: Path,
+) -> None:
+    descriptor_data = descriptor_with_field_change(
+        "OrientationError",
+        "yaw_variance",
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+    )
+    path = tmp_path / "string-orientation-error.mcap"
+    write_mcap(path, descriptor_data=descriptor_data, gnss_payloads=(b"",))
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match="GNSS schema field.*orientation_error.yaw_variance.*numeric",
+    ):
+        read_recording(path, "rec_cameras", "gnss")
+
+
+def test_gnss_repeated_orientation_error_nonfinite_value_is_structural(
+    tmp_path: Path,
+) -> None:
+    descriptor_data = descriptor_with_field_change(
+        "OrientationError",
+        "yaw_variance",
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+    )
+    _, gnss_type = message_classes(descriptor_data)
+    message = gnss_type.FromString(gnss_message(900_000_000, 0))
+    message.orientation_error.yaw_variance.extend([0.1, float("inf")])
+    path = tmp_path / "repeated-nonfinite-orientation-error.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        gnss_payloads=(bytes(message.SerializeToString()),),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="orientation_error.yaw_variance.*finite"):
+        read_recording(path, "rec_cameras", "gnss")
+
+
+def test_gnss_nested_orientation_error_nonfinite_value_is_structural(
+    tmp_path: Path,
+) -> None:
+    descriptor_data = descriptor_with_nested_orientation_variances()
+    _, gnss_type = message_classes(descriptor_data)
+    message = gnss_type.FromString(gnss_message(900_000_000, 0))
+    message.orientation_error.samples.add().variance = float("nan")
+    path = tmp_path / "nested-nonfinite-orientation-error.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        gnss_payloads=(bytes(message.SerializeToString()),),
+    )
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match="orientation_error.samples.variance.*finite",
+    ):
         read_recording(path, "rec_cameras", "gnss")
 
 

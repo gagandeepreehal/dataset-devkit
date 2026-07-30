@@ -32,9 +32,11 @@ VCL NAL unit. The indexed
 The GNSS protobuf type name may vary. Its descriptor must expose `timestamp`, `rec_timestamp`,
 `is_valid`, `lat_lon_ht`, `orientation`, `position_error`, and `orientation_error` with the required
 field shape. GNSS is indexed by protobuf `timestamp`; duplicate timestamps are structurally
-ambiguous. Unknown top-level identifiers and dynamically shaped orientation uncertainty remain
-serializable in the result. GNSS scalar and nested descriptor types are validated before payload
-decoding. Every message must contain both timestamps and all four required nested messages; a
+ambiguous. Unknown top-level identifiers and dynamically shaped numeric orientation uncertainty
+remain serializable in the result. GNSS scalar and nested descriptor types are validated before
+payload decoding. Orientation-uncertainty descriptors may contain scalar, repeated, or nested
+numeric fields; nonnumeric/recursive shapes and any present nonfinite numeric value are structural
+failures. Every message must contain both timestamps and all four required nested messages; a
 nested numeric value is also required when its protobuf descriptor exposes field presence.
 
 ## Selection, decode, and pose output

@@ -163,11 +163,34 @@ def test_observation_first_engine_retains_every_reason_and_raw_measurement(
         "up_sigma_m": pytest.approx(1.0),
     }
     assert sigma.threshold == 0.5
+    assert sigma.details["before_position_uncertainty"] == pytest.approx(
+        {"east_sigma_m": 1.2, "north_sigma_m": 1.1, "up_sigma_m": 1.0}
+    )
+    assert sigma.details["after_position_uncertainty"] == sigma.details[
+        "before_position_uncertainty"
+    ]
+    assert sigma.details["interpolated_position_uncertainty"] == sigma.measured_values
+    assert sigma.camera_timestamp_ns is not None
+    assert sigma.details["interpolation_fraction"] == pytest.approx(
+        sigma.camera_timestamp_ns / 4_000_000_000
+    )
+    assert sigma.details["sync_gap_before_ns"] == sigma.camera_timestamp_ns
+    assert sigma.details["sync_gap_after_ns"] == 4_000_000_000 - sigma.camera_timestamp_ns
     orientation = next(
         item for item in report.observations if item.code == "orientation_variance_exceeded"
     )
     assert orientation.measured_values["maximum_variance"] == pytest.approx(0.5)
     assert orientation.details["orientation_uncertainty"]["label"] == "preserved"
+    assert orientation.details["before_orientation_uncertainty"]["label"] == "preserved"
+    assert orientation.details["after_orientation_uncertainty"]["label"] == "preserved"
+    assert orientation.camera_timestamp_ns is not None
+    assert orientation.details["interpolation_fraction"] == pytest.approx(
+        orientation.camera_timestamp_ns / 4_000_000_000
+    )
+    assert orientation.details["sync_gap_before_ns"] == orientation.camera_timestamp_ns
+    assert orientation.details["sync_gap_after_ns"] == (
+        4_000_000_000 - orientation.camera_timestamp_ns
+    )
     sync = next(item for item in report.observations if item.code == "gnss_sync_gap_exceeded")
     assert sync.measured_values["maximum_endpoint_gap_ns"] == 3_999_999_900
     assert not report.final_candidates
@@ -175,6 +198,46 @@ def test_observation_first_engine_retains_every_reason_and_raw_measurement(
     assert all(sample.staged_image.path.is_file() for sample in result.samples)
     assert len(report.grid_audits) == 2
     assert report.grid_audits[1].batch_timestamp_ns is None
+
+
+def test_unselected_camera_timeline_violations_remain_in_recording_audit(
+    tmp_path: Path, config_factory: object
+) -> None:
+    result = _result(tmp_path)
+    calibration = _calibration()
+    unselected_timestamp = 3_000_000_100
+    unselected = RawCameraBatch(
+        unselected_timestamp,
+        unselected_timestamp,
+        3,
+        3,
+        "hevc",
+        4,
+        3,
+        (
+            RawCameraFrame(0, "front", 50, calibration),
+            RawCameraFrame(1, "rear", 5_000_000_100, calibration),
+            RawCameraFrame(2, "extra", 2_000_000_200, calibration),
+        ),
+    )
+    result = replace(result, camera_batches=(*result.camera_batches, unselected))
+
+    report = evaluate_validity(result, config_factory())  # type: ignore[operator]
+
+    unselected_observations = tuple(
+        item for item in report.observations
+        if item.batch_timestamp_ns == unselected_timestamp
+    )
+    assert [item.code for item in unselected_observations] == [
+        "camera_timestamp_non_monotonic",
+        "camera_timestamp_gap_exceeded",
+    ]
+    assert all(item.scope == "camera" for item in unselected_observations)
+    assert all(item.grid_target_timestamp_ns is None for item in unselected_observations)
+    assert not any(
+        item.batch_timestamp_ns == unselected_timestamp
+        for item in report.sample_audits[0].observations
+    )
 
 
 @pytest.mark.parametrize("enabled_code", INVALIDITY_CODES)

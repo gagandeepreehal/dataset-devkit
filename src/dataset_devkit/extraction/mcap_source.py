@@ -40,6 +40,20 @@ _GNSS_NUMERIC_FIELDS = {
     "orientation": ("roll_rad", "pitch_rad", "yaw_rad"),
     "position_error": ("east_sigma_m", "north_sigma_m", "up_sigma_m", "hdop"),
 }
+_PROTOBUF_NUMERIC_TYPES = {
+    FieldDescriptor.TYPE_DOUBLE,
+    FieldDescriptor.TYPE_FLOAT,
+    FieldDescriptor.TYPE_INT64,
+    FieldDescriptor.TYPE_UINT64,
+    FieldDescriptor.TYPE_INT32,
+    FieldDescriptor.TYPE_FIXED64,
+    FieldDescriptor.TYPE_FIXED32,
+    FieldDescriptor.TYPE_UINT32,
+    FieldDescriptor.TYPE_SFIXED32,
+    FieldDescriptor.TYPE_SFIXED64,
+    FieldDescriptor.TYPE_SINT32,
+    FieldDescriptor.TYPE_SINT64,
+}
 
 
 def _message_names(
@@ -418,7 +432,7 @@ def _validate_gnss_schema(descriptor: Descriptor) -> None:
                 field_type=FieldDescriptor.TYPE_DOUBLE,
                 repeated=False,
             )
-    _require_descriptor_field(
+    orientation_error = _require_descriptor_field(
         descriptor,
         context="GNSS",
         path="orientation_error",
@@ -426,6 +440,56 @@ def _validate_gnss_schema(descriptor: Descriptor) -> None:
         field_type=FieldDescriptor.TYPE_MESSAGE,
         repeated=False,
     )
+    if orientation_error.message_type is None:
+        raise StructuralExtractionError(
+            "GNSS schema field 'orientation_error' has no message descriptor"
+        )
+    _validate_orientation_error_schema(
+        cast(Descriptor, orientation_error.message_type),
+        path="orientation_error",
+        ancestors=frozenset(),
+    )
+
+
+def _validate_orientation_error_schema(
+    descriptor: Descriptor, *, path: str, ancestors: frozenset[str]
+) -> None:
+    if descriptor.full_name in ancestors:
+        raise StructuralExtractionError(
+            f"GNSS schema field {path!r} has a recursive message shape"
+        )
+    nested_ancestors = ancestors | {descriptor.full_name}
+    for field in descriptor.fields:
+        field_path = f"{path}.{field.name}"
+        if field.type == FieldDescriptor.TYPE_MESSAGE:
+            if field.message_type is None:
+                raise StructuralExtractionError(
+                    f"GNSS schema field {field_path!r} has no message descriptor"
+                )
+            _validate_orientation_error_schema(
+                cast(Descriptor, field.message_type),
+                path=field_path,
+                ancestors=nested_ancestors,
+            )
+        elif field.type not in _PROTOBUF_NUMERIC_TYPES:
+            raise StructuralExtractionError(
+                f"GNSS schema field {field_path!r} must be numeric or a nested numeric message"
+            )
+
+
+def _validate_orientation_error_values(message: Message, *, path: str) -> None:
+    for field, value in message.ListFields():
+        field_path = f"{path}.{field.name}"
+        values = value if field.is_repeated else (value,)
+        if field.type == FieldDescriptor.TYPE_MESSAGE:
+            for nested in values:
+                _validate_orientation_error_values(cast(Message, nested), path=field_path)
+            continue
+        for numeric in values:
+            if not math.isfinite(float(numeric)):
+                raise StructuralExtractionError(
+                    f"GNSS {field_path} numeric value must be finite"
+                )
 
 
 def _message_dict(message: Message) -> dict[str, Any]:
@@ -486,6 +550,9 @@ def _parse_gnss(message: Message) -> GnssSample:
             "orientation_error",
         ):
             raw.pop(known, None)
+        _validate_orientation_error_values(
+            cast(Message, dynamic.orientation_error), path="orientation_error"
+        )
         orientation_uncertainty = _message_dict(dynamic.orientation_error)
         return GnssSample(
             timestamp_ns=_timestamp_ns(message, "timestamp", "GNSS message"),

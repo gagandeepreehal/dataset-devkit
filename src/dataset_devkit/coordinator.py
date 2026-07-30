@@ -95,6 +95,9 @@ def _observed_context(
         {
             "code": item.code,
             "scope": item.scope,
+            "measured_values": item.measured_values,
+            "threshold": item.threshold,
+            "details": item.details,
             "enabled_as_invalidator": item.enabled_as_invalidator,
             "grid_target_timestamp_ns": item.grid_target_timestamp_ns,
             "batch_timestamp_ns": item.batch_timestamp_ns,

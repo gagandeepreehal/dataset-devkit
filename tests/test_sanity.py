@@ -81,3 +81,34 @@ def test_each_sanity_check_honors_error_warn_and_off(
         else:
             assert not report.observations
             assert not report.warnings
+
+
+@pytest.mark.parametrize("sample_policy", ["retain_for_audit", "drop"])
+def test_required_camera_coverage_uses_extracted_presence_before_policy_filtering(
+    tmp_path: Path,
+    config_factory: object,
+    sample_policy: Literal["retain_for_audit", "drop"],
+) -> None:
+    base = config_factory()  # type: ignore[operator]
+    config = base.model_copy(
+        update={
+            "frame_validity": base.frame_validity.model_copy(
+                update={
+                    "invalid_sample_policy": sample_policy,
+                    "required_cameras": ["front", "rear"],
+                }
+            ),
+            "sanity_checks": SanityChecksConfig(
+                empty_selected_grid="off",
+                empty_final_candidates="off",
+                all_gnss_sources_invalid="off",
+                zero_required_camera_coverage="warn",
+            ),
+        }
+    )
+    result = _result(tmp_path / sample_policy)
+    validity = evaluate_validity(result, config)
+
+    sanity = evaluate_sanity(result, validity, config)
+
+    assert not sanity.observations
