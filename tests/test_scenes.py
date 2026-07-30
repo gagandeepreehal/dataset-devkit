@@ -487,6 +487,38 @@ def test_merged_annotation_lineage_and_labels_follow_source_lines_not_time(
     assert window.labels == ("zebra", "alpha", "beta")
 
 
+def test_merged_window_uses_minimum_exact_boundary_when_index_ranges_tie(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    annotation_path = _annotations(
+        tmp_path / "sparse-boundaries.jsonl",
+        [
+            {"blob_path": SOURCE.blob_path, "timestamp_ns": 101, "labels": ["first-line"]},
+            {"blob_path": SOURCE.blob_path, "timestamp_ns": 100, "labels": ["second-line"]},
+        ],
+    )
+    config = _annotation_config(
+        config_factory(),
+        mode="annotation_only",
+        tolerance_ms=0,
+        before_s=0.00000005,
+        after_s=0.0000001,
+    )
+
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 100, 101, 200)),
+        SOURCE,
+        config,
+        annotations_path=annotation_path,
+    )
+
+    assert len(result.annotation_windows) == 1
+    window = result.annotation_windows[0]
+    assert window.first_timestamp_ns == 50
+    assert window.annotation_tokens == tuple(item.token for item in result.annotations)
+    validate_scene_graph(result)
+
+
 def test_hybrid_annotation_range_splits_automatic_runs_without_sample_reuse(
     tmp_path: Path, config_factory: Callable[[], GlobalConfig]
 ) -> None:
@@ -810,6 +842,51 @@ def test_validator_seals_annotation_matches_windows_and_build_config(
         )
     with pytest.raises(StructuralExtractionError, match="build configuration"):
         validate_scene_graph(replace(result, annotation_before_ns=1))
+
+
+def test_validator_seals_annotation_uuid_scene_source_and_sample_batch_timestamp(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    annotation_path = _annotations(
+        tmp_path / "identity-seals.jsonl",
+        [{"blob_path": SOURCE.blob_path, "timestamp_ns": 0, "labels": ["original"]}],
+    )
+    config = _annotation_config(
+        config_factory(), mode="annotation_only", tolerance_ms=0, before_s=0, after_s=0
+    )
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1)),
+        SOURCE,
+        config,
+        annotations_path=annotation_path,
+    )
+
+    with pytest.raises(StructuralExtractionError, match="annotation.*token|UUID|identity"):
+        validate_scene_graph(
+            replace(
+                result,
+                annotations=(replace(result.annotations[0], labels=("mutated",)),),
+            )
+        )
+    with pytest.raises(StructuralExtractionError, match="source.*blob"):
+        validate_scene_graph(
+            replace(
+                result,
+                scenes=(replace(result.scenes[0], source_blob_path="mcap-h265/other.mcap"),),
+            )
+        )
+    with pytest.raises(StructuralExtractionError, match="batch timestamp"):
+        validate_scene_graph(
+            replace(
+                result,
+                samples=(
+                    replace(
+                        result.samples[0],
+                        batch_timestamp_ns=result.samples[0].batch_timestamp_ns + 1,
+                    ),
+                ),
+            )
+        )
 
 
 def test_annotation_index_is_precomputed_and_large_matching_is_stable(

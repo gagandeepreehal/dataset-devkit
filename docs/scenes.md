@@ -111,8 +111,10 @@ separate; Task 6 computed tags are not present.
 
 Every graph embeds immutable `source_samples` records derived from Task 4 final candidates. Each
 record contains one logical timestamp, its canonical sorted nonempty expected camera-channel set,
-and its valid-run identity. Sample data carries the complete immutable staged-image evidence rather
-than only a local path.
+the selected batch timestamp, and its valid-run identity. Sample data carries the complete immutable
+staged-image evidence rather than only a local path. Validation binds each sample's batch timestamp
+back to this source evidence, recomputes annotation UUIDs, and requires every scene's exact source
+blob path.
 `validate_scene_graph` checks globally unique tokens, foreign references, endpoint/count/order
 consistency, symmetric acyclic chains, within-scene channel chains and real pose timestamps,
 exactly one sample-data record per expected channel, no missing/extra/duplicate channel, unique

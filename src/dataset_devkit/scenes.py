@@ -675,6 +675,7 @@ def build_recording_scenes(
     source_samples = tuple(
         SourceSampleRecord(
             item.grid_target_timestamp_ns,
+            item.batch_timestamp_ns,
             tuple(sorted(camera.camera_name for camera in item.samples)),
             index.run_id_by_position[position],
         )
@@ -811,6 +812,20 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
     source_runs = {run_id: tuple(values) for run_id, values in source_run_lists.items()}
     annotations = {item.token: item for item in result.annotations}
     windows = {item.token: item for item in result.annotation_windows}
+    for annotation in result.annotations:
+        expected_annotation_token = _token(
+            result.dataset_namespace,
+            "annotation",
+            [
+                result.source.to_dict(),
+                annotation.line_number,
+                annotation.blob_path,
+                annotation.timestamp_ns,
+                annotation.labels,
+            ],
+        )
+        if annotation.token != expected_annotation_token:
+            raise StructuralExtractionError("annotation token identity is inconsistent")
     expected_config_token = _token(
         result.dataset_namespace,
         "scene-build-config",
@@ -930,7 +945,7 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         sample_timestamps = source_runs[group[0].run_id][
             group[0].start_index : expected_group_end_index[group_index]
         ]
-        expected_first = group[0].first_ns
+        expected_first = min(item.first_ns for item in group)
         expected_last = expected_group_last_ns[group_index]
         expected_window_token = _token(
             result.dataset_namespace,
@@ -1022,6 +1037,8 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         zip(result.scenes, expected_partitions, strict=True)
     ):
         members = samples_by_scene.get(scene.token, [])
+        if scene.source_blob_path != result.source.blob_path:
+            raise StructuralExtractionError("scene source blob path is inconsistent")
         expected_scene_token = _token(
             result.dataset_namespace,
             "scene",
@@ -1055,6 +1072,11 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         ):
             raise StructuralExtractionError("scene sample endpoints/count/order are inconsistent")
         for index, member in enumerate(members):
+            if (
+                member.batch_timestamp_ns
+                != source_by_timestamp[member.timestamp_ns].batch_timestamp_ns
+            ):
+                raise StructuralExtractionError("sample batch timestamp evidence is inconsistent")
             expected_sample_token = _token(
                 result.dataset_namespace,
                 "sample",

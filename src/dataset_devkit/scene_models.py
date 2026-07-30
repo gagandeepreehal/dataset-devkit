@@ -117,6 +117,7 @@ class UnassignedSample:
 @dataclass(frozen=True)
 class SourceSampleRecord:
     timestamp_ns: int
+    batch_timestamp_ns: int
     expected_channels: tuple[str, ...]
     valid_run_id: int
 
