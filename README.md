@@ -8,8 +8,8 @@ selection, GNSS interpolation, and verified JPEG staging are a separate focused 
 validity/sanity policy, safe quarantine reports, independent-recording partial-export gating,
 deterministic automatic/annotation/hybrid scene graphs, real-timestamp features and tags,
 exact-quota scenario selection, and auditable scene-level train/test splitting are implemented.
-Deterministic nuScenes export and an indexed read-only Dataset SDK are also implemented;
-validation and atomic publication remain later stages.
+Deterministic nuScenes export, comprehensive validation, an indexed read-only Dataset SDK,
+content manifests, and no-overwrite atomic publication are implemented as one standalone pipeline.
 
 ## Install for development
 
@@ -36,9 +36,16 @@ dataset-devkit validate --dataroot DATASET --version v1.0-trainval
 dataset-devkit inspect --dataroot DATASET --version v1.0-trainval
 ```
 
-The command parsers and explicit service boundaries exist now. Build, validation, and
-inspection services intentionally report that they are not implemented until their pipeline
-tasks land.
+Each command prints one concise deterministic JSON object to stdout. Configuration/usage failures
+exit 2; operational or validation failures exit 1 with one safe stderr diagnostic and no normal
+traceback. A successful build publishes at `paths.output_dir/v1.0-trainval`; the dataroot itself
+contains the `v1.0-trainval/`, `samples/`, `maps/`, and `mz_extensions/` children.
+
+Builds run in a uniquely named sibling `.v1.0-trainval.staging-*` directory. Tables, assets,
+extensions, official-SDK smoke loading, and the final manifest are validated before one atomic
+rename. Existing final dataroots are never overwritten. An invocation-owned staging directory is
+removed after an ordinary failure; if identity-safe cleanup cannot be proven, it is deliberately
+left for operator recovery instead of deleting an ambiguous path.
 
 The secure cache backend is supported on POSIX platforms only. It requires POSIX file locks and
 descriptor-relative, no-follow filesystem operations; Windows is not a supported runtime.
@@ -76,7 +83,16 @@ filtering, and deterministic exact-quota scenario rules.
 
 See [export.md](docs/export.md) for the official nuScenes table layout, exact timestamp and image
 copy rules, loader-required non-semantic map compatibility scaffold, extension tables, exporter
-evidence boundary, and Dataset SDK methods.
+evidence boundary, validation/manifest semantics, atomic publication, and Dataset SDK methods.
+
+All recordings are attempted independently. Any acquisition, extraction, validity, or sanity
+failure is quarantined and blocks publication by default. Setting
+`execution.allow_partial_export` to `true` permits successful recordings only when every failure
+report was durably quarantined; the resulting build JSON explicitly reports `partial: true` and
+the failed blob names. Managed identity is always supplied by `DefaultAzureCredential`; secrets,
+SAS URLs, account keys, and connection strings are prohibited in configuration. The optional
+one-blob Azure smoke procedure is documented in
+[configuration.md](docs/configuration.md#managed-identity-smoke-check).
 
 ## Scene-level train/test split
 

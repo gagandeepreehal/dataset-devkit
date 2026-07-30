@@ -235,7 +235,7 @@ class DownsamplingConfig(StrictModel):
 
 
 class ImageConfig(StrictModel):
-    jpeg_quality: int = Field(ge=1, le=100)
+    jpeg_quality: Literal[95]
 
 
 class GnssConfig(StrictModel):
@@ -702,8 +702,8 @@ class QuarantineConfig(StrictModel):
 
 
 class PublicationConfig(StrictModel):
-    version: SafeSegment
-    refuse_overwrite: bool
+    version: Literal["v1.0-trainval"]
+    refuse_overwrite: Literal[True]
 
 
 class GlobalConfig(StrictModel):

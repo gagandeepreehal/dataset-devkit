@@ -402,12 +402,30 @@ def test_explicit_credential_field_names_are_rejected(
 def test_bearer_prefixed_ordinary_strings_and_paths_are_allowed(tmp_path: Path) -> None:
     data = minimal_config()
     set_nested(data, "annotations.path", "bearer archive/annotations.jsonl")
-    set_nested(data, "publication.version", "bearer migration archive for July recordings")
+    set_nested(data, "topics.camera", "bearer migration archive for July recordings")
 
     config = load_config(write_config(tmp_path, data))
 
     assert config.annotations.path.name == "annotations.jsonl"
-    assert config.publication.version == "bearer migration archive for July recordings"
+    assert config.topics.camera == "bearer migration archive for July recordings"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("image.jpeg_quality", 94),
+        ("publication.version", "v1.0-mini"),
+        ("publication.refuse_overwrite", False),
+    ],
+)
+def test_v1_publication_contract_is_exact(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    data = minimal_config()
+    set_nested(data, field, value)
+
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, data))
 
 
 @pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER"])

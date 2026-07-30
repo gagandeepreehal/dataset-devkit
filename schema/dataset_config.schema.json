@@ -538,8 +538,7 @@
       "additionalProperties": false,
       "properties": {
         "jpeg_quality": {
-          "maximum": 100,
-          "minimum": 1,
+          "const": 95,
           "title": "Jpeg Quality",
           "type": "integer"
         }
@@ -628,12 +627,12 @@
       "additionalProperties": false,
       "properties": {
         "refuse_overwrite": {
+          "const": true,
           "title": "Refuse Overwrite",
           "type": "boolean"
         },
         "version": {
-          "minLength": 1,
-          "pattern": "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$",
+          "const": "v1.0-trainval",
           "title": "Version",
           "type": "string"
         }

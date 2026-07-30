@@ -59,7 +59,7 @@ are not treated as credentials merely because their text contains words such as 
   overlap between any pair is rejected to prevent accidental corruption.
 - `topics`: nonblank logical camera and GNSS topic/channel names.
 - `downsampling`: positive target FPS and non-negative timestamp tolerance.
-- `image`: JPEG quality from 1 through 100.
+- `image`: exact JPEG quality `95`, matching the native staging encoder's v1 contract.
 - `gnss`: non-negative position, orientation-variance, and synchronization thresholds.
 - `frame_validity`: `retain_for_audit`/`drop`, exact required camera identities, a positive
   per-camera timestamp-gap limit, and eight independent typed invalidator toggles. Unknown reason
@@ -88,8 +88,8 @@ are not treated as credentials merely because their text contains words such as 
 - `quarantine`: mandatory `enabled: true`, an isolated output directory, and a basename-only
   rejection-manifest filename. The directory cannot overlap work, cache, or output; disabling
   quarantine is rejected because every failed recording must receive a report.
-- `publication`: safe single-segment public dataset version and overwrite refusal. Cross-platform
-  safety rejects traversal, Windows reserved device stems, and names ending in a dot or space.
+- `publication`: exact version `v1.0-trainval` and mandatory `refuse_overwrite: true`. The v1
+  publisher never replaces an existing dataset, symlink, file, or directory.
 
 ## Authoritative validation
 

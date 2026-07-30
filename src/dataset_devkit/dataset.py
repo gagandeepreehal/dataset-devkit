@@ -156,6 +156,7 @@ class Dataset:
             "split",
             "config",
             "content_manifest",
+            "pipeline_audit",
         ):
             extensions[name] = _load_json(root / "mz_extensions" / f"{name}.json")
         object.__setattr__(self, "_tables", MappingProxyType(tables))
@@ -430,4 +431,11 @@ class Dataset:
         value = self._extensions["validation"]
         if not isinstance(value, dict):
             raise DatasetFormatError("validation extension is malformed")
+        return deepcopy(cast(JsonRecord, value))
+
+    def pipeline_audit(self) -> JsonRecord:
+        """Return filtering, rejection, and ordered scenario-selection evidence."""
+        value = self._extensions["pipeline_audit"]
+        if not isinstance(value, dict):
+            raise DatasetFormatError("pipeline audit extension is malformed")
         return deepcopy(cast(JsonRecord, value))

@@ -39,8 +39,42 @@ and camera-time ego poses are required and must be finite.
 
 `mz_extensions` contains canonical `recordings.json`, `gnss.json`, `validity.json`,
 `validation.json`, `tags.json`, `annotations.json`, `split.json`, `config.json`, and
-`content_manifest.json`. Computed tags and human labels stay separate. Before Task 9 runs,
+`content_manifest.json`, plus `pipeline_audit.json` for filtering, rejection, and ordered
+scenario-selection evidence. Computed tags and human labels stay separate. Before Task 9 runs,
 `validation.json` truthfully records `state: "not_run"` and never claims success.
+
+## Final validation, manifest, and publication
+
+The build service first validates token uniqueness, all official foreign keys, scene/sample and
+per-camera chain symmetry/acyclicity/endpoints/timestamps, required-camera coverage, JPEG
+existence/decodability/dimensions, finite pose/calibration values, normalized quaternions,
+compatibility map/log links, extension references, and full disjoint split assignment. It then
+must instantiate the official `NuScenes` loader, query the first selected scene/sample/camera,
+and open the resolved image. Empty selected datasets cannot be published.
+
+Only after those checks does finalization replace `validation.json` with deterministic success
+evidence. `content_manifest.json` is written last and lists every published single-link regular
+file by sorted relative POSIX path, byte size, and SHA-256. The manifest excludes only itself,
+records that exclusion explicitly, and hashes the canonical entry list as `root_sha256`. It has
+no timestamp or staging/final absolute path, so the same inputs produce the same content hash.
+Revalidation rejects missing, extra, changed, linked, or identity-raced content.
+
+The final dataroot is `paths.output_dir/v1.0-trainval`. A successful staging tree is flushed and
+renamed atomically from its sibling directory. `publication.version` must be
+`v1.0-trainval`, `publication.refuse_overwrite` must be `true`, and `image.jpeg_quality` must be
+`95` in the v1 contract. Existing destinations, symlinks, and unsafe directory replacements are
+rejected rather than overwritten.
+
+Run validation and deterministic read-only inspection with:
+
+```bash
+dataset-devkit validate --dataroot DATASET --version v1.0-trainval
+dataset-devkit inspect --dataroot DATASET --version v1.0-trainval
+```
+
+Inspection reports official table and image counts, normalized camera channels, recording and
+train/test counts, final validation state, and the root content hash. It validates first and does
+not manufacture summaries from malformed content.
 
 ## Read-only SDK
 
@@ -57,7 +91,7 @@ duplicate tokens. Its stable methods are:
   `annotation_scene_references()`, individual annotation resolvers, and
   `scene_annotation_evidence(scene_token)`;
 - `split(scene_token)` and `scenes_in_split("train" | "test")`;
-- `recordings()` and `validation_report()`.
+- `recordings()`, `validation_report()`, and `pipeline_audit()`.
 
 Camera lookup uses a load-time validated `(sample_token, channel)` index, requires exactly one row,
 and rejects missing, malformed, or ambiguous references. Every returned table, record, traversal,

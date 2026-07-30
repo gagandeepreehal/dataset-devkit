@@ -298,6 +298,7 @@ class ExportEvidence:
     split: SceneSplitResult
     resolved_config: GlobalConfig
     content_manifest: object
+    pipeline_audit: object | None = None
 
 
 @dataclass(frozen=True)
@@ -612,6 +613,8 @@ def _validate_boundary(evidence: ExportEvidence) -> None:
         raise ValueError("scene graph namespace differs from resolved config")
     # Ensure the supplied content manifest is canonicalizable and finite.
     canonical_json(evidence.content_manifest)
+    if evidence.pipeline_audit is not None:
+        canonical_json(evidence.pipeline_audit)
 
 
 def _selected_records(
@@ -973,6 +976,20 @@ def _export_into(
         writer,
         ("mz_extensions", "config.json"),
         evidence.resolved_config.model_dump(mode="json"),
+    )
+    pipeline_audit = evidence.pipeline_audit or {
+        "schema_version": 1,
+        "filter": {"state": "not_provided_to_direct_export"},
+        "selection": {
+            "assignments": _jsonable(evidence.selection.assignments),
+            "rule_audits": _jsonable(evidence.selection.rule_audits),
+            "unselected": _jsonable(evidence.selection.unselected),
+        },
+    }
+    _write_json(
+        writer,
+        ("mz_extensions", "pipeline_audit.json"),
+        pipeline_audit,
     )
     manifest_bytes = _write_json(
         writer,
