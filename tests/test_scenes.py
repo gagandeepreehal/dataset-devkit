@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import replace
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 from uuid import UUID
@@ -99,17 +100,27 @@ def _report(tmp_path: Path, timestamps: tuple[int, ...]) -> ValidityReport:
 
 
 def _config(base: GlobalConfig, **scene_changes: object) -> GlobalConfig:
+    decimal_fields = {
+        "min_duration_s",
+        "max_duration_s",
+        "max_sample_gap_ms",
+        "skip_between_scenes_s",
+    }
+    scene_changes = {
+        key: Decimal(str(value)) if key in decimal_fields else value
+        for key, value in scene_changes.items()
+    }
     return base.model_copy(
         update={
             "scenes": base.scenes.model_copy(
                 update={
                     "mode": "automatic",
                     "dataset_namespace": UUID("8d55f58b-4a7b-5a9a-a95a-a3989610795b"),
-                    "min_duration_s": 0.0,
-                    "max_duration_s": 2.0,
+                    "min_duration_s": Decimal("0"),
+                    "max_duration_s": Decimal("2"),
                     "min_samples": 1,
-                    "max_sample_gap_ms": 1000.0,
-                    "skip_between_scenes_s": 0.0,
+                    "max_sample_gap_ms": Decimal("1000"),
+                    "skip_between_scenes_s": Decimal("0"),
                     **scene_changes,
                 }
             )
@@ -130,9 +141,9 @@ def _annotation_config(
         update={
             "annotations": base.annotations.model_copy(
                 update={
-                    "match_tolerance_ms": tolerance_ms,
-                    "before_s": before_s,
-                    "after_s": after_s,
+                    "match_tolerance_ms": Decimal(str(tolerance_ms)),
+                    "before_s": Decimal(str(before_s)),
+                    "after_s": Decimal(str(after_s)),
                 }
             )
         }
@@ -339,6 +350,44 @@ def test_annotation_windows_clip_to_runs_and_merge_overlap_with_lineage(
     assert all(scene.nbr_samples >= 1 for scene in result.scenes)
 
 
+def test_merged_annotation_lineage_and_labels_follow_source_lines_not_time(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    annotation_path = _annotations(
+        tmp_path / "reverse-annotations.jsonl",
+        [
+            {
+                "blob_path": SOURCE.blob_path,
+                "timestamp_ns": 2_000_000_000,
+                "labels": ["zebra", "alpha"],
+            },
+            {
+                "blob_path": SOURCE.blob_path,
+                "timestamp_ns": 1_000_000_000,
+                "labels": ["alpha", "beta"],
+            },
+        ],
+    )
+    config = _annotation_config(
+        config_factory(),
+        mode="annotation_only",
+        tolerance_ms=0.0,
+        before_s=1.0,
+        after_s=1.0,
+    )
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1_000_000_000, 2_000_000_000, 3_000_000_000)),
+        SOURCE,
+        config,
+        annotations_path=annotation_path,
+    )
+
+    assert len(result.annotation_windows) == 1
+    window = result.annotation_windows[0]
+    assert window.annotation_tokens == tuple(item.token for item in result.annotations)
+    assert window.labels == ("zebra", "alpha", "beta")
+
+
 def test_hybrid_annotation_range_splits_automatic_runs_without_sample_reuse(
     tmp_path: Path, config_factory: Callable[[], GlobalConfig]
 ) -> None:
@@ -357,10 +406,10 @@ def test_hybrid_annotation_range_splits_automatic_runs_without_sample_reuse(
         update={
             "scenes": config.scenes.model_copy(
                 update={
-                    "min_duration_s": 1.0,
-                    "max_duration_s": 10.0,
+                    "min_duration_s": Decimal("1"),
+                    "max_duration_s": Decimal("10"),
                     "min_samples": 2,
-                    "max_sample_gap_ms": 2000.0,
+                    "max_sample_gap_ms": Decimal("2000"),
                 }
             )
         }
@@ -409,10 +458,10 @@ def test_annotation_only_and_automatic_have_explicit_opposite_coverage(
         update={
             "scenes": automatic.scenes.model_copy(
                 update={
-                    "min_duration_s": 0.0,
+                    "min_duration_s": Decimal("0"),
                     "min_samples": 1,
-                    "max_duration_s": 10.0,
-                    "max_sample_gap_ms": 1000.0,
+                    "max_duration_s": Decimal("10"),
+                    "max_sample_gap_ms": Decimal("1000"),
                 }
             )
         }
@@ -443,7 +492,7 @@ def test_uuid_tokens_change_for_namespace_source_and_scene_config_not_local_stag
         }
     )
     changed_config = config.model_copy(
-        update={"scenes": config.scenes.model_copy(update={"max_duration_s": 3.0})}
+        update={"scenes": config.scenes.model_copy(update={"max_duration_s": Decimal("3")})}
     )
     changed_source = replace(SOURCE, etag='"other"')
 
@@ -557,3 +606,52 @@ def test_actual_task4_invalid_audit_and_grid_miss_never_enter_scenes(
     assert result.scenes == ()
     assert result.samples == ()
     assert result.sample_data == ()
+
+
+def test_graph_validator_seals_source_coverage_and_expected_camera_channels(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1_000_000_000)), SOURCE, _config(config_factory())
+    )
+    assert [(item.timestamp_ns, item.expected_channels) for item in result.source_samples] == [
+        (0, ("front", "rear")),
+        (1_000_000_000, ("front", "rear")),
+    ]
+
+    with pytest.raises(StructuralExtractionError, match="sample_data.*coverage|channel"):
+        validate_scene_graph(replace(result, sample_data=()))
+    with pytest.raises(StructuralExtractionError, match="sample_data.*coverage|channel"):
+        validate_scene_graph(replace(result, sample_data=result.sample_data[1:]))
+
+    original = result.sample_data[0]
+    duplicate_channel = replace(original, token="00000000-0000-5000-8000-000000000001")
+    with pytest.raises(StructuralExtractionError, match="duplicate.*channel|coverage"):
+        validate_scene_graph(replace(result, sample_data=(*result.sample_data, duplicate_channel)))
+
+    extra_channel = replace(
+        original,
+        token="00000000-0000-5000-8000-000000000002",
+        channel="unexpected",
+        prev="",
+        next="",
+    )
+    with pytest.raises(StructuralExtractionError, match="coverage|extra"):
+        validate_scene_graph(replace(result, sample_data=(*result.sample_data, extra_channel)))
+
+    with pytest.raises(StructuralExtractionError, match="token collision"):
+        validate_scene_graph(replace(result, sample_data=(*result.sample_data, original)))
+
+    with pytest.raises(StructuralExtractionError, match="coverage"):
+        validate_scene_graph(replace(result, source_samples=result.source_samples[:-1]))
+
+
+def test_graph_validator_rejects_duplicate_unassigned_timestamps(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _config(config_factory(), min_duration_s=Decimal("1"), min_samples=2)
+    result = build_recording_scenes(_report(tmp_path, (0,)), SOURCE, config)
+    assert len(result.unassigned) == 1
+
+    with pytest.raises(StructuralExtractionError, match="duplicate unassigned"):
+        validate_scene_graph(replace(result, unassigned=(*result.unassigned, result.unassigned[0])))

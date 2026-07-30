@@ -6,11 +6,11 @@ import json
 import re
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import parse_qsl, urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema, field_validator, model_validator
 
 from dataset_devkit.identifiers import SafeSegment
 
@@ -268,21 +268,35 @@ class SanityChecksConfig(StrictModel):
     zero_required_camera_coverage: Literal["error", "warn", "off"] = "error"
 
 
-def _exact_nanoseconds(value: float, multiplier: int, field_name: str) -> int:
-    converted = Decimal(str(value)) * multiplier
+def _exact_nanoseconds(value: Decimal, multiplier: int, field_name: str) -> int:
+    if not value.is_finite():
+        raise ValueError(f"{field_name} must be finite")
+    converted = value * multiplier
     if converted != converted.to_integral_value():
         raise ValueError(f"{field_name} must resolve to an exact integer number of nanoseconds")
     return int(converted)
 
 
+PositiveExactDecimal = Annotated[
+    Decimal,
+    Field(gt=0),
+    WithJsonSchema({"type": "number", "exclusiveMinimum": 0}),
+]
+NonnegativeExactDecimal = Annotated[
+    Decimal,
+    Field(ge=0),
+    WithJsonSchema({"type": "number", "minimum": 0}),
+]
+
+
 class ScenesConfig(StrictModel):
     mode: Literal["automatic", "annotation_only", "hybrid"] = "hybrid"
     dataset_namespace: UUID
-    min_duration_s: float = Field(gt=0)
-    max_duration_s: float = Field(gt=0)
+    min_duration_s: PositiveExactDecimal
+    max_duration_s: PositiveExactDecimal
     min_samples: int = Field(ge=1)
-    max_sample_gap_ms: float = Field(ge=0)
-    skip_between_scenes_s: float = Field(ge=0)
+    max_sample_gap_ms: NonnegativeExactDecimal
+    skip_between_scenes_s: NonnegativeExactDecimal
 
     @model_validator(mode="after")
     def validate_duration_range(self) -> ScenesConfig:
@@ -333,15 +347,13 @@ class ScenesConfig(StrictModel):
 
 class AnnotationsConfig(StrictModel):
     path: Path
-    match_tolerance_ms: float = Field(ge=0)
-    before_s: float = Field(ge=0)
-    after_s: float = Field(ge=0)
+    match_tolerance_ms: NonnegativeExactDecimal
+    before_s: NonnegativeExactDecimal
+    after_s: NonnegativeExactDecimal
 
     @property
     def match_tolerance_ns(self) -> int:
-        return _exact_nanoseconds(
-            self.match_tolerance_ms, 1_000_000, "match_tolerance_ms"
-        )
+        return _exact_nanoseconds(self.match_tolerance_ms, 1_000_000, "match_tolerance_ms")
 
     @property
     def before_ns(self) -> int:
@@ -515,9 +527,32 @@ class GlobalConfig(StrictModel):
 def load_config(path: Path) -> GlobalConfig:
     """Load configuration and resolve paths relative to its JSON file."""
     config_path = path.resolve()
-    data = json.loads(config_path.read_text(encoding="utf-8"))
+    text = config_path.read_text(encoding="utf-8")
+    data = json.loads(text)
     if not isinstance(data, dict):
         raise ConfigRootError("configuration must be a top-level JSON object")
+    exact_data = json.loads(text, parse_float=Decimal)
+    if isinstance(exact_data, dict):
+        for section, fields in (
+            (
+                "scenes",
+                (
+                    "min_duration_s",
+                    "max_duration_s",
+                    "max_sample_gap_ms",
+                    "skip_between_scenes_s",
+                ),
+            ),
+            ("annotations", ("match_tolerance_ms", "before_s", "after_s")),
+        ):
+            normal_section = data.get(section)
+            exact_section = exact_data.get(section)
+            if isinstance(normal_section, dict) and isinstance(exact_section, dict):
+                for field in fields:
+                    exact_value = exact_section.get(field)
+                    if isinstance(exact_value, int) and not isinstance(exact_value, bool):
+                        exact_value = Decimal(exact_value)
+                    normal_section[field] = exact_value
     base = config_path.parent
     quarantine_data = data.setdefault("quarantine", {})
     if isinstance(quarantine_data, dict):

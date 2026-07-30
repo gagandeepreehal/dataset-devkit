@@ -53,7 +53,8 @@ are not treated as credentials merely because their text contains words such as 
   `zero_required_camera_coverage`. Unknown check names and other policy words are rejected.
 - `scenes`: exact `automatic`, `annotation_only`, or default `hybrid` mode; stable dataset UUID
   namespace; duration bounds; sample minimum; gap limit; and scene spacing. Decimal time values
-  must resolve exactly to integer nanoseconds.
+  are parsed from exact JSON numeric text and must resolve exactly to integer nanoseconds. Direct
+  model-validation callers use `Decimal`; `load_config` remains the authoritative JSON boundary.
 - `annotations`: safely resolved relative JSONL path, nearest-match tolerance, and before/after
   windows. See [scenes.md](scenes.md) for the strict line format and matching algorithm.
 - `tags`: stationary-speed and turn-angle thresholds.

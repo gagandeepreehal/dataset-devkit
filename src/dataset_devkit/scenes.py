@@ -23,6 +23,7 @@ from dataset_devkit.scene_models import (
     SampleDataRecord,
     SampleRecord,
     SceneRecord,
+    SourceSampleRecord,
     UnassignedSample,
 )
 from dataset_devkit.validity import LogicalSampleAudit, ValidityReport
@@ -214,14 +215,15 @@ def _annotation_state(
     windows: list[AnnotationWindow] = []
     samples_by_window: dict[str, tuple[LogicalSampleAudit, ...]] = {}
     for group in merged:
+        lineage = sorted(group, key=lambda item: item.annotation.line_number)
         first_ns = min(item.first_ns for item in group)
         last_ns = max(item.last_ns for item in group)
         grouped_samples = {
             sample.grid_target_timestamp_ns: sample for item in group for sample in item.samples
         }
         ordered_samples = tuple(grouped_samples[key] for key in sorted(grouped_samples))
-        annotation_tokens = tuple(item.annotation.token for item in group)
-        labels = tuple(dict.fromkeys(label for item in group for label in item.annotation.labels))
+        annotation_tokens = tuple(item.annotation.token for item in lineage)
+        labels = tuple(dict.fromkeys(label for item in lineage for label in item.annotation.labels))
         window_token = _token(
             namespace,
             "annotation-window",
@@ -503,8 +505,16 @@ def build_recording_scenes(
         )
     )
     scenes, samples, sample_data = _materialize(ordered_candidates, source, config)
+    source_samples = tuple(
+        SourceSampleRecord(
+            item.grid_target_timestamp_ns,
+            tuple(camera.camera_name for camera in item.samples),
+        )
+        for item in final_samples
+    )
     result = RecordingSceneResult(
         source,
+        source_samples,
         scenes,
         samples,
         sample_data,
@@ -513,9 +523,7 @@ def build_recording_scenes(
         windows,
         tuple(sorted(unassigned, key=lambda item: item.timestamp_ns)),
     )
-    validate_scene_graph(
-        result, expected_final_timestamps={item.grid_target_timestamp_ns for item in final_samples}
-    )
+    validate_scene_graph(result)
     return result
 
 
@@ -544,9 +552,7 @@ def _validate_chain(
             current = by_token[current.next]
 
 
-def validate_scene_graph(
-    result: RecordingSceneResult, *, expected_final_timestamps: set[int] | None = None
-) -> None:
+def validate_scene_graph(result: RecordingSceneResult) -> None:
     """Structural validation for scene/sample/sample-data and annotation references."""
     all_tokens = [item.token for item in result.scenes]
     all_tokens += [item.token for item in result.samples]
@@ -557,7 +563,23 @@ def validate_scene_graph(
         raise StructuralExtractionError("scene graph contains a token collision")
     scenes = {item.token: item for item in result.scenes}
     samples = {item.token: item for item in result.samples}
-    annotations = {item.token for item in result.annotations}
+    source_by_timestamp = {item.timestamp_ns: item for item in result.source_samples}
+    if len(source_by_timestamp) != len(result.source_samples):
+        raise StructuralExtractionError("source coverage contains duplicate logical timestamps")
+    source_timestamps = tuple(item.timestamp_ns for item in result.source_samples)
+    if any(
+        current <= previous
+        for previous, current in zip(source_timestamps, source_timestamps[1:], strict=False)
+    ):
+        raise StructuralExtractionError("source coverage timestamps are not strictly ordered")
+    for source_record in result.source_samples:
+        if not source_record.expected_channels or len(source_record.expected_channels) != len(
+            set(source_record.expected_channels)
+        ):
+            raise StructuralExtractionError(
+                "source sample expected channel coverage is empty or duplicated"
+            )
+    annotations = {item.token: item for item in result.annotations}
     windows = {item.token: item for item in result.annotation_windows}
     for scene in result.scenes:
         members = sorted(
@@ -600,6 +622,7 @@ def validate_scene_graph(
         raise StructuralExtractionError("sample has a foreign scene reference")
     _validate_chain(result.samples, "sample")
     data_groups: dict[tuple[str, str], list[SampleDataRecord]] = defaultdict(list)
+    data_by_sample: dict[str, list[SampleDataRecord]] = defaultdict(list)
     for item in result.sample_data:
         sample = samples.get(item.sample_token)
         if sample is None or sample.scene_token != item.scene_token:
@@ -607,6 +630,16 @@ def validate_scene_graph(
         if item.ego_pose.timestamp_ns != item.timestamp_ns:
             raise StructuralExtractionError("sample_data does not preserve real pose timestamp")
         data_groups[(item.scene_token, item.channel)].append(item)
+        data_by_sample[item.sample_token].append(item)
+    for sample in result.samples:
+        expected = source_by_timestamp.get(sample.timestamp_ns)
+        if expected is None:
+            raise StructuralExtractionError("assigned sample is outside expected source coverage")
+        actual_channels = tuple(item.channel for item in data_by_sample[sample.token])
+        if len(actual_channels) != len(set(actual_channels)):
+            raise StructuralExtractionError("sample_data contains a duplicate sample channel")
+        if set(actual_channels) != set(expected.expected_channels):
+            raise StructuralExtractionError("sample_data channel coverage is missing or extra")
     for group in data_groups.values():
         ordered = sorted(group, key=lambda item: samples[item.sample_token].timestamp_ns)
         if any(
@@ -630,12 +663,26 @@ def validate_scene_graph(
     for window in result.annotation_windows:
         if any(reference not in annotations for reference in window.annotation_tokens):
             raise StructuralExtractionError("annotation window has a foreign annotation reference")
+        lineage = tuple(annotations[reference] for reference in window.annotation_tokens)
+        if tuple(item.line_number for item in lineage) != tuple(
+            sorted(item.line_number for item in lineage)
+        ):
+            raise StructuralExtractionError("annotation window lineage is not in source line order")
+        expected_labels = tuple(
+            dict.fromkeys(label for annotation in lineage for label in annotation.labels)
+        )
+        if window.labels != expected_labels:
+            raise StructuralExtractionError("annotation window label lineage is inconsistent")
         if window.first_sample_timestamp_ns > window.last_sample_timestamp_ns:
             raise StructuralExtractionError("annotation window sample endpoints are reversed")
     assigned = [item.timestamp_ns for item in result.samples]
     if len(assigned) != len(set(assigned)):
         raise StructuralExtractionError("a logical sample is claimed by multiple scenes")
-    if expected_final_timestamps is not None:
-        unassigned = {item.timestamp_ns for item in result.unassigned}
-        if set(assigned) & unassigned or set(assigned) | unassigned != expected_final_timestamps:
-            raise StructuralExtractionError("scene graph coverage is inconsistent")
+    unassigned_timestamps = [item.timestamp_ns for item in result.unassigned]
+    if len(unassigned_timestamps) != len(set(unassigned_timestamps)):
+        raise StructuralExtractionError("scene graph contains duplicate unassigned timestamps")
+    assigned_set = set(assigned)
+    unassigned_set = set(unassigned_timestamps)
+    expected_set = set(source_by_timestamp)
+    if assigned_set & unassigned_set or assigned_set | unassigned_set != expected_set:
+        raise StructuralExtractionError("scene graph source coverage is inconsistent")

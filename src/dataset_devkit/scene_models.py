@@ -110,8 +110,15 @@ class UnassignedSample:
 
 
 @dataclass(frozen=True)
+class SourceSampleRecord:
+    timestamp_ns: int
+    expected_channels: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RecordingSceneResult:
     source: SourceFingerprint
+    source_samples: tuple[SourceSampleRecord, ...]
     scenes: tuple[SceneRecord, ...]
     samples: tuple[SampleRecord, ...]
     sample_data: tuple[SampleDataRecord, ...]

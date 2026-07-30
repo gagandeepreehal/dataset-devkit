@@ -13,9 +13,12 @@ section also requires a stable `dataset_namespace` UUID, positive minimum/maximu
 positive minimum sample count, nonnegative maximum sample gap, and nonnegative inter-scene skip.
 `min_duration_s` cannot exceed `max_duration_s`. The annotation section contains the safely
 resolved JSONL `path`, nonnegative nearest-match tolerance, and nonnegative before/after windows.
-All configured seconds/milliseconds are converted through their decimal text to exact integer
-nanoseconds. A value containing a fraction smaller than one nanosecond is rejected rather than
-rounded or truncated.
+`load_config` is authoritative: it parses Task 5 time literals from their exact decimal JSON text
+and converts them to exact integer nanoseconds. Scientific notation is supported. Values just
+below or above an integer nanosecond are rejected rather than rounded through a binary float.
+Other configuration float fields retain their existing strict-float behavior. Direct
+`GlobalConfig.model_validate` callers must supply `Decimal` instances for Task 5 time fields;
+JSON numeric strings are not accepted, and the generated schema exposes numbers only.
 
 ## Valid runs and automatic segmentation
 
@@ -88,7 +91,11 @@ timestamp, not the logical grid time. Sample data preserves the deterministic ex
 staged image, calibration, and ego-pose reference. Chains never cross scenes. Human labels remain
 separate; Task 6 computed tags are not present.
 
+Every graph embeds immutable `source_samples` records derived from Task 4 final candidates. Each
+record contains one logical timestamp and its exact nonempty expected camera-channel set.
 `validate_scene_graph` checks globally unique tokens, foreign references, endpoint/count/order
 consistency, symmetric acyclic chains, within-scene channel chains and real pose timestamps,
-single assignment, complete assigned/unassigned coverage, and annotation/window references. The
-builder runs it before returning and raises `StructuralExtractionError` on any malformed graph.
+exactly one sample-data record per expected channel, no missing/extra/duplicate channel, unique
+unassigned timestamps, complete disjoint assigned/unassigned source coverage, and
+annotation/window references. The builder runs it before returning and raises
+`StructuralExtractionError` on any malformed graph.
