@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import os
@@ -65,6 +66,10 @@ class StagedImageCleanupError(StructuralExtractionError):
             "committed staged-image drop requires tombstone cleanup; "
             f"{len(tombstones)} owned tombstone(s) remain"
         )
+
+
+class _StagingNamespaceChanged(StructuralExtractionError):
+    """The pinned staging-root namespace changed during invocation creation."""
 
 
 @dataclass
@@ -186,14 +191,32 @@ def _staging_cleanup_failure(
     )
 
 
+def _assert_staging_namespace(root_fd: int, expected_entries: frozenset[str]) -> None:
+    try:
+        actual_entries = frozenset(os.listdir(root_fd))
+    except OSError as error:
+        raise _StagingNamespaceChanged("staging root namespace could not be verified") from error
+    if actual_entries != expected_entries:
+        raise _StagingNamespaceChanged("staging root namespace changed during invocation creation")
+
+
 def create_staging_invocation(staging_root: Path, recording_id: str) -> StagingInvocation:
-    """Exclusively create one collision-isolated staging directory."""
+    """Exclusively create one collision-isolated staging directory.
+
+    Cooperative creators are serialized with an advisory lock and observable namespace
+    mutations fail closed. POSIX cannot exclude a same-UID non-cooperator that mutates and
+    perfectly restores the namespace between identity checks.
+    """
     prefix = _recording_slug(recording_id)
     root_fd, root_chain = _open_directory_chain(staging_root, create=True)
-    root_identity = _identity(os.fstat(root_fd))
     directory_fd: int | None = None
     directory_identity: _Identity | None = None
+    root_locked = False
     try:
+        root_identity = _identity(os.fstat(root_fd))
+        fcntl.flock(root_fd, fcntl.LOCK_EX)
+        root_locked = True
+        baseline_entries = frozenset(os.listdir(root_fd))
         while True:
             directory_name = f"{prefix}-{uuid.uuid4().hex}"
             try:
@@ -201,8 +224,11 @@ def create_staging_invocation(staging_root: Path, recording_id: str) -> StagingI
                 break
             except FileExistsError:
                 continue
+        expected_entries = baseline_entries | {directory_name}
         try:
+            _assert_staging_namespace(root_fd, expected_entries)
             created_stat = os.stat(directory_name, dir_fd=root_fd, follow_symlinks=False)
+            _assert_staging_namespace(root_fd, expected_entries)
             if not stat.S_ISDIR(created_stat.st_mode):
                 raise StructuralExtractionError("new staging invocation is not a directory")
             directory_identity = _identity(created_stat)
@@ -215,8 +241,11 @@ def create_staging_invocation(staging_root: Path, recording_id: str) -> StagingI
                 directory_identity,
             )
             directory_fd = os.open(directory_name, _DIRECTORY_FLAGS, dir_fd=root_fd)
+            _assert_staging_namespace(root_fd, expected_entries)
             opened_stat = os.fstat(directory_fd)
+            _assert_staging_namespace(root_fd, expected_entries)
             directory_stat = os.stat(directory_name, dir_fd=root_fd, follow_symlinks=False)
+            _assert_staging_namespace(root_fd, expected_entries)
             if (
                 not stat.S_ISDIR(opened_stat.st_mode)
                 or not stat.S_ISDIR(directory_stat.st_mode)
@@ -225,11 +254,13 @@ def create_staging_invocation(staging_root: Path, recording_id: str) -> StagingI
             ):
                 raise StructuralExtractionError("new staging invocation identity changed")
             os.fsync(root_fd)
+            _assert_staging_namespace(root_fd, expected_entries)
         except Exception as setup_error:
             cleanup_fd = directory_fd
             close_cleanup_fd = False
             try:
-                if directory_identity is None:
+                namespace_changed = isinstance(setup_error, _StagingNamespaceChanged)
+                if directory_identity is None or namespace_changed:
                     cleaned = False
                 else:
                     if cleanup_fd is None:
@@ -253,7 +284,7 @@ def create_staging_invocation(staging_root: Path, recording_id: str) -> StagingI
                     directory_name,
                     root_chain,
                     root_identity,
-                    directory_identity,
+                    None if namespace_changed else directory_identity,
                 )
                 raise OwnedDirectoryCleanupError((failure,)) from setup_error
             raise
@@ -261,6 +292,9 @@ def create_staging_invocation(staging_root: Path, recording_id: str) -> StagingI
         if directory_fd is not None:
             with suppress(OSError):
                 os.close(directory_fd)
+        if root_locked:
+            with suppress(OSError):
+                fcntl.flock(root_fd, fcntl.LOCK_UN)
         with suppress(OSError):
             os.close(root_fd)
     assert directory_identity is not None

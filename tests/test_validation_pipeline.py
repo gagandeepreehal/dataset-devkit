@@ -1704,6 +1704,82 @@ def test_partial_pipeline_blocks_unpinned_fresh_invocation(
     }
 
 
+def test_partial_pipeline_blocks_first_stat_invocation_replacement(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    good_recording = tmp_path / "good-first-stat.mcap"
+    bad_recording = tmp_path / "bad-first-stat.mcap"
+    payloads = tuple(
+        camera_message(
+            timestamp,
+            (timestamp + 10, timestamp + 20),
+            camera_names=("front", "rear"),
+        )
+        for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
+    )
+    write_mcap(good_recording, camera_payloads=payloads)
+    write_mcap(bad_recording, camera_payloads=payloads)
+    good_blob = "mcap-h265/good-first-stat.mcap"
+    bad_blob = "mcap-h265/bad-first-stat.mcap"
+    config = _pipeline_config(
+        config_factory(), tmp_path, (good_blob, bad_blob), partial=True
+    )
+    acquirer = _FakeAcquirer(
+        {good_blob: good_recording, bad_blob: bad_recording}
+    )
+    original_stat = os.stat
+    replacement: Path | None = None
+    displaced: Path | None = None
+
+    def replace_before_first_stat(
+        path: str | bytes | Path | int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal replacement, displaced
+        if (
+            replacement is None
+            and isinstance(path, str)
+            and path.startswith("bad-first-stat-")
+            and dir_fd is not None
+            and not follow_symlinks
+        ):
+            created = config.paths.work_dir / path
+            displaced = created.with_name(f"{path}.displaced")
+            created.rename(displaced)
+            created.mkdir()
+            (created / "replacement.txt").write_text("unrelated", encoding="utf-8")
+            replacement = created
+        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.staging.os.stat", replace_before_first_stat
+    )
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: acquirer,
+        decoder_factory=DeterministicDecoder,
+        official_smoke=False,
+    )
+
+    with pytest.raises(BuildOperationalError, match="zero recordings are authorized"):
+        build_dataset(config, runtime=runtime)
+
+    assert not (config.paths.output_dir / config.publication.version).exists()
+    assert replacement is not None
+    assert displaced is not None and displaced.is_dir()
+    assert (replacement / "replacement.txt").read_text(encoding="utf-8") == "unrelated"
+    reports = tuple(config.quarantine.directory.glob("*.quarantine.json"))
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["artifact_handling"] == "preserved_in_place"
+    tree = payload["deterministic_details"]["owned_working_trees"][0]
+    assert tree["path"] == str(replacement)
+    assert tree["expected_device"] == -1
+    assert tree["expected_inode"] == -1
+
+
 def test_post_export_working_cleanup_failure_blocks_publication(
     tmp_path: Path,
     config_factory: Callable[[], GlobalConfig],

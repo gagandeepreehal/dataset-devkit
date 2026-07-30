@@ -607,6 +607,46 @@ def test_create_staging_invocation_rolls_back_post_mkdir_stat_failure(
     assert failure.expected_parent_chain
 
 
+def test_create_staging_invocation_preserves_replacement_before_first_child_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging_root = tmp_path / "staging"
+    original_stat = os.stat
+    replacement: Path | None = None
+    displaced: Path | None = None
+
+    def replace_created_directory_then_stat(
+        path: os.PathLike[str] | str | int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal displaced, replacement
+        if replacement is None and dir_fd is not None and isinstance(path, str) and path.startswith(
+            "recording-"
+        ):
+            created = staging_root / path
+            displaced = staging_root / f"{path}.displaced"
+            created.rename(displaced)
+            created.mkdir()
+            replacement = created
+        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "stat", replace_created_directory_then_stat)
+
+    with pytest.raises(OwnedDirectoryCleanupError) as captured:
+        staging_module.create_staging_invocation(staging_root, "recording")
+
+    assert isinstance(captured.value.__cause__, StructuralExtractionError)
+    assert replacement is not None and replacement.is_dir()
+    assert displaced is not None and displaced.is_dir()
+    failure = captured.value.failures[0]
+    assert failure.path == replacement
+    assert failure.expected_device == -1
+    assert failure.expected_inode == -1
+    assert failure.expected_parent_chain
+
+
 def test_create_staging_invocation_rolls_back_child_open_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
