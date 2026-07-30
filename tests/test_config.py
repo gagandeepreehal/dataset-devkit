@@ -201,6 +201,69 @@ def test_ordinary_urls_and_secret_named_paths_are_allowed(tmp_path: Path) -> Non
     assert config.annotations.path.name == "annotations.jsonl"
 
 
+@pytest.mark.parametrize(
+    "account_url",
+    [
+        "https://user@example.blob.core.windows.net",
+        "https://user:password@example.blob.core.windows.net",
+    ],
+)
+def test_account_url_rejects_url_userinfo(tmp_path: Path, account_url: str) -> None:
+    data = minimal_config()
+    set_nested(data, "azure.account_url", account_url)
+
+    with pytest.raises(ValidationError, match="credential|userinfo"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "A" * 86 + "==",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl",
+    ],
+)
+def test_raw_azure_keys_and_jwts_are_rejected_in_values(tmp_path: Path, secret: str) -> None:
+    data = minimal_config()
+    set_nested(data, "publication.version", secret)
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "credential_field",
+    [
+        "auth",
+        "password",
+        "secret",
+        "account_key",
+        "azure_storage_account_key",
+        "access_token",
+    ],
+)
+def test_explicit_credential_field_names_are_rejected(
+    tmp_path: Path, credential_field: str
+) -> None:
+    data = minimal_config()
+    azure: dict[str, object] = data["azure"]  # type: ignore[assignment]
+    azure[credential_field] = "embedded-value"
+
+    with pytest.raises(ValidationError, match="credential key"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_bearer_prefixed_ordinary_strings_and_paths_are_allowed(tmp_path: Path) -> None:
+    data = minimal_config()
+    set_nested(data, "azure.container", "bearer recordings")
+    set_nested(data, "annotations.path", "bearer archive/annotations.jsonl")
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.azure.container == "bearer recordings"
+    assert config.annotations.path.name == "annotations.jsonl"
+
+
 def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> None:
     data = minimal_config()
     data["frame_validity"] = {

@@ -17,8 +17,11 @@ prefer a managed identity. For local development, authenticate with `az login`; 
 credential chain can then use the Azure CLI session.
 
 Never place account keys, SAS tokens, connection strings, client secrets, passwords, bearer
-tokens, private keys, or other credentials in JSON. The loader rejects credential-looking keys
-and values before configuration is accepted. Do not append a SAS query string to `account_url`.
+tokens, private keys, JWTs, or other credentials in JSON. The loader rejects explicit
+credential-bearing field names and structured secret values before configuration is accepted.
+`account_url` must not contain URL userinfo and must not include a SAS query string. Ordinary
+URLs, paths, source identifiers, and non-secret strings are not treated as credentials merely
+because their text contains words such as `bearer` or `secret`.
 
 ## Sections
 

@@ -6,8 +6,67 @@ import json
 import re
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_AZURE_ACCOUNT_KEY_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{86}==(?=$|[^A-Za-z0-9+/=])"
+)
+_JWT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}"
+    r"\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?![A-Za-z0-9_-])"
+)
+_CREDENTIAL_KEY_NAMES = {
+    "auth",
+    "authentication",
+    "authorization",
+    "key",
+    "passwd",
+    "password",
+    "secret",
+    "token",
+    "accesstoken",
+    "accountkey",
+    "apikey",
+    "authtoken",
+    "bearertoken",
+    "clientsecret",
+    "connectionstring",
+    "credential",
+    "credentials",
+    "idtoken",
+    "privatekey",
+    "refreshtoken",
+    "sastoken",
+    "secretkey",
+    "sharedaccesskey",
+    "signingkey",
+    "storagekey",
+}
+
+
+def _is_credential_key(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return normalized in _CREDENTIAL_KEY_NAMES or normalized.endswith(
+        (
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "credential",
+            "credentials",
+            "accountkey",
+            "accesskey",
+            "apikey",
+            "clientkey",
+            "encryptionkey",
+            "privatekey",
+            "secretkey",
+            "signingkey",
+            "storagekey",
+        )
+    )
 
 
 class StrictModel(BaseModel):
@@ -18,6 +77,14 @@ class AzureConfig(StrictModel):
     account_url: str
     container: str
     blob_list: Path
+
+    @field_validator("account_url")
+    @classmethod
+    def reject_url_userinfo(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("account_url must not contain credential userinfo")
+        return value
 
 
 class PathsConfig(StrictModel):
@@ -176,26 +243,10 @@ class GlobalConfig(StrictModel):
     @model_validator(mode="before")
     @classmethod
     def reject_embedded_credentials(cls, value: object) -> object:
-        credential_keys = {
-            "accesstoken",
-            "accountkey",
-            "apikey",
-            "clientsecret",
-            "connectionstring",
-            "credential",
-            "credentials",
-            "password",
-            "privatekey",
-            "sastoken",
-            "sharedaccesskey",
-            "token",
-        }
-
         def inspect(item: object, location: str = "config") -> None:
             if isinstance(item, dict):
                 for key, nested in item.items():
-                    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-                    if normalized in credential_keys:
+                    if _is_credential_key(key):
                         raise ValueError(
                             f"embedded credential key is prohibited at {location}.{key}"
                         )
@@ -218,8 +269,9 @@ class GlobalConfig(StrictModel):
                 if (
                     has_sas_signature
                     or has_secret_assignment
+                    or _AZURE_ACCOUNT_KEY_PATTERN.search(item) is not None
+                    or _JWT_PATTERN.search(item) is not None
                     or re.fullmatch(r"sk-[A-Za-z0-9_-]{20,}", item) is not None
-                    or lowered.startswith("bearer ")
                     or "-----begin private key-----" in lowered
                 ):
                     raise ValueError(f"embedded credential value is prohibited at {location}")
