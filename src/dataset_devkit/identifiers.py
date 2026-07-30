@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Annotated
 
 from pydantic import AfterValidator, Field
@@ -26,7 +27,10 @@ def validate_safe_segment(value: str) -> str:
         or value.endswith(".")
         or value in {".", ".."}
         or stem in _WINDOWS_RESERVED_STEMS
-        or any(character in unsafe_characters or ord(character) < 32 for character in value)
+        or any(
+            character in unsafe_characters or unicodedata.category(character).startswith("C")
+            for character in value
+        )
     ):
         raise ValueError("value must be a nonempty safe path segment")
     return value

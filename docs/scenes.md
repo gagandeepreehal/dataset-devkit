@@ -53,11 +53,17 @@ float, or string). `labels` is a nonempty array of unique, trimmed, nonblank str
 duplicate JSON keys and duplicate `(blob_path, timestamp_ns, labels)` records are line-numbered
 errors.
 
+Parsing is binary streaming and never loads the complete file. Stable inclusive defaults bound the
+file to 64 MiB, each physical line to 256 KiB, records to 250,000, labels per record to 256, each
+label to 256 Unicode characters/1,024 UTF-8 bytes, and each blob path to 2,048 characters/4,096
+bytes. Exceeding any bound is a line-numbered format error.
+
 Every parsed record receives an audit. Records for another exact blob are
 `different_recording`. For the current blob, matching uses the nearest final valid logical
 sample. An exact distance tie chooses the earlier sample. Tolerance equality matches; a larger
 distance is `outside_tolerance`. Audits preserve the nearest sample timestamp, signed
-`sample - annotation` error, and absolute error even when tolerance prevents a match.
+`sample - annotation` error, and absolute error only for a match. Every unmatched reason has null
+sample/error fields, so it cannot accidentally claim an out-of-contract sample reference.
 
 A matched logical sample is the stable window anchor. The requested before/after interval is
 clipped to that sample's valid run, so it cannot cross a Task 4 invalid span, grid gap, configured
@@ -92,10 +98,13 @@ staged image, calibration, and ego-pose reference. Chains never cross scenes. Hu
 separate; Task 6 computed tags are not present.
 
 Every graph embeds immutable `source_samples` records derived from Task 4 final candidates. Each
-record contains one logical timestamp and its exact nonempty expected camera-channel set.
+record contains one logical timestamp, its canonical sorted nonempty expected camera-channel set,
+and its valid-run identity. Sample data carries the complete immutable staged-image evidence rather
+than only a local path.
 `validate_scene_graph` checks globally unique tokens, foreign references, endpoint/count/order
 consistency, symmetric acyclic chains, within-scene channel chains and real pose timestamps,
 exactly one sample-data record per expected channel, no missing/extra/duplicate channel, unique
 unassigned timestamps, complete disjoint assigned/unassigned source coverage, and
-annotation/window references. The builder runs it before returning and raises
+annotation match decisions, merged-window derivation, mode/config identity, safe POSIX export
+filenames, and staged asset content/root identity. The builder runs it before returning and raises
 `StructuralExtractionError` on any malformed graph.

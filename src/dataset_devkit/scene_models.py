@@ -6,12 +6,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
-from dataset_devkit.extraction.models import CameraCalibration, EgoPose
+from dataset_devkit.extraction.models import CameraCalibration, EgoPose, StagedImage
 from dataset_devkit.provenance import SourceFingerprint
 
 
 def _jsonable(value: object) -> object:
+    if isinstance(value, UUID):
+        return str(value)
     if isinstance(value, Path):
         return str(value)
     if is_dataclass(value) and not isinstance(value, type):
@@ -90,7 +93,7 @@ class SampleDataRecord:
     channel: str
     timestamp_ns: int
     filename: str
-    staged_image: Path
+    staged_image: StagedImage
     calibration: CameraCalibration | None
     ego_pose: EgoPose
     prev: str
@@ -113,6 +116,7 @@ class UnassignedSample:
 class SourceSampleRecord:
     timestamp_ns: int
     expected_channels: tuple[str, ...]
+    valid_run_id: int
 
 
 @dataclass(frozen=True)
@@ -126,6 +130,13 @@ class RecordingSceneResult:
     annotation_matches: tuple[AnnotationMatch, ...]
     annotation_windows: tuple[AnnotationWindow, ...]
     unassigned: tuple[UnassignedSample, ...]
+    build_mode: Literal["automatic", "annotation_only", "hybrid"]
+    annotation_match_tolerance_ns: int
+    annotation_before_ns: int
+    annotation_after_ns: int
+    max_sample_gap_ns: int
+    dataset_namespace: UUID
+    build_config_token: str
 
     def to_dict(self) -> dict[str, object]:
         return _jsonable(self)  # type: ignore[return-value]

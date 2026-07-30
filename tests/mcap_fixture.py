@@ -152,9 +152,7 @@ def descriptor_set_bytes() -> bytes:
 
 
 def message_classes(descriptor_data: bytes | None = None) -> tuple[type[Any], type[Any]]:
-    files = descriptor_pb2.FileDescriptorSet.FromString(
-        descriptor_data or descriptor_set_bytes()
-    )
+    files = descriptor_pb2.FileDescriptorSet.FromString(descriptor_data or descriptor_set_bytes())
     pool = descriptor_pool.DescriptorPool()
     pool.AddSerializedFile(timestamp_pb2.DESCRIPTOR.serialized_pb)  # type: ignore[no-untyped-call]
     pool.Add(files.file[1])  # type: ignore[no-untyped-call]
@@ -182,6 +180,7 @@ def camera_message(
     payloads: tuple[bytes, ...] | None = None,
     dimensions: tuple[int, int] = (4, 3),
     descriptor_data: bytes | None = None,
+    camera_names: tuple[str, ...] | None = None,
 ) -> bytes:
     camera_type, _ = message_classes(descriptor_data)
     message = camera_type()
@@ -195,7 +194,7 @@ def camera_message(
     frame_payloads = payloads or tuple(HEVC_AU for _ in camera_timestamps_ns)
     for index, timestamp_ns in enumerate(camera_timestamps_ns):
         message.data.append(frame_payloads[index])
-        message.name.append(f"cam_{index}")
+        message.name.append(f"cam_{index}" if camera_names is None else camera_names[index])
         _timestamp(message.camera_timestamp.add(), timestamp_ns)
         intrinsic = message.camera_intrinsic.add(
             focal_length_x=1,

@@ -34,6 +34,7 @@ from dataset_devkit.extraction.models import (
     TimestampObservation,
 )
 from dataset_devkit.extraction.uncertainty import TraversalBudget, bounded_freeze
+from dataset_devkit.identifiers import validate_safe_segment
 
 CAMERA_SCHEMA_NAME = "autonome.CompressedVideos"
 _GNSS_NUMERIC_FIELDS = {
@@ -373,10 +374,17 @@ def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
                     tuple(float(value) for value in extrinsic.translation_vector),
                 ),
             )
+            camera_name = str(dynamic.name[index])
+            try:
+                validate_safe_segment(camera_name)
+            except ValueError as error:
+                raise StructuralExtractionError(
+                    f"camera[{index}] name must be a safe path segment"
+                ) from error
             frames.append(
                 RawCameraFrame(
                     index,
-                    str(dynamic.name[index]),
+                    camera_name,
                     camera_timestamp_ns,
                     calibration,
                 )

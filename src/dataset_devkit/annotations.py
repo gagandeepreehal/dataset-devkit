@@ -34,7 +34,28 @@ class ParsedAnnotation:
     labels: tuple[str, ...]
 
 
-def _parse_record(value: object, line_number: int) -> ParsedAnnotation:
+@dataclass(frozen=True)
+class AnnotationBudgets:
+    """Stable bounds for streaming annotation input."""
+
+    max_total_bytes: int = 64 * 1024 * 1024
+    max_line_bytes: int = 256 * 1024
+    max_records: int = 250_000
+    max_labels_per_record: int = 256
+    max_label_chars: int = 256
+    max_label_bytes: int = 1024
+    max_blob_chars: int = 2048
+    max_blob_bytes: int = 4096
+
+    def __post_init__(self) -> None:
+        if any(value <= 0 for value in self.__dict__.values()):
+            raise ValueError("annotation budgets must be positive integers")
+
+
+DEFAULT_ANNOTATION_BUDGETS = AnnotationBudgets()
+
+
+def _parse_record(value: object, line_number: int, budgets: AnnotationBudgets) -> ParsedAnnotation:
     if not isinstance(value, dict) or set(value) != {"blob_path", "timestamp_ns", "labels"}:
         raise AnnotationFormatError(
             f"invalid annotation object at line {line_number}: exact keys are required"
@@ -44,6 +65,10 @@ def _parse_record(value: object, line_number: int) -> ParsedAnnotation:
     labels = value["labels"]
     if not isinstance(blob_path, str):
         raise AnnotationFormatError(f"invalid blob_path at line {line_number}")
+    if len(blob_path) > budgets.max_blob_chars:
+        raise AnnotationFormatError(f"blob path characters exceed budget at line {line_number}")
+    if len(blob_path.encode("utf-8")) > budgets.max_blob_bytes:
+        raise AnnotationFormatError(f"blob path bytes exceed budget at line {line_number}")
     try:
         validate_blob_path(blob_path, line_number=line_number)
     except BlobListError as error:
@@ -55,46 +80,80 @@ def _parse_record(value: object, line_number: int) -> ParsedAnnotation:
     if (
         not isinstance(labels, list)
         or not labels
+        or len(labels) > budgets.max_labels_per_record
         or any(
             not isinstance(label, str) or not label.strip() or label != label.strip()
             for label in labels
         )
         or len(labels) != len(set(labels))
     ):
+        if isinstance(labels, list) and len(labels) > budgets.max_labels_per_record:
+            raise AnnotationFormatError(f"label count exceeds budget at line {line_number}")
         raise AnnotationFormatError(
             f"labels must be a nonempty unique array of nonblank strings at line {line_number}"
         )
+    for label in labels:
+        if len(label) > budgets.max_label_chars:
+            raise AnnotationFormatError(f"label characters exceed budget at line {line_number}")
+        if len(label.encode("utf-8")) > budgets.max_label_bytes:
+            raise AnnotationFormatError(f"label bytes exceed budget at line {line_number}")
     return ParsedAnnotation(line_number, blob_path, timestamp, tuple(labels))
 
 
-def parse_annotations(path: Path) -> tuple[ParsedAnnotation, ...]:
+def parse_annotations(
+    path: Path, *, budgets: AnnotationBudgets = DEFAULT_ANNOTATION_BUDGETS
+) -> tuple[ParsedAnnotation, ...]:
     """Parse JSONL; blank and comment-only lines are explicitly ignored."""
     records: list[ParsedAnnotation] = []
     identities: dict[tuple[str, int, tuple[str, ...]], int] = {}
-    raw_file = path.read_bytes()
-    try:
-        text = raw_file.decode("utf-8")
-    except UnicodeDecodeError as error:
-        line_number = raw_file[: error.start].count(b"\n") + 1
-        raise AnnotationFormatError(f"invalid UTF-8 at line {line_number}") from error
-    for line_number, line in enumerate(text.splitlines(), 1):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        try:
-            value = json.loads(line, object_pairs_hook=_unique_object)
-        except _DuplicateKey as error:
-            raise AnnotationFormatError(
-                f"duplicate JSON key {error.args[0]!r} at line {line_number}"
-            ) from error
-        except json.JSONDecodeError as error:
-            raise AnnotationFormatError(f"invalid JSON at line {line_number}: {error}") from error
-        record = _parse_record(value, line_number)
-        identity = (record.blob_path, record.timestamp_ns, record.labels)
-        if identity in identities:
-            raise AnnotationFormatError(
-                f"duplicate annotation at line {line_number} "
-                f"(first seen at line {identities[identity]})"
-            )
-        identities[identity] = line_number
-        records.append(record)
+    total_bytes = 0
+    with path.open("rb") as stream:
+        for line_number, raw_line in enumerate(
+            iter(lambda: stream.readline(budgets.max_line_bytes + 1), b""), 1
+        ):
+            total_bytes += len(raw_line)
+            if total_bytes > budgets.max_total_bytes:
+                raise AnnotationFormatError(
+                    f"annotation total bytes exceed budget at line {line_number}"
+                )
+            content = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
+            if content.endswith(b"\r"):
+                content = content[:-1]
+            if len(content) > budgets.max_line_bytes or (
+                len(raw_line) > budgets.max_line_bytes and not raw_line.endswith(b"\n")
+            ):
+                raise AnnotationFormatError(
+                    f"annotation line bytes exceed budget at line {line_number}"
+                )
+            try:
+                line = content.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise AnnotationFormatError(
+                    f"invalid UTF-8 at line {line_number} byte {error.start + 1}"
+                ) from error
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if len(records) >= budgets.max_records:
+                raise AnnotationFormatError(
+                    f"annotation record count exceeds budget at line {line_number}"
+                )
+            try:
+                value = json.loads(line, object_pairs_hook=_unique_object)
+            except _DuplicateKey as error:
+                raise AnnotationFormatError(
+                    f"duplicate JSON key {error.args[0]!r} at line {line_number}"
+                ) from error
+            except json.JSONDecodeError as error:
+                raise AnnotationFormatError(
+                    f"invalid JSON at line {line_number}: {error}"
+                ) from error
+            record = _parse_record(value, line_number, budgets)
+            identity = (record.blob_path, record.timestamp_ns, record.labels)
+            if identity in identities:
+                raise AnnotationFormatError(
+                    f"duplicate annotation at line {line_number} "
+                    f"(first seen at line {identities[identity]})"
+                )
+            identities[identity] = line_number
+            records.append(record)
     return tuple(records)

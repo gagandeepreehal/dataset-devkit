@@ -74,8 +74,7 @@ def descriptor_with_nested_orientation_variances() -> bytes:
     file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
     calibration = next(file for file in file_set.file if file.name == "calibration.proto")
     orientation_error = next(
-        message for message in calibration.message_type
-        if message.name == "OrientationError"
+        message for message in calibration.message_type if message.name == "OrientationError"
     )
     axis = orientation_error.nested_type.add(name="AxisVariance")
     variance = axis.field.add(
@@ -198,8 +197,7 @@ def _normalized_descriptor_contract(
             for field in descriptor.field
         ),
         tuple(
-            _normalized_descriptor_contract(nested, full_name)
-            for nested in descriptor.nested_type
+            _normalized_descriptor_contract(nested, full_name) for nested in descriptor.nested_type
         ),
     )
 
@@ -263,6 +261,38 @@ def test_real_mcap_reader_decodes_exact_topics_and_per_camera_timestamps(tmp_pat
         2_100_000_000,
     ]
     assert recording.gnss_samples[0].raw_identifiers["receiver_id"] == "rx-1"
+
+
+@pytest.mark.parametrize(
+    "camera_name",
+    ["", "../rear", "cam/front", r"cam\rear", "CON", "rear\x00bad", "rear\x7fbad"],
+)
+def test_actual_mcap_rejects_unsafe_camera_channel_names(tmp_path: Path, camera_name: str) -> None:
+    path = tmp_path / "unsafe-camera-name.mcap"
+    write_mcap(
+        path,
+        camera_payloads=(camera_message(camera_names=(camera_name, "CAM_FRONT")),),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="camera.*name|safe path segment"):
+        read_recording(path, "rec_cameras", "gnss")
+
+
+def test_actual_mcap_preserves_exact_safe_unicode_and_uppercase_camera_names(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "safe-camera-names.mcap"
+    write_mcap(
+        path,
+        camera_payloads=(camera_message(camera_names=("CAM_FRONT", "Cámara_Rear")),),
+    )
+
+    recording = read_recording(path, "rec_cameras", "gnss")
+
+    assert tuple(frame.camera_name for frame in recording.camera_batches[0].frames) == (
+        "CAM_FRONT",
+        "Cámara_Rear",
+    )
 
 
 def _contains_bytes(value: object, seen: set[int] | None = None) -> bool:
@@ -349,9 +379,7 @@ def test_invalid_indexed_camera_timestamp_is_structural(tmp_path: Path) -> None:
         read_recording(path, "rec_cameras", "gnss")
 
 
-@pytest.mark.parametrize(
-    "payload", [b"not-annex-b", b"\x00\x00\x00\x01\x40\x01\xaa"]
-)
+@pytest.mark.parametrize("payload", [b"not-annex-b", b"\x00\x00\x00\x01\x40\x01\xaa"])
 def test_actual_mcap_rejects_non_annex_b_or_non_vcl_camera_payload(
     tmp_path: Path, payload: bytes
 ) -> None:
@@ -502,9 +530,7 @@ def test_gnss_message_requires_nested_numeric_when_descriptor_exposes_presence(
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_gnss_orientation_error_nonfinite_value_is_structural(
-    tmp_path: Path, value: float
-) -> None:
+def test_gnss_orientation_error_nonfinite_value_is_structural(tmp_path: Path, value: float) -> None:
     _, gnss_type = message_classes()
     message = gnss_type.FromString(gnss_message(900_000_000, 0))
     message.orientation_error.yaw_variance = value

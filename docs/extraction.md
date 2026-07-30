@@ -71,7 +71,7 @@ of those bytes. Every decoder is flushed at EOF, and the recording fails for an 
 ambiguous, or missing final output. Only outputs whose originating batches were selected are staged.
 
 Each extraction invocation exclusively creates a UUID-suffixed subdirectory below the trusted
-staging root. Deterministic leaf names include batch ordinal, camera index, sanitized camera name,
+staging root. Deterministic leaf names include batch ordinal, camera index, exact camera name,
 and actual camera timestamp, so duplicate timestamps cannot collide. Selected frames are converted
 to RGB, atomically linked without clobber as JPEG quality 95, and independently reopened with
 Pillow to verify JPEG format, RGB mode, complete decode, and dimensions. The POSIX writer rejects
@@ -81,8 +81,12 @@ inode identity is rechecked around publication and verification. Verification re
 trusted directory descriptor, requires the exact encoded byte sequence and digest, then decodes
 those same bytes with Pillow. Rollback removes only files whose stored device/inode identities are
 still owned by that invocation and then removes only the still-identical empty invocation directory;
-prior, concurrent, or substituted paths are never unlinked by name alone. Successful results expose
-the invocation root and staged paths for later publication.
+prior, concurrent, or substituted paths are never unlinked by name alone. Camera names must already
+be single safe path segments: separators, traversal names, platform-reserved names, and all Unicode
+control/format/surrogate/private-use categories are rejected. Accepted Unicode spelling and case are
+preserved exactly; names are not normalized or sanitized into a different identity. Successful
+results expose the invocation root plus immutable relative-path, directory-chain, device/inode,
+byte-size, SHA-256, dimensions, and staged-path evidence for later publication and reverification.
 
 Every staged candidate keeps three distinct times: grid target, chosen batch `rec_timestamp`, and
 its real camera timestamp. Ego poses are keyed by the real camera timestamp. GNSS values are

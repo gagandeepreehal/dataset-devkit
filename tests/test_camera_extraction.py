@@ -26,7 +26,7 @@ from dataset_devkit.extraction.models import (
     RawCameraBatch,
     RawCameraFrame,
 )
-from dataset_devkit.extraction.staging import stage_jpeg
+from dataset_devkit.extraction.staging import stage_jpeg, verify_staged_image_identity
 
 HEVC_AU = b"\x00\x00\x00\x01\x26\x01\xaa"  # type 19 VCL NAL
 
@@ -91,17 +91,13 @@ def test_annex_b_requires_start_code_and_vcl(payload: bytes) -> None:
         (b"\x00\x00\x01\x26", "two-byte"),
     ],
 )
-def test_annex_b_rejects_junk_empty_or_invalid_hevc_headers(
-    payload: bytes, message: str
-) -> None:
+def test_annex_b_rejects_junk_empty_or_invalid_hevc_headers(payload: bytes, message: str) -> None:
     with pytest.raises(StructuralExtractionError, match=message):
         validate_annex_b_hevc_access_unit(payload)
 
 
 def test_annex_b_accepts_mixed_three_and_four_byte_boundaries() -> None:
-    validate_annex_b_hevc_access_unit(
-        b"\x00\x00\x00\x01\x40\x01\xaa\x00\x00\x01\x26\x01\xbb"
-    )
+    validate_annex_b_hevc_access_unit(b"\x00\x00\x00\x01\x40\x01\xaa\x00\x00\x01\x26\x01\xbb")
 
 
 class FakeDecoder:
@@ -109,9 +105,7 @@ class FakeDecoder:
         self.outputs = outputs
         self.closed = False
 
-    def decode(
-        self, payload: bytes, pts: int, time_base: Fraction
-    ) -> list[DecoderOutput]:
+    def decode(self, payload: bytes, pts: int, time_base: Fraction) -> list[DecoderOutput]:
         assert payload == HEVC_AU
         return [DecoderOutput(pts, image) for image in self.outputs.pop(0)]
 
@@ -127,17 +121,13 @@ def output_frame(pts: int | None, color: int) -> DecoderOutput:
 
 
 class DelayedDecoder:
-    def __init__(
-        self, outputs: list[list[DecoderOutput]], flush: list[DecoderOutput]
-    ) -> None:
+    def __init__(self, outputs: list[list[DecoderOutput]], flush: list[DecoderOutput]) -> None:
         self.outputs = outputs
         self.flush_outputs = flush
         self.submitted_pts: list[int] = []
         self.closed = False
 
-    def decode(
-        self, payload: bytes, pts: int, time_base: Fraction
-    ) -> list[DecoderOutput]:
+    def decode(self, payload: bytes, pts: int, time_base: Fraction) -> list[DecoderOutput]:
         assert payload == HEVC_AU
         assert time_base == Fraction(1, 1_000_000_000)
         self.submitted_pts.append(pts)
@@ -163,18 +153,14 @@ def test_decoder_associates_zero_now_multiple_later_and_flush_outputs_by_pts() -
     flushed = decoders.finish()
 
     assert [
-        (item.metadata, cast(tuple[int, ...], item.image.getpixel((0, 0)))[0])
-        for item in emitted
+        (item.metadata, cast(tuple[int, ...], item.image.getpixel((0, 0)))[0]) for item in emitted
     ] == [
         ("second", 20),
         ("first", 10),
     ]
     assert [
-        (item.metadata, cast(tuple[int, ...], item.image.getpixel((0, 0)))[0])
-        for item in flushed
-    ] == [
-        ("third", 30)
-    ]
+        (item.metadata, cast(tuple[int, ...], item.image.getpixel((0, 0)))[0]) for item in flushed
+    ] == [("third", 30)]
     assert decoder.submitted_pts == [0, 1, 2]
     assert decoder.closed
 
@@ -225,9 +211,7 @@ def test_decoder_construction_failure_closes_every_created_context_once() -> Non
             close_counts.append(0)
             self.index = len(close_counts) - 1
 
-        def decode(
-            self, payload: bytes, pts: int, time_base: Fraction
-        ) -> list[DecoderOutput]:
+        def decode(self, payload: bytes, pts: int, time_base: Fraction) -> list[DecoderOutput]:
             return [DecoderOutput(pts, Image.new("RGB", (4, 3)))]
 
         def flush(self) -> list[DecoderOutput]:
@@ -257,17 +241,15 @@ def test_stage_jpeg_uses_quality_95_atomic_replace_and_reopens(
     save_calls: list[dict[str, Any]] = []
     original_save = Image.Image.save
 
-    def save_spy(
-        target: Image.Image, file: Any, format: str | None = None, **params: Any
-    ) -> None:
+    def save_spy(target: Image.Image, file: Any, format: str | None = None, **params: Any) -> None:
         save_calls.append({"format": format, **params})
         original_save(target, file, format=format, **params)
 
     monkeypatch.setattr(Image.Image, "save", save_spy)
-    staged = stage_jpeg(tmp_path, "recording-1", 0, "cam/front", 123, image, (4, 3))
+    staged = stage_jpeg(tmp_path, "recording-1", 0, "CAM_FRONT", 123, image, (4, 3))
 
     assert save_calls == [{"format": "JPEG", "quality": 95}]
-    assert staged.path.name == "000-cam_front-123.jpg"
+    assert staged.path.name == "000-CAM_FRONT-123.jpg"
     assert staged.timestamp_ns == 123
     assert staged.path.read_bytes().startswith(b"\xff\xd8")
     assert not list(staged.path.parent.glob("*.tmp"))
@@ -282,7 +264,7 @@ def test_stage_jpeg_uses_quality_95_atomic_replace_and_reopens(
             tmp_path,
             "recording-1",
             0,
-            "cam/front",
+            "CAM_FRONT",
             123,
             Image.new("RGB", (4, 3), (200, 1, 2)),
             (4, 3),
@@ -309,6 +291,46 @@ def test_stage_jpeg_rejects_escape_symlink_and_hardlink_targets(tmp_path: Path) 
         stage_jpeg(tmp_path, "recording", 0, "cam", 1, image, (4, 3))
 
 
+@pytest.mark.parametrize("attack", ["mutation", "replacement", "symlink", "hardlink"])
+def test_staged_image_identity_rejects_content_and_name_attacks(
+    tmp_path: Path, attack: str
+) -> None:
+    staged = stage_jpeg(tmp_path, "recording", 0, "CAM_FRONT", 1, Image.new("RGB", (4, 3)), (4, 3))
+    verify_staged_image_identity(staged)
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(staged.path.read_bytes())
+    if attack == "mutation":
+        staged.path.write_bytes(staged.path.read_bytes() + b"changed")
+    elif attack == "replacement":
+        staged.path.unlink()
+        staged.path.write_bytes(outside.read_bytes())
+    elif attack == "symlink":
+        staged.path.unlink()
+        staged.path.symlink_to(outside)
+    else:
+        os.link(staged.path, outside.with_name("second-link.jpg"))
+
+    with pytest.raises(StructuralExtractionError, match="staged image"):
+        verify_staged_image_identity(staged)
+
+
+def test_staged_image_identity_rejects_forged_path_and_ancestor_swap(
+    tmp_path: Path,
+) -> None:
+    staged = stage_jpeg(tmp_path, "recording", 0, "CAM_FRONT", 1, Image.new("RGB", (4, 3)), (4, 3))
+    unrelated = tmp_path / "recording" / "unrelated.jpg"
+    unrelated.write_bytes(staged.path.read_bytes())
+    forged = replace(staged, path=unrelated, root_relative_path=unrelated.name)
+    with pytest.raises(StructuralExtractionError, match="identity|ownership"):
+        verify_staged_image_identity(forged)
+
+    original_directory = tmp_path / "recording-original"
+    staged.path.parent.rename(original_directory)
+    (tmp_path / "recording").mkdir()
+    with pytest.raises(StructuralExtractionError, match="ancestor"):
+        verify_staged_image_identity(staged)
+
+
 def test_stage_jpeg_rejects_symlink_in_staging_ancestor(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -332,9 +354,7 @@ def test_stage_jpeg_rejects_same_dimension_content_swap_and_removes_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     alternate_stream = BytesIO()
-    Image.new("RGB", (4, 3), (200, 1, 2)).save(
-        alternate_stream, format="JPEG", quality=95
-    )
+    Image.new("RGB", (4, 3), (200, 1, 2)).save(alternate_stream, format="JPEG", quality=95)
     alternate = alternate_stream.getvalue()
     original_link = os.link
 
@@ -480,7 +500,7 @@ def test_staging_invocations_isolate_reruns_concurrency_and_sanitized_collisions
             tmp_path / "staging",
             invocation.directory_name,
             0,
-            "cam/front",
+            "CAM_FRONT",
             123,
             Image.new("RGB", (4, 3), (1, 2, 3)),
             (4, 3),

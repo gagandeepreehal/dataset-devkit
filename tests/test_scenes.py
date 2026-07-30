@@ -11,6 +11,8 @@ from uuid import UUID
 import pytest
 from PIL import Image
 
+from dataset_devkit import scenes as scenes_module
+from dataset_devkit.annotations import ParsedAnnotation
 from dataset_devkit.config import GlobalConfig, InvalidationRulesConfig
 from dataset_devkit.extraction.camera import DecoderOutput
 from dataset_devkit.extraction.errors import StructuralExtractionError
@@ -21,9 +23,9 @@ from dataset_devkit.extraction.models import (
     EgoPose,
     ExtractedCameraSample,
     GnssInterpolation,
-    StagedImage,
 )
 from dataset_devkit.extraction.service import RecordingExtractor
+from dataset_devkit.extraction.staging import stage_jpeg
 from dataset_devkit.provenance import SourceFingerprint, canonical_json
 from dataset_devkit.scenes import build_recording_scenes, validate_scene_graph
 from dataset_devkit.validity import (
@@ -55,9 +57,17 @@ class _DeterministicDecoder:
 
 
 def _camera(tmp_path: Path, logical: int, channel: str, real: int) -> ExtractedCameraSample:
-    image = tmp_path / f"{logical}-{channel}.jpg"
-    image.write_bytes(b"jpeg")
-    stat = image.stat()
+    camera_index = 0 if channel == "front" else 1
+    staged = stage_jpeg(
+        tmp_path / "scene-staging",
+        "recording",
+        camera_index,
+        channel,
+        real,
+        Image.new("RGB", (4, 3), (camera_index, 2, 3)),
+        (4, 3),
+        batch_ordinal=logical,
+    )
     interpolation = GnssInterpolation(real, True, None, None, 0.0, 0, 0)
     pose = EgoPose(real, True, (1.0, 2.0, 3.0), (1.0, 0.0, 0.0, 0.0), interpolation)
     calibration = CameraCalibration(
@@ -68,11 +78,9 @@ def _camera(tmp_path: Path, logical: int, channel: str, real: int) -> ExtractedC
         logical,
         logical,
         real,
-        0 if channel == "front" else 1,
+        camera_index,
         channel,
-        StagedImage(
-            0 if channel == "front" else 1, channel, real, image, 4, 3, stat.st_dev, stat.st_ino
-        ),
+        staged,
         pose,
         calibration,
     )
@@ -302,9 +310,9 @@ def test_valid_multicamera_staged_identity_reaches_sample_data(
 ) -> None:
     result = build_recording_scenes(_report(tmp_path, (0,)), SOURCE, _config(config_factory()))
 
-    assert [(item.channel, item.staged_image.name) for item in result.sample_data] == [
-        ("front", "0-front.jpg"),
-        ("rear", "0-rear.jpg"),
+    assert [(item.channel, item.staged_image.path.name) for item in result.sample_data] == [
+        ("front", "000000000-000-front-10.jpg"),
+        ("rear", "000000000-001-rear-20.jpg"),
     ]
     assert all(item.calibration is not None for item in result.sample_data)
 
@@ -385,7 +393,7 @@ def test_nearest_annotation_match_uses_earlier_tie_and_exact_tolerance(
         for item in result.annotation_matches
     ] == [
         (1, True, 0, -1_000_000_000, "matched"),
-        (2, False, 2_000_000_000, -1_000_000_001, "outside_tolerance"),
+        (2, False, None, None, "outside_tolerance"),
         (3, False, None, None, "different_recording"),
     ]
     assert len(result.scenes) == 1 and result.scenes[0].labels == ("tie",)
@@ -721,7 +729,7 @@ def test_graph_validator_seals_source_coverage_and_expected_camera_channels(
         prev="",
         next="",
     )
-    with pytest.raises(StructuralExtractionError, match="coverage|extra"):
+    with pytest.raises(StructuralExtractionError, match="coverage|extra|inconsistent"):
         validate_scene_graph(replace(result, sample_data=(*result.sample_data, extra_channel)))
 
     with pytest.raises(StructuralExtractionError, match="token collision"):
@@ -740,3 +748,85 @@ def test_graph_validator_rejects_duplicate_unassigned_timestamps(
 
     with pytest.raises(StructuralExtractionError, match="duplicate unassigned"):
         validate_scene_graph(replace(result, unassigned=(*result.unassigned, result.unassigned[0])))
+
+
+def test_scene_boundary_rejects_forged_unsafe_channel_and_filename(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    result = build_recording_scenes(_report(tmp_path, (0,)), SOURCE, _config(config_factory()))
+    original = result.sample_data[0]
+    with pytest.raises(StructuralExtractionError, match="channel"):
+        validate_scene_graph(
+            replace(
+                result,
+                sample_data=(replace(original, channel="../escape"), *result.sample_data[1:]),
+            )
+        )
+    with pytest.raises(StructuralExtractionError, match="filename"):
+        validate_scene_graph(
+            replace(
+                result,
+                sample_data=(
+                    replace(original, filename="samples/digest/front/../../escape.jpg"),
+                    *result.sample_data[1:],
+                ),
+            )
+        )
+
+
+def test_validator_seals_annotation_matches_windows_and_build_config(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    annotation_path = _annotations(
+        tmp_path / "sealed.jsonl",
+        [{"blob_path": SOURCE.blob_path, "timestamp_ns": 0, "labels": ["sealed"]}],
+    )
+    config = _annotation_config(
+        config_factory(), mode="annotation_only", tolerance_ms=0, before_s=0, after_s=0
+    )
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1_000_000_000)),
+        SOURCE,
+        config,
+        annotations_path=annotation_path,
+    )
+    match = result.annotation_matches[0]
+    with pytest.raises(StructuralExtractionError, match="match decision"):
+        validate_scene_graph(
+            replace(result, annotation_matches=(replace(match, signed_error_ns=1),))
+        )
+    window = result.annotation_windows[0]
+    with pytest.raises(StructuralExtractionError, match="window derivation"):
+        validate_scene_graph(
+            replace(result, annotation_windows=(replace(window, last_timestamp_ns=1),))
+        )
+    with pytest.raises(StructuralExtractionError, match="build configuration"):
+        validate_scene_graph(replace(result, annotation_before_ns=1))
+
+
+def test_annotation_index_is_precomputed_and_large_matching_is_stable(
+    config_factory: Callable[[], GlobalConfig],
+) -> None:
+    count = 10_000
+    audits = tuple(
+        LogicalSampleAudit(index * 10, index * 10, (), (), (), True) for index in range(count)
+    )
+    index = scenes_module._SampleIndex.build(audits, 10)
+    assert len(index.runs) == 1
+    assert index.nearest_position(55) == 5
+    parsed = tuple(
+        ParsedAnnotation(
+            line_number + 1,
+            SOURCE.blob_path,
+            line_number * 10,
+            ("event",),
+        )
+        for line_number in range(count)
+    )
+    config = _annotation_config(
+        config_factory(), mode="annotation_only", tolerance_ms=0, before_s=0, after_s=0
+    )
+    records, matches, windows, samples_by_window = scenes_module._annotation_state(
+        parsed, SOURCE, index, config
+    )
+    assert len(records) == len(matches) == len(windows) == len(samples_by_window) == count

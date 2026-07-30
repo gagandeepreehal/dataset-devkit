@@ -108,6 +108,13 @@ class StagedImage:
     height: int
     device: int | None = None
     inode: int | None = None
+    size: int | None = None
+    sha256: str | None = None
+    invocation_root: Path | None = None
+    root_relative_path: str | None = None
+    directory_device: int | None = None
+    directory_inode: int | None = None
+    directory_chain_identities: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)

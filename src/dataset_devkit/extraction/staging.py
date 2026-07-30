@@ -11,17 +11,16 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from PIL import Image
 
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import StagedImage
+from dataset_devkit.identifiers import validate_safe_segment
 
 _SAFE_RECORDING = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_DIRECTORY_FLAGS = (
-    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-)
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _Identity = tuple[int, int]
 
@@ -74,11 +73,6 @@ class StagingInvocation:
 def _recording_slug(recording_id: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", recording_id).strip("._-")
     return slug or "recording"
-
-
-def _camera_slug(name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
-    return slug or "camera"
 
 
 def _identity(file_stat: os.stat_result) -> _Identity:
@@ -220,9 +214,7 @@ def rollback_staging_invocation(invocation: StagingInvocation) -> None:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-        current_dir = os.stat(
-            invocation.directory_name, dir_fd=root_fd, follow_symlinks=False
-        )
+        current_dir = os.stat(invocation.directory_name, dir_fd=root_fd, follow_symlinks=False)
         if _identity(current_dir) != invocation.directory_identity:
             raise StructuralExtractionError("staging invocation directory identity changed")
         try:
@@ -239,24 +231,16 @@ def rollback_staging_invocation(invocation: StagingInvocation) -> None:
 def _open_verified_owned_images(
     staging_root: Path, images: tuple[StagedImage, ...]
 ) -> tuple[int, tuple[tuple[str, _Identity], ...], tuple[_Identity, ...]]:
-    directory_fd, directory_identities = _open_directory_chain(
-        staging_root, create=False
-    )
+    directory_fd, directory_identities = _open_directory_chain(staging_root, create=False)
     verified: list[tuple[str, _Identity]] = []
     try:
         for image in images:
-            if (
-                image.path.parent != staging_root
-                or image.device is None
-                or image.inode is None
-            ):
+            if image.path.parent != staging_root or image.device is None or image.inode is None:
                 raise StructuralExtractionError(
                     "staged image is not owned by this extraction invocation"
                 )
             try:
-                current = os.stat(
-                    image.path.name, dir_fd=directory_fd, follow_symlinks=False
-                )
+                current = os.stat(image.path.name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as error:
                 raise StructuralExtractionError("staged image is unavailable") from error
             expected = (image.device, image.inode)
@@ -265,9 +249,7 @@ def _open_verified_owned_images(
                 or current.st_nlink != 1
                 or _identity(current) != expected
             ):
-                raise StructuralExtractionError(
-                    "staged image ownership or identity changed"
-                )
+                raise StructuralExtractionError("staged image ownership or identity changed")
             verified.append((image.path.name, expected))
         return directory_fd, tuple(verified), directory_identities
     except Exception:
@@ -275,29 +257,115 @@ def _open_verified_owned_images(
         raise
 
 
-def verify_owned_staged_images(
-    staging_root: Path, images: tuple[StagedImage, ...]
-) -> None:
+def verify_owned_staged_images(staging_root: Path, images: tuple[StagedImage, ...]) -> None:
     """Verify every image through a component-wise no-follow invocation directory."""
     directory_fd, _, _ = _open_verified_owned_images(staging_root, images)
     os.close(directory_fd)
 
 
-def remove_owned_staged_images(
-    staging_root: Path, images: tuple[StagedImage, ...]
-) -> None:
+def verify_staged_image_identity(image: StagedImage) -> None:
+    """Reverify one immutable staged asset without following caller-controlled paths."""
+    if (
+        image.invocation_root is None
+        or image.root_relative_path is None
+        or image.device is None
+        or image.inode is None
+        or image.size is None
+        or image.sha256 is None
+        or image.directory_device is None
+        or image.directory_inode is None
+        or not image.directory_chain_identities
+    ):
+        raise StructuralExtractionError("staged image lacks immutable ownership metadata")
+    relative = PurePosixPath(image.root_relative_path)
+    if (
+        relative.is_absolute()
+        or len(relative.parts) != 1
+        or relative.name != image.root_relative_path
+        or image.path != image.invocation_root / relative.name
+    ):
+        raise StructuralExtractionError("staged image path containment is inconsistent")
+    directory_fd, actual_chain = _open_directory_chain(image.invocation_root, create=False)
+    try:
+        directory_stat = os.fstat(directory_fd)
+        if actual_chain != image.directory_chain_identities or _identity(directory_stat) != (
+            image.directory_device,
+            image.directory_inode,
+        ):
+            raise StructuralExtractionError("staged image ancestor identity changed")
+        try:
+            file_fd = os.open(relative.name, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd)
+        except OSError as error:
+            raise StructuralExtractionError("staged image is unavailable") from error
+        try:
+            opened = os.fstat(file_fd)
+            listed = os.stat(relative.name, dir_fd=directory_fd, follow_symlinks=False)
+            expected_identity = image.device, image.inode
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(listed.st_mode)
+                or opened.st_nlink != 1
+                or listed.st_nlink != 1
+                or _identity(opened) != expected_identity
+                or _identity(listed) != expected_identity
+                or opened.st_size != image.size
+                or listed.st_size != image.size
+            ):
+                raise StructuralExtractionError("staged image ownership or identity changed")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(file_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            if not hmac.compare_digest(digest.hexdigest(), image.sha256):
+                raise StructuralExtractionError("staged image content identity changed")
+            os.lseek(file_fd, 0, os.SEEK_SET)
+            with (
+                os.fdopen(os.dup(file_fd), "rb") as stream,
+                Image.open(stream) as reopened,
+            ):
+                reopened.load()
+                if (
+                    reopened.format != "JPEG"
+                    or reopened.mode != "RGB"
+                    or reopened.size != (image.width, image.height)
+                ):
+                    raise StructuralExtractionError("staged image JPEG identity changed")
+            listed_after = os.stat(
+                relative.name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(listed_after.st_mode)
+                or listed_after.st_nlink != 1
+                or _identity(listed_after) != expected_identity
+                or listed_after.st_size != image.size
+            ):
+                raise StructuralExtractionError(
+                    "staged image identity changed during verification"
+                )
+            _assert_directory_chain_unchanged(
+                image.invocation_root, image.directory_chain_identities
+            )
+        except StructuralExtractionError:
+            raise
+        except Exception as error:
+            raise StructuralExtractionError("staged image verification failed") from error
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def remove_owned_staged_images(staging_root: Path, images: tuple[StagedImage, ...]) -> None:
     """Transactionally hide verified images, then clean committed tombstones."""
-    directory_fd, verified, directory_identities = _open_verified_owned_images(
-        staging_root, images
-    )
+    directory_fd, verified, directory_identities = _open_verified_owned_images(staging_root, images)
     directory_identity = _identity(os.fstat(directory_fd))
     moved: list[tuple[TombstoneRecord, bool]] = []
     try:
         try:
             for filename, expected in verified:
-                current = os.stat(
-                    filename, dir_fd=directory_fd, follow_symlinks=False
-                )
+                current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
                 if (
                     not stat.S_ISREG(current.st_mode)
                     or current.st_nlink != 1
@@ -325,20 +393,14 @@ def remove_owned_staged_images(
                     follow_symlinks=False,
                 )
                 moved.append((record, False))
-                tombstone_stat = os.stat(
-                    tombstone, dir_fd=directory_fd, follow_symlinks=False
-                )
+                tombstone_stat = os.stat(tombstone, dir_fd=directory_fd, follow_symlinks=False)
                 if (
                     not stat.S_ISREG(tombstone_stat.st_mode)
                     or tombstone_stat.st_nlink != 2
                     or _identity(tombstone_stat) != expected
                 ):
-                    raise StructuralExtractionError(
-                        "staged image tombstone identity changed"
-                    )
-                source_after_link = os.stat(
-                    filename, dir_fd=directory_fd, follow_symlinks=False
-                )
+                    raise StructuralExtractionError("staged image tombstone identity changed")
+                source_after_link = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
                 if (
                     not stat.S_ISREG(source_after_link.st_mode)
                     or source_after_link.st_nlink != 2
@@ -349,9 +411,7 @@ def remove_owned_staged_images(
                     )
                 os.unlink(filename, dir_fd=directory_fd)
                 moved[-1] = (record, True)
-                tombstone_stat = os.stat(
-                    tombstone, dir_fd=directory_fd, follow_symlinks=False
-                )
+                tombstone_stat = os.stat(tombstone, dir_fd=directory_fd, follow_symlinks=False)
                 if (
                     not stat.S_ISREG(tombstone_stat.st_mode)
                     or tombstone_stat.st_nlink != 1
@@ -413,9 +473,7 @@ def remove_owned_staged_images(
                         follow_symlinks=False,
                     )
                     if not _stat_matches(restored, expected, 1):
-                        raise StructuralExtractionError(
-                            "rolled-back staged image identity changed"
-                        )
+                        raise StructuralExtractionError("rolled-back staged image identity changed")
                 except Exception as error:
                     rollback_error = rollback_error or error
             try:
@@ -467,9 +525,7 @@ def retry_owned_tombstone_cleanup(
     cleaned: list[TombstoneRecord] = []
     mismatched: list[TombstoneRecord] = []
     fsynced = True
-    groups: dict[
-        tuple[Path, tuple[_Identity, ...]], list[TombstoneRecord]
-    ] = {}
+    groups: dict[tuple[Path, tuple[_Identity, ...]], list[TombstoneRecord]] = {}
     for record in records:
         groups.setdefault(
             (
@@ -515,9 +571,8 @@ def retry_owned_tombstone_cleanup(
                         follow_symlinks=False,
                     )
                     expected = record.device, record.inode
-                    if (
-                        not _stat_matches(opened, expected, 1)
-                        or not _stat_matches(current, expected, 1)
+                    if not _stat_matches(opened, expected, 1) or not _stat_matches(
+                        current, expected, 1
                     ):
                         mismatched.append(record)
                         continue
@@ -543,9 +598,7 @@ def retry_owned_tombstone_cleanup(
 def owned_tombstone_record_matches(record: TombstoneRecord) -> bool:
     """Check one cleanup record through its trusted no-follow directory context."""
     try:
-        directory_fd, identities = _open_directory_chain(
-            record.invocation_root, create=False
-        )
+        directory_fd, identities = _open_directory_chain(record.invocation_root, create=False)
     except StructuralExtractionError:
         return False
     try:
@@ -571,9 +624,7 @@ def owned_tombstone_record_matches(record: TombstoneRecord) -> bool:
                 follow_symlinks=False,
             )
             expected = record.device, record.inode
-            return _stat_matches(opened, expected, 1) and _stat_matches(
-                current, expected, 1
-            )
+            return _stat_matches(opened, expected, 1) and _stat_matches(current, expected, 1)
         finally:
             os.close(file_fd)
     finally:
@@ -595,16 +646,17 @@ def stage_jpeg(
     """Atomically persist and bind verification to one quality-95 JPEG byte sequence."""
     if _SAFE_RECORDING.fullmatch(recording_id) is None:
         raise StructuralExtractionError("unsafe recording identifier for staging")
+    try:
+        validate_safe_segment(camera_name)
+    except ValueError as error:
+        raise StructuralExtractionError("unsafe camera name for staging") from error
     if invocation is not None and (
-        invocation.staging_root != staging_root
-        or invocation.directory_name != recording_id
+        invocation.staging_root != staging_root or invocation.directory_name != recording_id
     ):
         raise StructuralExtractionError("staging invocation does not match target directory")
     recording_dir = staging_root / recording_id
     ordinal_prefix = "" if batch_ordinal is None else f"{batch_ordinal:09d}-"
-    filename = (
-        f"{ordinal_prefix}{camera_index:03d}-{_camera_slug(camera_name)}-{timestamp_ns}.jpg"
-    )
+    filename = f"{ordinal_prefix}{camera_index:03d}-{camera_name}-{timestamp_ns}.jpg"
     temporary_name = f".{filename}.{uuid.uuid4().hex}.tmp"
     encoded_stream = BytesIO()
     try:
@@ -614,6 +666,7 @@ def stage_jpeg(
     encoded = encoded_stream.getvalue()
     expected_digest = hashlib.sha256(encoded).digest()
     directory_fd, directory_identities = _open_directory_chain(recording_dir, create=True)
+    directory_identity = _identity(os.fstat(directory_fd))
     published = False
     temporary_identity: _Identity | None = None
     try:
@@ -621,9 +674,7 @@ def stage_jpeg(
             existing = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
             existing = None
-        if existing is not None and (
-            not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1
-        ):
+        if existing is not None and (not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1):
             raise StructuralExtractionError("unsafe existing staging target")
         if existing is not None:
             raise StructuralExtractionError("staging target already exists; refusing to clobber")
@@ -709,4 +760,11 @@ def stage_jpeg(
         expected_dimensions[1],
         current_stat.st_dev,
         current_stat.st_ino,
+        current_stat.st_size,
+        actual_digest.hex(),
+        recording_dir,
+        filename,
+        directory_identity[0],
+        directory_identity[1],
+        directory_identities,
     )

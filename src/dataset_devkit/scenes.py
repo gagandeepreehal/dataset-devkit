@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import math
-import stat
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import UUID, uuid5
 
 from dataset_devkit.annotations import ParsedAnnotation, parse_annotations
@@ -15,6 +15,8 @@ from dataset_devkit.blob_list import BlobListError, validate_blob_path
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import ExtractedCameraSample
+from dataset_devkit.extraction.staging import verify_staged_image_identity
+from dataset_devkit.identifiers import validate_safe_segment
 from dataset_devkit.provenance import SourceFingerprint, canonical_json
 from dataset_devkit.scene_models import (
     AnnotationMatch,
@@ -74,6 +76,12 @@ def _validate_input(
         if cameras != audit.camera_timestamps or len(cameras) != len(set(cameras)):
             raise StructuralExtractionError("final candidate camera references are inconsistent")
         for camera in audit.samples:
+            try:
+                validate_safe_segment(camera.camera_name)
+            except ValueError as error:
+                raise StructuralExtractionError(
+                    "camera channel is not a safe path segment"
+                ) from error
             if camera.grid_target_timestamp_ns != audit.grid_target_timestamp_ns:
                 raise StructuralExtractionError("broken staged frame logical timestamp reference")
             if camera.batch_timestamp_ns != audit.batch_timestamp_ns:
@@ -85,18 +93,7 @@ def _validate_input(
                 or staged.timestamp_ns != camera.camera_timestamp_ns
             ):
                 raise StructuralExtractionError("staged image camera identity is inconsistent")
-            try:
-                staged_stat = staged.path.lstat()
-            except OSError as error:
-                raise StructuralExtractionError("broken staged image file reference") from error
-            if (
-                staged.device is None
-                or staged.inode is None
-                or not stat.S_ISREG(staged_stat.st_mode)
-                or staged_stat.st_nlink != 1
-                or (staged_stat.st_dev, staged_stat.st_ino) != (staged.device, staged.inode)
-            ):
-                raise StructuralExtractionError("staged image ownership identity is inconsistent")
+            verify_staged_image_identity(staged)
             if staged.width <= 0 or staged.height <= 0:
                 raise StructuralExtractionError("staged image dimensions are invalid")
             if camera.ego_pose.timestamp_ns != camera.camera_timestamp_ns:
@@ -158,11 +155,54 @@ class _WindowCandidate:
     samples: tuple[LogicalSampleAudit, ...]
 
 
+@dataclass(frozen=True)
+class _SampleIndex:
+    samples: tuple[LogicalSampleAudit, ...]
+    timestamps: tuple[int, ...]
+    runs: tuple[tuple[int, int], ...]
+    run_id_by_position: tuple[int, ...]
+
+    @classmethod
+    def build(cls, samples: Sequence[LogicalSampleAudit], max_gap_ns: int) -> _SampleIndex:
+        ordered = tuple(samples)
+        timestamps = tuple(item.grid_target_timestamp_ns for item in ordered)
+        if not ordered:
+            return cls((), (), (), ())
+        starts = [0]
+        for position in range(1, len(ordered)):
+            if timestamps[position] - timestamps[position - 1] > max_gap_ns:
+                starts.append(position)
+        ends = [*starts[1:], len(ordered)]
+        runs = tuple(zip(starts, ends, strict=True))
+        run_ids = [0] * len(ordered)
+        for run_id, (start, end) in enumerate(runs):
+            run_ids[start:end] = [run_id] * (end - start)
+        return cls(ordered, timestamps, runs, tuple(run_ids))
+
+    def nearest_position(self, timestamp_ns: int) -> int:
+        right = bisect_left(self.timestamps, timestamp_ns)
+        if right == 0:
+            return 0
+        if right == len(self.timestamps):
+            return right - 1
+        left = right - 1
+        left_error = timestamp_ns - self.timestamps[left]
+        right_error = self.timestamps[right] - timestamp_ns
+        return left if left_error <= right_error else right
+
+    def window(
+        self, anchor_position: int, first_ns: int, last_ns: int
+    ) -> tuple[LogicalSampleAudit, ...]:
+        run_start, run_end = self.runs[self.run_id_by_position[anchor_position]]
+        start = bisect_left(self.timestamps, first_ns, run_start, run_end)
+        end = bisect_right(self.timestamps, last_ns, start, run_end)
+        return self.samples[start:end]
+
+
 def _annotation_state(
     parsed: Sequence[ParsedAnnotation],
     source: SourceFingerprint,
-    samples: Sequence[LogicalSampleAudit],
-    runs: Sequence[Sequence[LogicalSampleAudit]],
+    index: _SampleIndex,
     config: GlobalConfig,
 ) -> tuple[
     tuple[AnnotationRecord, ...],
@@ -186,9 +226,6 @@ def _annotation_state(
         )
         for item in parsed
     )
-    run_by_timestamp = {
-        sample.grid_target_timestamp_ns: tuple(run) for run in runs for sample in run
-    }
     matches: list[AnnotationMatch] = []
     candidates: list[_WindowCandidate] = []
     for parsed_item, record in zip(parsed, records, strict=True):
@@ -199,20 +236,15 @@ def _annotation_state(
                 )
             )
             continue
-        if not samples:
+        if not index.samples:
             matches.append(
                 AnnotationMatch(
                     record.token, record.line_number, False, None, None, None, "no_valid_samples"
                 )
             )
             continue
-        nearest = min(
-            samples,
-            key=lambda item: (
-                abs(item.grid_target_timestamp_ns - parsed_item.timestamp_ns),
-                item.grid_target_timestamp_ns,
-            ),
-        )
+        nearest_position = index.nearest_position(parsed_item.timestamp_ns)
+        nearest = index.samples[nearest_position]
         signed = nearest.grid_target_timestamp_ns - parsed_item.timestamp_ns
         absolute = abs(signed)
         if absolute > config.annotations.match_tolerance_ns:
@@ -221,9 +253,9 @@ def _annotation_state(
                     record.token,
                     record.line_number,
                     False,
-                    nearest.grid_target_timestamp_ns,
-                    signed,
-                    absolute,
+                    None,
+                    None,
+                    None,
                     "outside_tolerance",
                 )
             )
@@ -234,23 +266,24 @@ def _annotation_state(
                 record.token, record.line_number, True, anchor, signed, absolute, "matched"
             )
         )
-        run = run_by_timestamp[anchor]
+        run_start, run_end = index.runs[index.run_id_by_position[nearest_position]]
         requested_first = anchor - config.annotations.before_ns
         requested_last = anchor + config.annotations.after_ns
-        first_ns = max(requested_first, run[0].grid_target_timestamp_ns)
-        last_ns = min(requested_last, run[-1].grid_target_timestamp_ns)
-        window_samples = tuple(
-            item for item in run if first_ns <= item.grid_target_timestamp_ns <= last_ns
-        )
+        first_ns = max(requested_first, index.timestamps[run_start])
+        last_ns = min(requested_last, index.timestamps[run_end - 1])
+        window_samples = index.window(nearest_position, first_ns, last_ns)
         candidates.append(_WindowCandidate(record, first_ns, last_ns, window_samples))
 
     candidates.sort(key=lambda item: (item.first_ns, item.last_ns, item.annotation.line_number))
     merged: list[list[_WindowCandidate]] = []
+    merged_end: list[int] = []
     for candidate in candidates:
-        if not merged or candidate.first_ns > max(item.last_ns for item in merged[-1]):
+        if not merged or candidate.first_ns > merged_end[-1]:
             merged.append([candidate])
+            merged_end.append(candidate.last_ns)
         else:
             merged[-1].append(candidate)
+            merged_end[-1] = max(merged_end[-1], candidate.last_ns)
     windows: list[AnnotationWindow] = []
     samples_by_window: dict[str, tuple[LogicalSampleAudit, ...]] = {}
     for group in merged:
@@ -441,6 +474,11 @@ def _materialize(
                 zip(channel_items, data_tokens, strict=True)
             ):
                 suffix = camera.staged_image.path.suffix.lower() or ".jpg"
+                relative = (
+                    PurePosixPath("samples") / source.digest / channel / f"{data_token}{suffix}"
+                )
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise StructuralExtractionError("sample_data filename is unsafe")
                 sample_data.append(
                     SampleDataRecord(
                         data_token,
@@ -448,8 +486,8 @@ def _materialize(
                         scene_token,
                         channel,
                         camera.camera_timestamp_ns,
-                        f"samples/{source.digest}/{channel}/{data_token}{suffix}",
-                        camera.staged_image.path,
+                        relative.as_posix(),
+                        camera.staged_image,
                         camera.calibration,
                         camera.ego_pose,
                         "" if data_index == 0 else data_tokens[data_index - 1],
@@ -485,13 +523,14 @@ def build_recording_scenes(
 ) -> RecordingSceneResult:
     """Build and validate one deterministic scene graph from final valid candidates only."""
     final_samples = _validate_input(report, source)
-    runs = _partition_runs(final_samples, config.scenes.max_sample_gap_ns)
+    index = _SampleIndex.build(final_samples, config.scenes.max_sample_gap_ns)
+    runs = tuple(index.samples[start:end] for start, end in index.runs)
     path = config.annotations.path if annotations_path is None else annotations_path
     if not path.is_file():
         raise StructuralExtractionError(f"annotation JSONL is not a file: {path}")
     parsed = parse_annotations(path)
     annotations, matches, windows, samples_by_window = _annotation_state(
-        parsed, source, final_samples, runs, config
+        parsed, source, index, config
     )
     annotation_candidates = tuple(
         _SceneCandidate(
@@ -547,9 +586,10 @@ def build_recording_scenes(
     source_samples = tuple(
         SourceSampleRecord(
             item.grid_target_timestamp_ns,
-            tuple(camera.camera_name for camera in item.samples),
+            tuple(sorted(camera.camera_name for camera in item.samples)),
+            index.run_id_by_position[position],
         )
-        for item in final_samples
+        for position, item in enumerate(final_samples)
     )
     result = RecordingSceneResult(
         source,
@@ -561,6 +601,23 @@ def build_recording_scenes(
         matches,
         windows,
         tuple(sorted(unassigned, key=lambda item: item.timestamp_ns)),
+        config.scenes.mode,
+        config.annotations.match_tolerance_ns,
+        config.annotations.before_ns,
+        config.annotations.after_ns,
+        config.scenes.max_sample_gap_ns,
+        config.scenes.dataset_namespace,
+        _token(
+            config.scenes.dataset_namespace,
+            "scene-build-config",
+            [
+                config.scenes.mode,
+                config.annotations.match_tolerance_ns,
+                config.annotations.before_ns,
+                config.annotations.after_ns,
+                config.scenes.max_sample_gap_ns,
+            ],
+        ),
     )
     validate_scene_graph(result)
     return result
@@ -581,14 +638,25 @@ def _validate_chain(
             following = by_token.get(item.next)
             if following is None or following.prev != item.token:
                 raise StructuralExtractionError(f"{label} chain has broken prev/next symmetry")
+    state: dict[str, int] = {}
     for item in records:
-        seen: set[str] = set()
+        if state.get(item.token) == 2:
+            continue
+        path: list[str] = []
         current = item
-        while current.next:
-            if current.token in seen:
+        while True:
+            status = state.get(current.token, 0)
+            if status == 1:
                 raise StructuralExtractionError(f"{label} chain contains a cycle")
-            seen.add(current.token)
+            if status == 2:
+                break
+            state[current.token] = 1
+            path.append(current.token)
+            if not current.next:
+                break
             current = by_token[current.next]
+        for token in path:
+            state[token] = 2
 
 
 def validate_scene_graph(result: RecordingSceneResult) -> None:
@@ -618,13 +686,149 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             raise StructuralExtractionError(
                 "source sample expected channel coverage is empty or duplicated"
             )
+    expected_run_id = 0
+    for previous, current in zip(result.source_samples, result.source_samples[1:], strict=False):
+        if current.timestamp_ns - previous.timestamp_ns > result.max_sample_gap_ns:
+            expected_run_id += 1
+        if current.valid_run_id != expected_run_id:
+            raise StructuralExtractionError("source valid-run identity is inconsistent")
+    if result.source_samples and result.source_samples[0].valid_run_id != 0:
+        raise StructuralExtractionError("source valid-run identity is inconsistent")
     annotations = {item.token: item for item in result.annotations}
     windows = {item.token: item for item in result.annotation_windows}
-    for scene in result.scenes:
-        members = sorted(
-            (item for item in result.samples if item.scene_token == scene.token),
-            key=lambda item: item.timestamp_ns,
+    expected_config_token = _token(
+        result.dataset_namespace,
+        "scene-build-config",
+        [
+            result.build_mode,
+            result.annotation_match_tolerance_ns,
+            result.annotation_before_ns,
+            result.annotation_after_ns,
+            result.max_sample_gap_ns,
+        ],
+    )
+    if result.build_config_token != expected_config_token:
+        raise StructuralExtractionError("scene graph build configuration is inconsistent")
+    if len(result.annotation_matches) != len(result.annotations):
+        raise StructuralExtractionError("annotation match coverage is incomplete or duplicated")
+    matches_by_annotation = {item.annotation_token: item for item in result.annotation_matches}
+    if len(matches_by_annotation) != len(result.annotation_matches) or set(
+        matches_by_annotation
+    ) != set(annotations):
+        raise StructuralExtractionError("annotation match coverage is incomplete or duplicated")
+    timestamp_values = tuple(source_by_timestamp)
+    for annotation in result.annotations:
+        match = matches_by_annotation[annotation.token]
+        expected_match: tuple[bool, int | None, int | None, int | None, str]
+        if match.line_number != annotation.line_number:
+            raise StructuralExtractionError("annotation match line identity is inconsistent")
+        if annotation.blob_path != result.source.blob_path:
+            expected_match = (False, None, None, None, "different_recording")
+        elif not timestamp_values:
+            expected_match = (False, None, None, None, "no_valid_samples")
+        else:
+            right = bisect_left(timestamp_values, annotation.timestamp_ns)
+            if right == 0:
+                nearest = timestamp_values[0]
+            elif right == len(timestamp_values):
+                nearest = timestamp_values[-1]
+            else:
+                before = timestamp_values[right - 1]
+                after = timestamp_values[right]
+                nearest = (
+                    before
+                    if annotation.timestamp_ns - before <= after - annotation.timestamp_ns
+                    else after
+                )
+            signed = nearest - annotation.timestamp_ns
+            absolute = abs(signed)
+            expected_match = (
+                (True, nearest, signed, absolute, "matched")
+                if absolute <= result.annotation_match_tolerance_ns
+                else (False, None, None, None, "outside_tolerance")
+            )
+        actual_match = (
+            match.matched,
+            match.sample_timestamp_ns,
+            match.signed_error_ns,
+            match.absolute_error_ns,
+            match.reason,
         )
+        if actual_match != expected_match:
+            raise StructuralExtractionError("annotation match decision is inconsistent")
+
+    expected_window_candidates: list[tuple[int, int, AnnotationRecord, tuple[int, ...]]] = []
+    for annotation in result.annotations:
+        match = matches_by_annotation[annotation.token]
+        if not match.matched:
+            continue
+        assert match.sample_timestamp_ns is not None
+        anchor_record = source_by_timestamp[match.sample_timestamp_ns]
+        run_id = anchor_record.valid_run_id
+        run_timestamps = tuple(
+            item.timestamp_ns for item in result.source_samples if item.valid_run_id == run_id
+        )
+        requested_first = match.sample_timestamp_ns - result.annotation_before_ns
+        requested_last = match.sample_timestamp_ns + result.annotation_after_ns
+        first_ns = max(requested_first, run_timestamps[0])
+        last_ns = min(requested_last, run_timestamps[-1])
+        first_position = bisect_left(run_timestamps, first_ns)
+        last_position = bisect_right(run_timestamps, last_ns)
+        expected_window_candidates.append(
+            (first_ns, last_ns, annotation, run_timestamps[first_position:last_position])
+        )
+    expected_window_candidates.sort(key=lambda item: (item[0], item[1], item[2].line_number))
+    expected_groups: list[list[tuple[int, int, AnnotationRecord, tuple[int, ...]]]] = []
+    expected_group_end: list[int] = []
+    for candidate in expected_window_candidates:
+        if not expected_groups or candidate[0] > expected_group_end[-1]:
+            expected_groups.append([candidate])
+            expected_group_end.append(candidate[1])
+        else:
+            expected_groups[-1].append(candidate)
+            expected_group_end[-1] = max(expected_group_end[-1], candidate[1])
+    if len(expected_groups) != len(result.annotation_windows):
+        raise StructuralExtractionError("annotation window coverage is inconsistent")
+    expected_samples_by_window: dict[str, tuple[int, ...]] = {}
+    for window, group in zip(result.annotation_windows, expected_groups, strict=True):
+        lineage = sorted(group, key=lambda item: item[2].line_number)
+        expected_tokens = tuple(item[2].token for item in lineage)
+        expected_labels = tuple(
+            dict.fromkeys(label for item in lineage for label in item[2].labels)
+        )
+        sample_timestamps = tuple(sorted({timestamp for item in group for timestamp in item[3]}))
+        expected_first = min(item[0] for item in group)
+        expected_last = max(item[1] for item in group)
+        expected_window_token = _token(
+            result.dataset_namespace,
+            "annotation-window",
+            [
+                result.source.to_dict(),
+                expected_tokens,
+                expected_first,
+                expected_last,
+                sample_timestamps[0],
+                sample_timestamps[-1],
+            ],
+        )
+        if (
+            window.token != expected_window_token
+            or window.annotation_tokens != expected_tokens
+            or window.first_timestamp_ns != expected_first
+            or window.last_timestamp_ns != expected_last
+            or window.first_sample_timestamp_ns != sample_timestamps[0]
+            or window.last_sample_timestamp_ns != sample_timestamps[-1]
+            or window.labels != expected_labels
+        ):
+            raise StructuralExtractionError("annotation window derivation is inconsistent")
+        expected_samples_by_window[window.token] = sample_timestamps
+    samples_by_scene: dict[str, list[SampleRecord]] = defaultdict(list)
+    for sample in result.samples:
+        samples_by_scene[sample.scene_token].append(sample)
+    for members in samples_by_scene.values():
+        members.sort(key=lambda item: item.timestamp_ns)
+    for scene in result.scenes:
+        members = samples_by_scene.get(scene.token, [])
         if (
             len(members) != scene.nbr_samples
             or not members
@@ -646,13 +850,15 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         if any(reference not in annotations for reference in scene.annotation_refs):
             raise StructuralExtractionError("scene has a foreign annotation reference")
         if scene.kind == "annotation":
-            window = windows.get(scene.annotation_window_ref)
+            selected_window = windows.get(scene.annotation_window_ref)
             if (
-                window is None
-                or scene.annotation_refs != window.annotation_tokens
-                or scene.labels != window.labels
-                or scene.first_timestamp_ns != window.first_sample_timestamp_ns
-                or scene.last_timestamp_ns != window.last_sample_timestamp_ns
+                selected_window is None
+                or scene.annotation_refs != selected_window.annotation_tokens
+                or scene.labels != selected_window.labels
+                or scene.first_timestamp_ns != selected_window.first_sample_timestamp_ns
+                or scene.last_timestamp_ns != selected_window.last_sample_timestamp_ns
+                or tuple(item.timestamp_ns for item in members)
+                != expected_samples_by_window[selected_window.token]
             ):
                 raise StructuralExtractionError("annotation scene has a broken window reference")
         elif scene.annotation_window_ref or scene.annotation_refs or scene.labels:
@@ -663,8 +869,21 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
     data_groups: dict[tuple[str, str], list[SampleDataRecord]] = defaultdict(list)
     data_by_sample: dict[str, list[SampleDataRecord]] = defaultdict(list)
     for item in result.sample_data:
-        sample = samples.get(item.sample_token)
-        if sample is None or sample.scene_token != item.scene_token:
+        try:
+            validate_safe_segment(item.channel)
+        except ValueError as error:
+            raise StructuralExtractionError("sample_data channel is unsafe") from error
+        filename = PurePosixPath(item.filename)
+        if (
+            filename.is_absolute()
+            or ".." in filename.parts
+            or len(filename.parts) != 4
+            or filename.parts[:3] != ("samples", result.source.digest, item.channel)
+        ):
+            raise StructuralExtractionError("sample_data filename is unsafe or inconsistent")
+        verify_staged_image_identity(item.staged_image)
+        selected_sample = samples.get(item.sample_token)
+        if selected_sample is None or selected_sample.scene_token != item.scene_token:
             raise StructuralExtractionError("sample_data has a foreign or cross-scene reference")
         if item.ego_pose.timestamp_ns != item.timestamp_ns:
             raise StructuralExtractionError("sample_data does not preserve real pose timestamp")
@@ -679,8 +898,8 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             raise StructuralExtractionError("sample_data contains a duplicate sample channel")
         if set(actual_channels) != set(expected.expected_channels):
             raise StructuralExtractionError("sample_data channel coverage is missing or extra")
-    for group in data_groups.values():
-        ordered = sorted(group, key=lambda item: samples[item.sample_token].timestamp_ns)
+    for data_group in data_groups.values():
+        ordered = sorted(data_group, key=lambda item: samples[item.sample_token].timestamp_ns)
         if any(
             current.timestamp_ns <= previous.timestamp_ns
             for previous, current in zip(ordered, ordered[1:], strict=False)
@@ -693,24 +912,19 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
                 raise StructuralExtractionError(
                     "sample_data chain has cross-scene, cross-channel, or endpoint links"
                 )
-        _validate_chain(group, "sample_data")
-    for match in result.annotation_matches:
-        if match.annotation_token not in annotations:
-            raise StructuralExtractionError("annotation match has a foreign annotation reference")
-        if match.matched and match.sample_timestamp_ns is None:
-            raise StructuralExtractionError("matched annotation lacks a sample reference")
+        _validate_chain(data_group, "sample_data")
     for window in result.annotation_windows:
         if any(reference not in annotations for reference in window.annotation_tokens):
             raise StructuralExtractionError("annotation window has a foreign annotation reference")
-        lineage = tuple(annotations[reference] for reference in window.annotation_tokens)
-        if tuple(item.line_number for item in lineage) != tuple(
-            sorted(item.line_number for item in lineage)
+        annotation_lineage = tuple(annotations[reference] for reference in window.annotation_tokens)
+        if tuple(item.line_number for item in annotation_lineage) != tuple(
+            sorted(item.line_number for item in annotation_lineage)
         ):
             raise StructuralExtractionError("annotation window lineage is not in source line order")
-        expected_labels = tuple(
-            dict.fromkeys(label for annotation in lineage for label in annotation.labels)
+        lineage_labels = tuple(
+            dict.fromkeys(label for annotation in annotation_lineage for label in annotation.labels)
         )
-        if window.labels != expected_labels:
+        if window.labels != lineage_labels:
             raise StructuralExtractionError("annotation window label lineage is inconsistent")
         if window.first_sample_timestamp_ns > window.last_sample_timestamp_ns:
             raise StructuralExtractionError("annotation window sample endpoints are reversed")
@@ -725,3 +939,12 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
     expected_set = set(source_by_timestamp)
     if assigned_set & unassigned_set or assigned_set | unassigned_set != expected_set:
         raise StructuralExtractionError("scene graph source coverage is inconsistent")
+    annotation_scene_windows = [
+        scene.annotation_window_ref for scene in result.scenes if scene.kind == "annotation"
+    ]
+    if result.build_mode == "automatic" and annotation_scene_windows:
+        raise StructuralExtractionError("automatic mode contains annotation scenes")
+    if result.build_mode in {"annotation_only", "hybrid"} and sorted(
+        annotation_scene_windows
+    ) != sorted(windows):
+        raise StructuralExtractionError("annotation windows do not have exactly one scene")
