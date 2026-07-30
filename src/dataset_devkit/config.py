@@ -63,6 +63,7 @@ _PATH_FIELD_LOCATIONS = {
     "config.annotations.path",
     "config.quarantine.directory",
 }
+_HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 def _is_credential_key(key: object) -> bool:
@@ -109,6 +110,20 @@ def _looks_like_opaque_bearer_token(value: str) -> bool:
     return _BEARER_TOKEN_PATTERN.fullmatch(payload) is not None
 
 
+def _is_azure_blob_service_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    for suffix in _AZURE_BLOB_HOST_SUFFIXES:
+        if not hostname.endswith(suffix):
+            continue
+        prefix = hostname[: -len(suffix)]
+        labels = prefix.split(".")
+        if len(labels) == 2 and labels[1] == "privatelink":
+            labels.pop()
+        return len(labels) == 1 and _HOST_LABEL_PATTERN.fullmatch(labels[0]) is not None
+    return False
+
+
 def _paths_overlap(first: Path, second: Path) -> bool:
     return first == second or first in second.parents or second in first.parents
 
@@ -139,11 +154,18 @@ class AzureConfig(StrictModel):
     def reject_url_userinfo(cls, value: str) -> str:
         parsed = urlsplit(value)
         hostname = parsed.hostname
-        is_blob_host = hostname is not None and hostname.endswith(_AZURE_BLOB_HOST_SUFFIXES)
-        if parsed.scheme != "https" or not is_blob_host:
+        try:
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError("account_url must contain a valid port") from error
+        if parsed.scheme != "https" or not _is_azure_blob_service_host(hostname):
             raise ValueError("account_url must be an HTTPS Azure Blob service URL")
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("account_url must not contain credential userinfo")
+        if parsed.path not in {"", "/"}:
+            raise ValueError("account_url must not contain a container or blob path")
+        if "#" in value:
+            raise ValueError("account_url must not contain a fragment")
         if _has_credential_url_query(value):
             raise ValueError("account_url must not contain credential query parameters")
         return value

@@ -20,7 +20,8 @@ credential chain can then use the Azure CLI session.
 Never place account keys, SAS tokens, connection strings, client secrets, passwords, bearer
 tokens, private keys, JWTs, or other credentials in JSON. The loader rejects explicit
 credential-bearing field names and structured secret values before configuration is accepted.
-`account_url` must not contain URL userinfo or credential-bearing query parameters. Nonempty
+`account_url` must identify the Blob service root over HTTPS; container/blob paths, fragments,
+malformed ports, URL userinfo, and credential-bearing query parameters are rejected. Nonempty
 signature fields such as `sig` make a SAS URL credential-bearing; SAS metadata such as `sp`,
 `st`, `se`, `sr`, and `sv` is not secret by itself. The same query checks apply to other URL
 values, while ordinary query parameters remain valid. Opaque bearer tokens are recognized only
@@ -54,7 +55,8 @@ are not treated as credentials merely because their text contains words such as 
 - `execution`: positive worker count and partial-export policy.
 - `quarantine`: enablement, isolated output directory, and basename-only rejection-manifest
   filename. When enabled, its directory cannot overlap work, cache, or output.
-- `publication`: safe single-segment public dataset version and overwrite refusal.
+- `publication`: safe single-segment public dataset version and overwrite refusal. Cross-platform
+  safety rejects traversal, Windows reserved device stems, and names ending in a dot or space.
 
 ## Authoritative validation
 

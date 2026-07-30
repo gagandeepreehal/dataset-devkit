@@ -16,7 +16,10 @@ def test_dataset_is_a_stable_import_boundary(tmp_path: Path) -> None:
     assert dataset.version == "v1.0-trainval"
 
 
-@pytest.mark.parametrize("version", ["", ".", "..", "versions/v1", r"versions\v1", " v1 "])
+@pytest.mark.parametrize(
+    "version",
+    ["", ".", "..", "versions/v1", r"versions\v1", " v1 ", "CON.txt", "release."],
+)
 def test_dataset_rejects_unsafe_version_segments(tmp_path: Path, version: str) -> None:
     with pytest.raises(ValueError, match="version|segment"):
         dataset_devkit.Dataset(dataroot=tmp_path, version=version)
@@ -59,14 +62,15 @@ def test_cli_help_smoke(argv: list[str], expected: str, capsys: pytest.CaptureFi
 
 
 @pytest.mark.parametrize("command", ["validate", "inspect"])
-def test_cli_rejects_unsafe_version_segments(command: str) -> None:
+@pytest.mark.parametrize("version", ["../v1", "CON.txt", "release."])
+def test_cli_rejects_unsafe_version_segments(command: str, version: str) -> None:
     from dataset_devkit.cli import create_parser
 
     with pytest.raises(SystemExit, match="2"):
-        create_parser().parse_args([command, "--dataroot", "DATASET", "--version", "../v1"])
+        create_parser().parse_args([command, "--dataroot", "DATASET", "--version", version])
 
 
-@pytest.mark.parametrize("case", ["missing", "malformed", "invalid"])
+@pytest.mark.parametrize("case", ["missing", "malformed", "invalid", "invalid_utf8"])
 def test_build_main_returns_concise_config_diagnostics(
     tmp_path: Path,
     case: str,
@@ -79,6 +83,8 @@ def test_build_main_returns_concise_config_diagnostics(
         config_path.write_text("{not-json", encoding="utf-8")
     elif case == "invalid":
         config_path.write_text(json.dumps({"schema_version": "1.0"}), encoding="utf-8")
+    elif case == "invalid_utf8":
+        config_path.write_bytes(b"\xff")
 
     result = main(["build", "--config", str(config_path)])
     error = capsys.readouterr().err

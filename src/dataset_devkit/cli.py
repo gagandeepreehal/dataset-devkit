@@ -56,7 +56,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "build":
         try:
             config = load_config(args.config)
-        except (OSError, json.JSONDecodeError, ValidationError, ConfigRootError) as error:
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValidationError,
+            ConfigRootError,
+        ) as error:
             print(f"dataset-devkit: error: {_format_config_error(error)}", file=sys.stderr)
             return 2
     try:
@@ -72,8 +78,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _format_config_error(
-    error: OSError | json.JSONDecodeError | ValidationError | ConfigRootError,
+    error: OSError | UnicodeDecodeError | json.JSONDecodeError | ValidationError | ConfigRootError,
 ) -> str:
+    if isinstance(error, UnicodeDecodeError):
+        return f"configuration is not valid UTF-8 at byte {error.start}"
     if isinstance(error, json.JSONDecodeError):
         return f"invalid JSON at line {error.lineno}, column {error.colno}: {error.msg}"
     if isinstance(error, ValidationError):

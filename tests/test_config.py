@@ -288,8 +288,13 @@ def test_account_url_rejects_url_userinfo(tmp_path: Path, account_url: str) -> N
     "account_url",
     [
         "https://account.blob.core.windows.net",
+        "https://account.blob.core.windows.net/",
+        "https://account.blob.core.windows.net:443/",
         "https://account.blob.core.usgovcloudapi.net",
+        "https://account.blob.core.chinacloudapi.cn",
+        "https://account.blob.core.cloudapi.de",
         "https://account.privatelink.blob.core.windows.net",
+        "https://account.privatelink.blob.core.usgovcloudapi.net",
     ],
 )
 def test_azure_blob_service_urls_are_accepted(tmp_path: Path, account_url: str) -> None:
@@ -306,6 +311,12 @@ def test_azure_blob_service_urls_are_accepted(tmp_path: Path, account_url: str) 
         "ftp://account.blob.core.windows.net",
         "https://example.com",
         "https://blob.evil.com",
+        "https://.blob.core.windows.net",
+        "https://-account.blob.core.windows.net",
+        "https://account.blob.core.windows.net:bad",
+        "https://account.blob.core.windows.net/container",
+        "https://account.blob.core.windows.net/#fragment",
+        "https://account.blob.core.windows.net/#",
         "https:///missing-host",
     ],
 )
@@ -526,7 +537,7 @@ def test_standalone_sas_metadata_query_parameters_are_allowed(
     set_nested(
         data,
         "azure.account_url",
-        f"https://example.blob.core.windows.net/search?{query_key}={query_value}",
+        f"https://example.blob.core.windows.net?{query_key}={query_value}",
     )
 
     config = load_config(write_config(tmp_path, data))
@@ -648,6 +659,16 @@ def test_scenario_rule_name_must_be_nonblank(tmp_path: Path, name: str) -> None:
         ("publication.version", ".."),
         ("publication.version", "versions/v1"),
         ("publication.version", " v1 "),
+        ("publication.version", "artifact "),
+        ("publication.version", "artifact."),
+        ("publication.version", "CON"),
+        ("publication.version", "prn.txt"),
+        ("publication.version", "AUX"),
+        ("publication.version", "nul.log"),
+        ("publication.version", "COM1"),
+        ("publication.version", "com9.ext"),
+        ("publication.version", "LPT1"),
+        ("publication.version", "lpt9.data"),
     ],
 )
 def test_manifest_and_publication_identifiers_are_safe_segments(
