@@ -8,6 +8,7 @@ import shutil
 import stat
 import tempfile
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -16,15 +17,24 @@ from typing import Protocol
 from dataset_devkit.acquisition import AcquisitionResult, AzureBlobAcquirer
 from dataset_devkit.blob_list import parse_blob_list
 from dataset_devkit.config import GlobalConfig
+from dataset_devkit.coordinator import (
+    PublicationBlockedError,
+    RecordingCoordinator,
+    RecordingFailure,
+    RecordingRequest,
+)
 from dataset_devkit.dataset import Dataset, DatasetFormatError
 from dataset_devkit.export import NUSCENES_VERSION, ExportEvidence, export_dataset
+from dataset_devkit.extraction.cache import ExtractionResultCache
 from dataset_devkit.extraction.camera import HevcDecoder
+from dataset_devkit.extraction.errors import StructuralExtractionError
+from dataset_devkit.extraction.models import RecordingExtractionResult
 from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.features import SceneFeatures, compute_recording_features
 from dataset_devkit.filtering import filter_scenes
+from dataset_devkit.provenance import SourceFingerprint, canonical_hash, extraction_config_hash
 from dataset_devkit.publication import publish_staging
-from dataset_devkit.quarantine import QuarantineReport, write_quarantine_report
-from dataset_devkit.sanity import evaluate_sanity
+from dataset_devkit.quarantine import write_rejection_manifest
 from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scenes import build_recording_scenes
 from dataset_devkit.split import split_selected_scenes
@@ -39,6 +49,14 @@ class BuildOperationalError(RuntimeError):
 class AcquirerProtocol(Protocol):
     def acquire(self, blob_path: str) -> AcquisitionResult: ...
 
+    def extraction_cache_reusable(
+        self, source: SourceFingerprint, expected_extraction_config_hash: str
+    ) -> bool: ...
+
+    def record_extraction_complete(
+        self, source: SourceFingerprint, completed_extraction_config_hash: str
+    ) -> Path: ...
+
 
 @dataclass(frozen=True)
 class BuildRuntime:
@@ -46,9 +64,7 @@ class BuildRuntime:
 
     acquirer_factory: Callable[[GlobalConfig], AcquirerProtocol] = AzureBlobAcquirer.from_config
     decoder_factory: Callable[[], HevcDecoder] | None = None
-    evidence_builder: Callable[
-        [GlobalConfig], tuple[ExportEvidence, tuple[str, ...]]
-    ] | None = None
+    extraction_cache_factory: Callable[[Path], ExtractionResultCache] = ExtractionResultCache
     official_smoke: bool = True
 
 
@@ -95,30 +111,6 @@ class InspectionSummary:
         }
 
 
-def _quarantine_failure(config: GlobalConfig, blob: str, stage: str, error: Exception) -> bool:
-    try:
-        write_quarantine_report(
-            config.quarantine.directory,
-            QuarantineReport(
-                recording_id=Path(blob).stem.replace(" ", "_") or "recording",
-                source_path=blob,
-                status="quarantined",
-                category="unexpected",
-                exception_type=type(error).__name__,
-                exception_message=str(error),
-                stage=stage,
-                deterministic_details={"blob_path": blob},
-                observed_context=(),
-                source_config_hash=None,
-                extraction_config_hash=None,
-                artifact_handling="no_owned_artifacts",
-            ),
-        )
-    except Exception:
-        return False
-    return True
-
-
 def _cleanup_owned_staging(staging: Path, identity: tuple[int, int]) -> bool:
     """Delete only the invocation-owned staging entry through its pinned parent."""
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -158,28 +150,133 @@ def _build_evidence(
         staging_root=config.paths.work_dir,
         **extractor_kwargs,  # type: ignore[arg-type]
     )
-    graphs = []
-    failures: list[str] = []
-    quarantine_complete = True
-    for blob in blobs:
-        try:
-            acquisition = acquirer.acquire(blob)
-        except Exception as error:
-            failures.append(blob)
-            quarantine_complete &= _quarantine_failure(config, blob, "acquisition", error)
-            continue
-        try:
-            extraction = extractor.extract(acquisition.artifact_path)
-            from dataset_devkit.validity import evaluate_validity
 
-            validity = evaluate_validity(extraction, config)
-            evaluate_sanity(extraction, validity, config)
-            graph = build_recording_scenes(validity, acquisition.manifest.source, config)
+    def acquire_one(blob: str) -> AcquisitionResult | Exception:
+        try:
+            return acquirer.acquire(blob)
         except Exception as error:
-            failures.append(blob)
-            quarantine_complete &= _quarantine_failure(config, blob, "extraction", error)
+            return error
+
+    with ThreadPoolExecutor(max_workers=config.execution.workers) as executor:
+        acquired_outcomes = tuple(executor.map(acquire_one, blobs))
+    acquired: list[tuple[int, str, AcquisitionResult]] = []
+    acquisition_errors: list[tuple[int, str, Exception]] = []
+    for index, (blob, outcome) in enumerate(zip(blobs, acquired_outcomes, strict=True)):
+        if isinstance(outcome, Exception):
+            acquisition_errors.append((index, blob, outcome))
+        else:
+            acquired.append((index, blob, outcome))
+    acquisition_by_path = {
+        item.artifact_path.resolve(): item for _, _, item in acquired
+    }
+    extraction_cache = runtime.extraction_cache_factory(config.paths.cache_dir)
+
+    def extract_cached(path: Path) -> RecordingExtractionResult:
+        acquisition = acquisition_by_path[path.resolve()]
+        source = acquisition.manifest.source
+        if acquirer.extraction_cache_reusable(source, extraction_hash):
+            cached = extraction_cache.load(source, extraction_hash, path)
+            if cached is not None:
+                return cached
+        extracted = extractor.extract(path)
+        cached = extraction_cache.store(source, extraction_hash, extracted)
+        acquirer.record_extraction_complete(source, extraction_hash)
+        return cached
+
+    coordinator = RecordingCoordinator(config=config, extractor=extract_cached)
+    source_config_hash = canonical_hash(config.azure.model_dump(mode="json"))
+    extraction_hash = extraction_config_hash(config)
+    acquisition_failures: list[RecordingFailure] = []
+    for index, blob, error in acquisition_errors:
+        request = RecordingRequest(
+            f"recording-{index:06d}",
+            Path(blob),
+            source_config_hash,
+            extraction_hash,
+        )
+        acquisition_failures.append(
+            coordinator.quarantine_failure(
+                request,
+                error,
+                category=(
+                    "structural" if isinstance(error, StructuralExtractionError) else "unexpected"
+                ),
+                stage="acquisition",
+            )
+        )
+    requests = tuple(
+        RecordingRequest(
+            f"recording-{index:06d}",
+            acquisition.artifact_path,
+            canonical_hash(acquisition.manifest.source.to_dict()),
+            extraction_hash,
+        )
+        for index, _, acquisition in acquired
+    )
+    try:
+        coordinator_result = (
+            coordinator.process(
+                requests,
+                allow_partial_export=True,
+                max_workers=config.execution.workers,
+            )
+            if requests
+            else None
+        )
+    except PublicationBlockedError as error:
+        raise BuildOperationalError(str(error)) from error
+    successes = () if coordinator_result is None else coordinator_result.successes
+    processing_failures = () if coordinator_result is None else coordinator_result.failures
+    graphs = []
+    scene_failures: list[RecordingFailure] = []
+    for success in successes:
+        acquisition = acquisition_by_path[success.extraction.source_path.resolve()]
+        try:
+            graph = build_recording_scenes(
+                success.validity, acquisition.manifest.source, config
+            )
+        except Exception as error:
+            request = next(item for item in requests if item.recording_id == success.recording_id)
+            scene_failures.append(
+                coordinator.quarantine_failure(
+                    request,
+                    error,
+                    category=(
+                        "structural"
+                        if isinstance(error, StructuralExtractionError)
+                        else "unexpected"
+                    ),
+                    stage="scene_building",
+                    extraction=success.extraction,
+                    validity=success.validity,
+                )
+            )
             continue
         graphs.append(graph)
+    all_failures = tuple(
+        sorted(
+            (*acquisition_failures, *processing_failures, *scene_failures),
+            key=lambda item: item.recording_id,
+        )
+    )
+    quarantine_complete = all(item.quarantine_persisted for item in all_failures)
+    if all_failures and quarantine_complete:
+        try:
+            write_rejection_manifest(
+                config.quarantine.directory,
+                config.quarantine.manifest_name,
+                tuple(
+                    item.quarantine.report
+                    for item in all_failures
+                    if item.quarantine is not None
+                ),
+            )
+        except Exception:
+            quarantine_complete = False
+    failures = tuple(
+        blobs[int(item.recording_id.removeprefix("recording-"))]
+        for item in all_failures
+    )
     if failures and (not config.execution.allow_partial_export or not quarantine_complete):
         raise BuildOperationalError(
             f"publication blocked after {len(failures)} quarantined recording failure(s)"
@@ -231,6 +328,9 @@ def _build_evidence(
                 ],
             },
             "selection": {
+                "candidate_fingerprint": selection.candidate_fingerprint,
+                "config_fingerprint": selection.config_fingerprint,
+                "rules_fingerprint": selection.rules_fingerprint,
                 "assignments": [asdict(item) for item in selection.assignments],
                 "rule_audits": [asdict(item) for item in selection.rule_audits],
                 "unselected": [asdict(item) for item in selection.unselected],
@@ -252,16 +352,7 @@ def build_dataset(config: GlobalConfig, *, runtime: BuildRuntime | None = None) 
     final = output / config.publication.version
     if final.exists() or final.is_symlink():
         raise FileExistsError(f"refusing to overwrite existing final dataset: {final}")
-    if selected_runtime.evidence_builder is None:
-        evidence, failures = _build_evidence(config, selected_runtime)
-    else:
-        evidence, failures = selected_runtime.evidence_builder(config)
-        if failures and not config.execution.allow_partial_export:
-            raise BuildOperationalError(
-                f"publication blocked after {len(failures)} recording failure(s)"
-            )
-    if evidence.pipeline_audit is None:
-        raise BuildOperationalError("build evidence is missing the pipeline audit report")
+    evidence, failures = _build_evidence(config, selected_runtime)
     staging = Path(tempfile.mkdtemp(prefix=f".{config.publication.version}.staging-", dir=output))
     identity = staging.stat().st_dev, staging.stat().st_ino
     try:

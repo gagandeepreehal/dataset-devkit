@@ -9,6 +9,7 @@ import os
 import stat
 from contextlib import suppress
 from dataclasses import dataclass
+from decimal import ROUND_FLOOR, Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
@@ -21,6 +22,10 @@ from dataset_devkit.provenance import canonical_hash, canonical_json
 
 _MANIFEST = "mz_extensions/content_manifest.json"
 _QUATERNION_TOLERANCE = 1e-9
+_LEAKAGE_WARNING = (
+    "Scene-level splitting can leak neighboring temporal context when chronologically "
+    "adjacent scenes from one recording are assigned to different splits."
+)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -399,6 +404,256 @@ def _images(
             )
 
 
+def _sha256_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_split_extension(
+    split: object,
+    config: GlobalConfig | None,
+    tables: dict[str, list[dict[str, Any]]],
+    scene_to_source: dict[str, str],
+    source_blob_paths: dict[str, str],
+    pipeline_audit: object,
+    findings: list[ValidationFinding],
+) -> None:
+    def fail(message: str) -> None:
+        findings.append(
+            ValidationFinding("error", "split_integrity", "split", message)
+        )
+
+    expected_keys = {
+        "schema_version",
+        "assignments",
+        "strata",
+        "adjacent_scene_leakage",
+        "seed",
+        "test_fraction",
+        "stratify",
+        "population_count",
+        "train_count",
+        "test_count",
+        "rounding_rule",
+        "config_fingerprint",
+        "upstream_fingerprint",
+        "candidate_fingerprint",
+        "graph_fingerprint",
+    }
+    if not isinstance(split, dict) or set(split) != expected_keys:
+        fail("split schema fields differ")
+        return
+    assignments = split["assignments"]
+    if not isinstance(assignments, list) or any(
+        not isinstance(item, dict)
+        or set(item)
+        != {"scene_token", "source_digest", "primary_scenario", "split", "rank"}
+        for item in assignments
+    ):
+        fail("split assignments are malformed")
+        return
+    typed = cast(list[dict[str, Any]], assignments)
+    identities = [(item.get("scene_token"), item.get("source_digest")) for item in typed]
+    scene_tokens = {item.get("token") for item in tables["scene"]}
+    if (
+        len(identities) != len(set(identities))
+        or {item[0] for item in identities} != scene_tokens
+        or any(
+            not isinstance(item[0], str)
+            or not isinstance(item[1], str)
+            or scene_to_source.get(item[0]) != item[1]
+            for item in identities
+        )
+    ):
+        fail("split assignment identities are not unique and complete")
+        return
+    seed = split.get("seed")
+    fraction = split.get("test_fraction")
+    stratify = split.get("stratify")
+    if (
+        not isinstance(seed, int)
+        or isinstance(seed, bool)
+        or not isinstance(fraction, (int, float))
+        or isinstance(fraction, bool)
+        or not 0 < float(fraction) < 1
+        or not isinstance(stratify, bool)
+    ):
+        fail("split seed, fraction, or stratify value is malformed")
+        return
+    if config is not None and (
+        seed != config.split.seed
+        or float(fraction) != config.split.test_fraction
+        or stratify != config.split.stratify
+        or split.get("config_fingerprint")
+        != canonical_hash(config.split.model_dump(mode="json"))
+    ):
+        fail("split configuration commitment differs from resolved config")
+    population = len(typed)
+    target = int(
+        (Decimal(population) * Decimal(str(fraction)) + Decimal("0.5")).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
+    )
+    actual_test = sum(item.get("split") == "test" for item in typed)
+    if (
+        split.get("schema_version") != 1
+        or split.get("population_count") != population
+        or split.get("test_count") != target
+        or split.get("train_count") != population - target
+        or actual_test != target
+        or split.get("rounding_rule") != "floor(n * test_fraction + 0.5)"
+        or any(item.get("split") not in {"train", "test"} for item in typed)
+    ):
+        fail("split counts, rounding, or train/test values differ")
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in typed:
+        scenario = item.get("primary_scenario")
+        if not isinstance(scenario, str) or not scenario:
+            fail("split primary scenario is malformed")
+            continue
+        groups.setdefault(scenario, []).append(item)
+        expected_rank = canonical_hash(
+            {
+                "seed": seed,
+                "primary_scenario": scenario if stratify else "__all__",
+                "scene_token": item["scene_token"],
+                "source_digest": item["source_digest"],
+            }
+        )
+        if item.get("rank") != expected_rank:
+            fail("split assignment rank differs")
+    strata = split.get("strata")
+    stratum_keys = {
+        "primary_scenario",
+        "population_count",
+        "expected_test_count",
+        "target_test_count",
+        "actual_test_count",
+        "actual_train_count",
+        "stratification_applied",
+        "fallback_reason",
+    }
+    if not isinstance(strata, list) or any(
+        not isinstance(item, dict) or set(item) != stratum_keys for item in strata
+    ):
+        fail("split strata audit is malformed")
+    else:
+        by_scenario = {
+            item.get("primary_scenario"): item for item in cast(list[dict[str, Any]], strata)
+        }
+        if len(by_scenario) != len(strata) or set(by_scenario) != set(groups):
+            fail("split strata identities differ")
+        for scenario, items in groups.items():
+            audit = by_scenario.get(scenario)
+            if audit is None:
+                continue
+            count = len(items)
+            tests = sum(item.get("split") == "test" for item in items)
+            applied = bool(stratify and count >= 2 and 0 < tests < count)
+            fallback = (
+                "stratification_disabled"
+                if not stratify
+                else "stratum_too_small"
+                if count < 2
+                else "global_target_prevents_both_sides"
+                if not applied
+                else None
+            )
+            if (
+                audit.get("population_count") != count
+                or audit.get("expected_test_count")
+                != str(Decimal(count) * Decimal(str(fraction)))
+                or audit.get("target_test_count") != tests
+                or audit.get("actual_test_count") != tests
+                or audit.get("actual_train_count") != count - tests
+                or audit.get("stratification_applied") is not applied
+                or audit.get("fallback_reason") != fallback
+            ):
+                fail("split stratum audit differs from assignments")
+    for key in ("upstream_fingerprint", "candidate_fingerprint", "graph_fingerprint"):
+        if not _sha256_text(split.get(key)):
+            fail(f"split {key} is not a SHA-256 commitment")
+    if isinstance(pipeline_audit, dict):
+        selection = pipeline_audit.get("selection")
+        if isinstance(selection, dict) and selection.get("candidate_fingerprint") != split.get(
+            "candidate_fingerprint"
+        ):
+            fail("split candidate fingerprint differs from pipeline audit")
+    leakage = split.get("adjacent_scene_leakage")
+    if (
+        not isinstance(leakage, dict)
+        or set(leakage) != {"checked", "warning", "cross_split_pairs"}
+        or leakage.get("checked") is not True
+        or leakage.get("warning") != _LEAKAGE_WARNING
+        or not isinstance(leakage.get("cross_split_pairs"), list)
+    ):
+        fail("adjacent-scene leakage audit is malformed")
+        return
+    split_by_scene = {cast(str, item["scene_token"]): item["split"] for item in typed}
+    sample_by_token = {item.get("token"): item for item in tables["sample"]}
+    expected_pairs: list[dict[str, object]] = []
+    for source in sorted(set(scene_to_source.values())):
+        source_scenes = [
+            scene
+            for scene in tables["scene"]
+            if scene_to_source.get(cast(str, scene.get("token"))) == source
+        ]
+        ordered = sorted(
+            source_scenes,
+            key=lambda scene: cast(
+                int, sample_by_token[scene.get("first_sample_token")]["timestamp"]
+            ),
+        )
+        for earlier, later in zip(ordered, ordered[1:], strict=False):
+            earlier_token = cast(str, earlier["token"])
+            later_token = cast(str, later["token"])
+            if split_by_scene[earlier_token] == split_by_scene[later_token]:
+                continue
+            expected_pairs.append(
+                {
+                    "source_digest": source,
+                    "source_blob_path": source_blob_paths.get(source),
+                    "earlier_scene_token": earlier_token,
+                    "later_scene_token": later_token,
+                    "earlier_last_timestamp_us": sample_by_token[
+                        earlier["last_sample_token"]
+                    ]["timestamp"],
+                    "later_first_timestamp_us": sample_by_token[
+                        later["first_sample_token"]
+                    ]["timestamp"],
+                    "earlier_split": split_by_scene[earlier_token],
+                    "later_split": split_by_scene[later_token],
+                }
+            )
+    actual_pairs = cast(list[object], leakage["cross_split_pairs"])
+    if len(actual_pairs) != len(expected_pairs):
+        fail("adjacent-scene leakage pair count differs")
+    else:
+        for actual, expected in zip(actual_pairs, expected_pairs, strict=True):
+            earlier_ns = (
+                actual.get("earlier_last_timestamp_ns") if isinstance(actual, dict) else None
+            )
+            later_ns = actual.get("later_first_timestamp_ns") if isinstance(actual, dict) else None
+            if not isinstance(actual, dict) or (
+                actual.get("source_digest") != expected["source_digest"]
+                or actual.get("source_blob_path") != expected["source_blob_path"]
+                or actual.get("earlier_scene_token") != expected["earlier_scene_token"]
+                or actual.get("later_scene_token") != expected["later_scene_token"]
+                or actual.get("earlier_split") != expected["earlier_split"]
+                or actual.get("later_split") != expected["later_split"]
+                or not isinstance(earlier_ns, int)
+                or isinstance(earlier_ns, bool)
+                or earlier_ns // 1000 != expected["earlier_last_timestamp_us"]
+                or not isinstance(later_ns, int)
+                or isinstance(later_ns, bool)
+                or later_ns // 1000 != expected["later_first_timestamp_us"]
+            ):
+                fail("adjacent-scene leakage pair differs from chronology")
+
+
 def _extensions(
     root: Path,
     tables: dict[str, list[dict[str, Any]]],
@@ -446,7 +701,13 @@ def _extensions(
     }
     recording_sources: set[str] = set()
     log_to_source: dict[str, str] = {}
-    if isinstance(recordings, list) and all(isinstance(item, dict) for item in recordings):
+    source_blob_paths: dict[str, str] = {}
+    recording_keys = {"source", "source_digest", "log_token", "channels"}
+    source_keys = {"account_url", "container", "blob_path", "etag", "size"}
+    channel_keys = {"original", "normalized"}
+    if isinstance(recordings, list) and all(
+        isinstance(item, dict) and set(item) == recording_keys for item in recordings
+    ):
         for item in cast(list[dict[str, Any]], recordings):
             source = item.get("source_digest")
             log_token = item.get("log_token")
@@ -469,10 +730,44 @@ def _extensions(
                 continue
             recording_sources.add(source)
             log_to_source[log_token] = source
+            source_value = item.get("source")
+            blob_path = source_value.get("blob_path") if isinstance(source_value, dict) else None
+            channels = item.get("channels")
+            channel_rows = (
+                cast(list[dict[str, Any]], channels) if isinstance(channels, list) else []
+            )
+            channel_identities = [row.get("normalized") for row in channel_rows]
+            if (
+                not isinstance(source_value, dict)
+                or set(source_value) != source_keys
+                or not isinstance(blob_path, str)
+                or source in source_blob_paths
+                or not isinstance(channels, list)
+                or any(not isinstance(row, dict) or set(row) != channel_keys for row in channels)
+                or any(
+                    not isinstance(row.get("original"), str)
+                    or not isinstance(row.get("normalized"), str)
+                    for row in channel_rows
+                )
+                or len(channel_identities) != len(set(channel_identities))
+            ):
+                findings.append(
+                    ValidationFinding(
+                        "error",
+                        "extension_reference",
+                        "recordings",
+                        "recording source payload is malformed or duplicated",
+                    )
+                )
+            else:
+                source_blob_paths[source] = blob_path
     else:
         findings.append(
             ValidationFinding(
-                "error", "extension_reference", "recordings", "recordings must be an array"
+                "error",
+                "extension_reference",
+                "recordings",
+                "recordings must contain exact-shaped unique rows",
             )
         )
     if set(log_to_source) != log_tokens:
@@ -489,11 +784,34 @@ def _extensions(
         for scene in tables["scene"]
         if isinstance(scene.get("token"), str)
     }
+    scene_extension_keys = {
+        "validity": {
+            "scene_token",
+            "source_digest",
+            "scene_valid_ratio",
+            "source_gnss_valid_ratio",
+            "camera_coverage_ratio",
+            "camera_coverage_by_channel",
+            "max_abs_sync_error_ms",
+            "mean_abs_sync_error_ms",
+            "sample_data",
+            "samples",
+        },
+        "tags": {"scene_token", "source_digest", "computed_tags"},
+    }
     for name in ("validity", "tags"):
         value = loaded[name]
+        typed_rows = cast(list[dict[str, Any]], value) if isinstance(value, list) else []
+        identities = [item.get("scene_token") for item in typed_rows if isinstance(item, dict)]
         if (
             not isinstance(value, list)
-            or {item.get("scene_token") for item in value if isinstance(item, dict)} != scenes
+            or any(
+                not isinstance(item, dict) or set(item) != scene_extension_keys[name]
+                for item in value
+            )
+            or len(identities) != len(value)
+            or len(identities) != len(set(identities))
+            or set(identities) != scenes
         ):
             findings.append(
                 ValidationFinding(
@@ -504,8 +822,8 @@ def _extensions(
                 )
             )
         if isinstance(value, list) and any(
-            isinstance(item, dict)
-            and (
+            not isinstance(item, dict)
+            or (
                 item.get("source_digest") not in recording_sources
                 or scene_to_source.get(cast(str, item.get("scene_token")))
                 != item.get("source_digest")
@@ -521,10 +839,39 @@ def _extensions(
                 )
             )
     gnss = loaded["gnss"]
+    gnss_keys = {
+        "sample_data_token",
+        "scene_token",
+        "source_digest",
+        "original_channel",
+        "normalized_channel",
+        "timestamp_ns",
+        "image_sha256",
+        "available",
+        "latitude_deg",
+        "longitude_deg",
+        "height_m",
+        "quaternion_wxyz",
+        "fraction",
+        "sync_gap_before_ns",
+        "sync_gap_after_ns",
+        "source_validity",
+        "position_uncertainty",
+        "orientation_uncertainty",
+        "before",
+        "after",
+    }
+    gnss_identities = (
+        [item.get("sample_data_token") for item in gnss if isinstance(item, dict)]
+        if isinstance(gnss, list)
+        else []
+    )
     if (
         not isinstance(gnss, list)
-        or any(not isinstance(item, dict) for item in gnss)
-        or {item.get("sample_data_token") for item in gnss if isinstance(item, dict)} != sample_data
+        or any(not isinstance(item, dict) or set(item) != gnss_keys for item in gnss)
+        or len(gnss_identities) != len(gnss)
+        or len(gnss_identities) != len(set(gnss_identities))
+        or set(gnss_identities) != sample_data
     ):
         findings.append(
             ValidationFinding(
@@ -584,10 +931,30 @@ def _extensions(
         )
     annotations = loaded["annotations"]
     annotation_scenes = annotations.get("scenes") if isinstance(annotations, dict) else None
+    annotation_scene_keys = {
+        "scene_token",
+        "source_digest",
+        "human_labels",
+        "annotation_refs",
+        "annotation_window_ref",
+    }
+    annotation_scene_ids = (
+        [item.get("scene_token") for item in annotation_scenes if isinstance(item, dict)]
+        if isinstance(annotation_scenes, list)
+        else []
+    )
     if (
+        not isinstance(annotations, dict)
+        or set(annotations) != {"scenes", "records", "matches", "windows"}
+        or
         not isinstance(annotation_scenes, list)
-        or {item.get("scene_token") for item in annotation_scenes if isinstance(item, dict)}
-        != scenes
+        or any(
+            not isinstance(item, dict) or set(item) != annotation_scene_keys
+            for item in annotation_scenes
+        )
+        or len(annotation_scene_ids) != len(annotation_scenes)
+        or len(annotation_scene_ids) != len(set(annotation_scene_ids))
+        or set(annotation_scene_ids) != scenes
     ):
         findings.append(
             ValidationFinding(
@@ -608,6 +975,117 @@ def _extensions(
                 "annotation scene/source ownership differs",
             )
         )
+    if isinstance(annotations, dict):
+        records = annotations.get("records")
+        matches = annotations.get("matches")
+        windows = annotations.get("windows")
+        record_keys = {
+            "source_digest",
+            "token",
+            "line_number",
+            "blob_path",
+            "timestamp_ns",
+            "labels",
+        }
+        match_keys = {
+            "source_digest",
+            "annotation_token",
+            "line_number",
+            "matched",
+            "sample_timestamp_ns",
+            "signed_error_ns",
+            "absolute_error_ns",
+            "reason",
+        }
+        window_keys = {
+            "source_digest",
+            "token",
+            "annotation_tokens",
+            "first_timestamp_ns",
+            "last_timestamp_ns",
+            "first_sample_timestamp_ns",
+            "last_sample_timestamp_ns",
+            "labels",
+        }
+        records_typed = cast(list[dict[str, Any]], records) if isinstance(records, list) else []
+        matches_typed = cast(list[dict[str, Any]], matches) if isinstance(matches, list) else []
+        windows_typed = cast(list[dict[str, Any]], windows) if isinstance(windows, list) else []
+        record_ids = [item.get("token") for item in records_typed if isinstance(item, dict)]
+        match_ids = [
+            (item.get("source_digest"), item.get("annotation_token"))
+            for item in matches_typed
+            if isinstance(item, dict)
+        ]
+        window_ids = [item.get("token") for item in windows_typed if isinstance(item, dict)]
+        malformed_annotations = (
+            not isinstance(records, list)
+            or any(not isinstance(item, dict) or set(item) != record_keys for item in records)
+            or len(record_ids) != len(records)
+            or len(record_ids) != len(set(record_ids))
+            or not isinstance(matches, list)
+            or any(not isinstance(item, dict) or set(item) != match_keys for item in matches)
+            or len(match_ids) != len(matches)
+            or len(match_ids) != len(set(match_ids))
+            or not isinstance(windows, list)
+            or any(not isinstance(item, dict) or set(item) != window_keys for item in windows)
+            or len(window_ids) != len(windows)
+            or len(window_ids) != len(set(window_ids))
+        )
+        record_source = {
+            cast(str, item.get("token")): item.get("source_digest") for item in records_typed
+        }
+        window_source = {
+            cast(str, item.get("token")): item.get("source_digest") for item in windows_typed
+        }
+        malformed_annotations = malformed_annotations or any(
+            item.get("source_digest") not in recording_sources
+            or source_blob_paths.get(cast(str, item.get("source_digest")))
+            != item.get("blob_path")
+            for item in records_typed
+        )
+        malformed_annotations = malformed_annotations or any(
+            item.get("source_digest") not in recording_sources
+            or record_source.get(cast(str, item.get("annotation_token")))
+            != item.get("source_digest")
+            for item in matches_typed
+        )
+        malformed_annotations = malformed_annotations or any(
+            item.get("source_digest") not in recording_sources
+            or not isinstance(item.get("annotation_tokens"), list)
+            or len(item.get("annotation_tokens", []))
+            != len(set(item.get("annotation_tokens", [])))
+            or any(
+                record_source.get(cast(str, token)) != item.get("source_digest")
+                for token in item.get("annotation_tokens", [])
+            )
+            for item in windows_typed
+        )
+        if isinstance(annotation_scenes, list):
+            malformed_annotations = malformed_annotations or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("annotation_refs"), list)
+                or len(item.get("annotation_refs", []))
+                != len(set(item.get("annotation_refs", [])))
+                or any(
+                    record_source.get(cast(str, token)) != item.get("source_digest")
+                    for token in item.get("annotation_refs", [])
+                )
+                or (
+                    item.get("annotation_window_ref") != ""
+                    and window_source.get(cast(str, item.get("annotation_window_ref")))
+                    != item.get("source_digest")
+                )
+                for item in annotation_scenes
+            )
+        if malformed_annotations:
+            findings.append(
+                ValidationFinding(
+                    "error",
+                    "extension_reference",
+                    "annotations",
+                    "annotation rows are malformed, duplicated, or cross recording ownership",
+                )
+            )
     validation = loaded["validation"]
     if finalized and (
         not isinstance(validation, dict)
@@ -624,7 +1102,40 @@ def _extensions(
             )
         )
     pipeline_audit = loaded["pipeline_audit"]
-    if not isinstance(pipeline_audit, dict) or pipeline_audit.get("schema_version") != 1:
+    audit_keys = (
+        set(pipeline_audit) if isinstance(pipeline_audit, dict) else set()
+    )
+    selection_audit = (
+        pipeline_audit.get("selection") if isinstance(pipeline_audit, dict) else None
+    )
+    if (
+        not isinstance(pipeline_audit, dict)
+        or audit_keys
+        not in (
+            {"schema_version", "filter", "selection"},
+            {"schema_version", "blob_order", "failed_recordings", "filter", "selection"},
+        )
+        or pipeline_audit.get("schema_version") != 1
+        or not isinstance(pipeline_audit.get("filter"), dict)
+        or not isinstance(selection_audit, dict)
+        or set(selection_audit)
+        != {
+            "candidate_fingerprint",
+            "config_fingerprint",
+            "rules_fingerprint",
+            "assignments",
+            "rule_audits",
+            "unselected",
+        }
+        or any(
+            not _sha256_text(selection_audit.get(key))
+            for key in ("candidate_fingerprint", "config_fingerprint", "rules_fingerprint")
+        )
+        or any(
+            not isinstance(selection_audit.get(key), list)
+            for key in ("assignments", "rule_audits", "unselected")
+        )
+    ):
         findings.append(
             ValidationFinding(
                 "error",
@@ -633,6 +1144,15 @@ def _extensions(
                 "pipeline audit report is malformed",
             )
         )
+    _validate_split_extension(
+        split,
+        config,
+        tables,
+        scene_to_source,
+        source_blob_paths,
+        pipeline_audit,
+        findings,
+    )
     if config is not None:
         required = {
             f"CAM_{str(channel).upper().replace('-', '_')}"

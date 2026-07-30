@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from typing import Any, Literal
 
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.uncertainty import bounded_freeze
+from dataset_devkit.provenance import canonical_json
 
 FailureCategory = Literal["structural", "sanity", "unexpected"]
 ArtifactHandling = Literal["no_owned_artifacts", "preserved_in_place"]
@@ -248,4 +250,77 @@ def write_quarantine_report(directory: Path, report: QuarantineReport) -> Quaran
                 continue
             return QuarantineArtifact(report, directory / filename)
     finally:
+        os.close(directory_fd)
+
+
+def write_rejection_manifest(
+    directory: Path,
+    manifest_name: str,
+    reports: tuple[QuarantineReport, ...],
+) -> Path:
+    """Merge durable reports into one locked, canonical JSONL rejection inventory."""
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", manifest_name) is None:
+        raise StructuralExtractionError("unsafe quarantine manifest name")
+    directory_fd = _open_directory(directory)
+    lock_fd = -1
+    temporary: str | None = None
+    try:
+        lock_fd = os.open(
+            f".{manifest_name}.lock",
+            os.O_RDWR | os.O_CREAT | _FILE_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        lock_stat = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+            raise StructuralExtractionError("unsafe quarantine manifest lock")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        existing: list[dict[str, Any]] = []
+        try:
+            manifest_stat = os.stat(
+                manifest_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(manifest_stat.st_mode) or manifest_stat.st_nlink != 1:
+                raise StructuralExtractionError("unsafe existing quarantine manifest")
+            read_fd = os.open(manifest_name, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd)
+            try:
+                for line in _read_all(read_fd).decode("utf-8").splitlines():
+                    value = json.loads(line)
+                    if not isinstance(value, dict):
+                        raise ValueError("rejection manifest row must be an object")
+                    existing.append(value)
+            finally:
+                os.close(read_fd)
+        rows = existing + [report.as_dict() for report in reports]
+        unique = {canonical_json(row): row for row in rows}
+        content = "".join(f"{key}\n" for key in sorted(unique)).encode("utf-8")
+        temporary = f".{manifest_name}.{uuid.uuid4().hex}.tmp"
+        write_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            _write_all(write_fd, content)
+            os.fsync(write_fd)
+        finally:
+            os.close(write_fd)
+        os.replace(temporary, manifest_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        temporary = None
+        os.fsync(directory_fd)
+        return directory / manifest_name
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise StructuralExtractionError("failed to update quarantine rejection manifest") from error
+    finally:
+        if temporary is not None:
+            with suppress(OSError):
+                os.unlink(temporary, dir_fd=directory_fd)
+        if lock_fd >= 0:
+            with suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
         os.close(directory_fd)

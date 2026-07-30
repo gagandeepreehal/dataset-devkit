@@ -981,6 +981,9 @@ def _export_into(
         "schema_version": 1,
         "filter": {"state": "not_provided_to_direct_export"},
         "selection": {
+            "candidate_fingerprint": evidence.selection.candidate_fingerprint,
+            "config_fingerprint": evidence.selection.config_fingerprint,
+            "rules_fingerprint": evidence.selection.rules_fingerprint,
             "assignments": _jsonable(evidence.selection.assignments),
             "rule_audits": _jsonable(evidence.selection.rule_audits),
             "unselected": _jsonable(evidence.selection.unselected),

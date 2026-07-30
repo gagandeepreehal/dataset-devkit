@@ -263,6 +263,16 @@ def verify_owned_staged_images(staging_root: Path, images: tuple[StagedImage, ..
     os.close(directory_fd)
 
 
+def staged_directory_metadata(path: Path) -> tuple[int, int, tuple[_Identity, ...]]:
+    """Return no-follow identity evidence for an existing staging directory."""
+    directory_fd, identities = _open_directory_chain(path, create=False)
+    try:
+        device, inode = _identity(os.fstat(directory_fd))
+        return device, inode, identities
+    finally:
+        os.close(directory_fd)
+
+
 def verify_staged_image_identity(image: StagedImage) -> None:
     """Reverify one immutable staged asset without following caller-controlled paths."""
     if (

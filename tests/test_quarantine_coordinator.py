@@ -464,6 +464,33 @@ def test_structural_failure_is_never_downgraded_by_sanity_policy(
     assert result.failures[0].stage == "extraction"
 
 
+def test_coordinator_honors_worker_bound_and_preserves_request_order(
+    tmp_path: Path, config_factory: object
+) -> None:
+    rendezvous = threading.Barrier(2)
+    threads: set[int] = set()
+    lock = threading.Lock()
+
+    def extract(path: Path) -> object:
+        with lock:
+            threads.add(threading.get_ident())
+        rendezvous.wait(timeout=5)
+        return replace(_result(tmp_path / f"owned-{path.stem}"), source_path=path)
+
+    requests = (
+        RecordingRequest("second", tmp_path / "second.mcap"),
+        RecordingRequest("first", tmp_path / "first.mcap"),
+    )
+    result = RecordingCoordinator(
+        config=_policy_config(config_factory),
+        quarantine_directory=tmp_path / "quarantine",
+        extractor=extract,  # type: ignore[arg-type]
+    ).process(requests, allow_partial_export=False, max_workers=2)
+
+    assert len(threads) == 2
+    assert [item.recording_id for item in result.successes] == ["second", "first"]
+
+
 def test_sanity_error_is_quarantined_with_validity_audit_context(
     tmp_path: Path, config_factory: object
 ) -> None:

@@ -8,6 +8,7 @@ import re
 import stat
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -295,11 +296,43 @@ class RecordingCoordinator:
             quarantine_error=quarantine_error,
         )
 
+    def quarantine_failure(
+        self,
+        request: RecordingRequest,
+        error: Exception,
+        *,
+        category: FailureCategory,
+        stage: str,
+        extraction: RecordingExtractionResult | None = None,
+        validity: ValidityReport | None = None,
+    ) -> RecordingFailure:
+        """Persist one failure outside the standard extraction/validity/sanity path."""
+        return self._failure(request, error, category, stage, extraction, validity)
+
+    def _process_one(self, request: RecordingRequest) -> RecordingOutcome:
+        extraction: RecordingExtractionResult | None = None
+        validity: ValidityReport | None = None
+        stage = "extraction"
+        try:
+            extraction = self.extractor(request.source_path)
+            stage = "validity"
+            validity = evaluate_validity(extraction, self.config)
+            stage = "sanity"
+            sanity = evaluate_sanity(extraction, validity, self.config)
+        except StructuralExtractionError as error:
+            return self._failure(request, error, "structural", stage, extraction, validity)
+        except NonstructuralSanityError as error:
+            return self._failure(request, error, "sanity", stage, extraction, validity)
+        except Exception as error:
+            return self._failure(request, error, "unexpected", stage, extraction, validity)
+        return RecordingSuccess(request.recording_id, extraction, validity, sanity)
+
     def process(
         self,
         requests: Sequence[RecordingRequest],
         *,
         allow_partial_export: bool | None = None,
+        max_workers: int = 1,
     ) -> CoordinatorResult:
         if not requests:
             raise CoordinatorInputError("at least one recording is required")
@@ -309,33 +342,13 @@ class RecordingCoordinator:
         )
         if duplicates:
             raise CoordinatorInputError(f"duplicate recording identity: {duplicates[0]}")
-        outcomes: list[RecordingOutcome] = []
-        for request in requests:
-            extraction: RecordingExtractionResult | None = None
-            validity: ValidityReport | None = None
-            stage = "extraction"
-            try:
-                extraction = self.extractor(request.source_path)
-                stage = "validity"
-                validity = evaluate_validity(extraction, self.config)
-                stage = "sanity"
-                sanity = evaluate_sanity(extraction, validity, self.config)
-            except StructuralExtractionError as error:
-                outcomes.append(
-                    self._failure(request, error, "structural", stage, extraction, validity)
-                )
-            except NonstructuralSanityError as error:
-                outcomes.append(
-                    self._failure(request, error, "sanity", stage, extraction, validity)
-                )
-            except Exception as error:
-                outcomes.append(
-                    self._failure(request, error, "unexpected", stage, extraction, validity)
-                )
-            else:
-                outcomes.append(
-                    RecordingSuccess(request.recording_id, extraction, validity, sanity)
-                )
+        if max_workers < 1:
+            raise CoordinatorInputError("max_workers must be positive")
+        if max_workers == 1:
+            outcomes = [self._process_one(request) for request in requests]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                outcomes = list(executor.map(self._process_one, requests))
         successes = tuple(item for item in outcomes if isinstance(item, RecordingSuccess))
         failures = tuple(item for item in outcomes if isinstance(item, RecordingFailure))
         partial = (
