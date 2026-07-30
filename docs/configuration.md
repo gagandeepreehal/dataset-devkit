@@ -108,7 +108,11 @@ within the configured cache. Unsafe symbolic or hard links are never followed, m
 promoted into final cache objects. Download verification is bound to the partial file's device
 and inode; finalization checks that same inode before and after rename and then repeats full-file
 integrity verification before writing the acquisition manifest. Empty source blobs follow the
-same checks using an exclusively created zero-length partial.
+same checks using an exclusively created zero-length partial. A non-empty partial is resumable
+only when Azure supplies a whole-blob content MD5; otherwise acquisition restarts from byte zero
+because the existing prefix cannot be verified. Acquisitions for the same recording are serialized
+with an operating-system file lock. Cache directories are opened component by component without
+following symbolic links, and leaf operations remain relative to those trusted directory handles.
 
 ## Managed-identity smoke check
 

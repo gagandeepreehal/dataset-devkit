@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import IO
 
 import pytest
@@ -84,6 +86,33 @@ class FakeBlobServiceClient:
     def get_blob_client(self, *, container: str, blob: str) -> BlobClientProtocol:
         self.requests.append((container, blob))
         return self.client
+
+
+class BlockingBlobClient(FakeBlobClient):
+    def __init__(
+        self,
+        payload: bytes,
+        properties: list[FakeProperties],
+        entered: Event,
+        release: Event,
+    ) -> None:
+        super().__init__(payload, properties)
+        self.entered = entered
+        self.release = release
+
+    def download_blob(self, *, offset: int, **kwargs: object) -> DownloadProtocol:
+        download = super().download_blob(offset=offset, **kwargs)
+        entered = self.entered
+        release = self.release
+
+        class BlockingDownload:
+            def readinto(self, stream: IO[bytes]) -> int:
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise RuntimeError("timed out waiting to release test download")
+                return download.readinto(stream)
+
+        return BlockingDownload()
 
 
 def properties(payload: bytes, etag: str = '"etag-1"', *, md5: bool = True) -> FakeProperties:
@@ -184,6 +213,38 @@ def test_empty_blob_exact_fingerprint_is_a_cache_hit(tmp_path: Path) -> None:
     assert client.download_offsets == []
 
 
+def test_concurrent_acquisitions_serialize_and_second_observes_cache_hit(
+    tmp_path: Path,
+) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    entered = Event()
+    release = Event()
+    first_client = BlockingBlobClient(payload, [prop, prop], entered, release)
+    second_client = FakeBlobClient(payload, [prop])
+    first_acquirer = acquirer(tmp_path, first_client)
+    second_acquirer = acquirer(tmp_path, second_client)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(first_acquirer.acquire, "mcap-h265/concurrent.mcap")
+        assert entered.wait(timeout=2)
+        second_future = executor.submit(second_acquirer.acquire, "mcap-h265/concurrent.mcap")
+        try:
+            with pytest.raises(TimeoutError):
+                second_future.result(timeout=0.1)
+        finally:
+            release.set()
+        first = first_future.result(timeout=2)
+        second = second_future.result(timeout=2)
+
+    assert first.artifact_path.read_bytes() == payload
+    assert second.artifact_path == first.artifact_path
+    assert first.manifest.status == "downloaded"
+    assert second.manifest.status == "cache_hit"
+    assert first_client.download_offsets == [0]
+    assert second_client.download_offsets == []
+
+
 @pytest.mark.parametrize(
     ("new_payload", "new_etag"),
     [(b"new", '"etag-2"'), (b"longer-payload", '"etag-1"')],
@@ -231,6 +292,38 @@ def test_compatible_partial_is_resumed_with_a_ranged_read(tmp_path: Path) -> Non
     assert result.manifest.status == "resumed"
     assert result.artifact_path.read_bytes() == payload
     assert client.download_offsets == [6]
+
+
+def test_checksumless_corrupt_partial_prefix_restarts_from_zero(tmp_path: Path) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload, md5=False)
+    client = FakeBlobClient(payload, [prop, prop])
+    downloader = acquirer(tmp_path, client)
+    source = downloader.fingerprint_for("mcap-h265/a.mcap", prop)
+    write_partial(downloader, source, b"evil")
+
+    result = downloader.acquire(source.blob_path)
+
+    assert client.download_offsets == [0]
+    assert result.manifest.status == "downloaded"
+    assert result.artifact_path.read_bytes() == payload
+    assert result.manifest.integrity.method == "size_etag"
+
+
+def test_checksumless_corrupt_full_partial_restarts_from_zero(tmp_path: Path) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload, md5=False)
+    client = FakeBlobClient(payload, [prop, prop])
+    downloader = acquirer(tmp_path, client)
+    source = downloader.fingerprint_for("mcap-h265/a.mcap", prop)
+    write_partial(downloader, source, b"evil-payload")
+
+    result = downloader.acquire(source.blob_path)
+
+    assert client.download_offsets == [0]
+    assert result.manifest.status == "downloaded"
+    assert result.artifact_path.read_bytes() == payload
+    assert result.manifest.integrity.method == "size_etag"
 
 
 def test_incompatible_partial_is_discarded_and_restarted(tmp_path: Path) -> None:
@@ -397,6 +490,36 @@ def test_cache_layout_rejects_a_preexisting_directory_symlink_escape(tmp_path: P
 
     with pytest.raises(AcquisitionError, match="escape"):
         downloader.paths_for(source)
+
+
+def test_ancestor_swap_after_path_calculation_cannot_redirect_leaf_operations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    client = FakeBlobClient(payload, [prop, prop])
+    downloader = acquirer(tmp_path, client)
+    blob_path = "mcap-h265/ancestor-race.mcap"
+    recording_directory = downloader._recording_directory(blob_path)
+    moved_directory = tmp_path / "moved-recording-cache"
+    outside = tmp_path / "outside-ancestor-target"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"must-not-change")
+    original_acquire_locked = downloader._acquire_locked
+
+    def swap_ancestor_then_acquire(*args: object, **kwargs: object) -> object:
+        recording_directory.rename(moved_directory)
+        recording_directory.symlink_to(outside, target_is_directory=True)
+        return original_acquire_locked(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(downloader, "_acquire_locked", swap_ancestor_then_acquire)
+
+    with pytest.raises(AcquisitionError, match="cache|directory|safe"):
+        downloader.acquire(blob_path)
+
+    assert sentinel.read_bytes() == b"must-not-change"
+    assert list(outside.iterdir()) == [sentinel]
 
 
 def test_partial_symlink_is_unlinked_without_modifying_target_and_download_restarts(
@@ -616,12 +739,20 @@ def test_unsafe_leaf_swap_during_finalization_is_cleaned(
     def replace_with_symlink(
         source_path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         destination_path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        **kwargs: int,
     ) -> None:
-        if Path(os.fsdecode(destination_path)) == paths.final:
-            Path(os.fsdecode(source_path)).unlink()
-            paths.final.symlink_to(outside)
+        if Path(os.fsdecode(destination_path)).name == paths.final.name:
+            source_directory_fd = kwargs["src_dir_fd"]
+            destination_directory_fd = kwargs["dst_dir_fd"]
+            os.unlink(source_path, dir_fd=source_directory_fd)
+            os.symlink(outside, destination_path, dir_fd=destination_directory_fd)
             return
-        real_replace(source_path, destination_path)
+        real_replace(
+            source_path,
+            destination_path,
+            src_dir_fd=kwargs.get("src_dir_fd"),
+            dst_dir_fd=kwargs.get("dst_dir_fd"),
+        )
 
     monkeypatch.setattr(os, "replace", replace_with_symlink)
 
@@ -649,14 +780,22 @@ def test_same_size_regular_inode_swap_during_finalization_is_rejected(
     def replace_with_different_inode(
         source_path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         destination_path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        **kwargs: int,
     ) -> None:
-        source_file = Path(os.fsdecode(source_path))
-        destination_file = Path(os.fsdecode(destination_path))
-        if destination_file == paths.final:
+        if Path(os.fsdecode(destination_path)).name == paths.final.name:
             replacement = paths.directory / "same-size-replacement"
             replacement.write_bytes(replacement_payload)
-            real_replace(replacement, source_file)
-        real_replace(source_file, destination_file)
+            real_replace(
+                replacement,
+                source_path,
+                dst_dir_fd=kwargs["src_dir_fd"],
+            )
+        real_replace(
+            source_path,
+            destination_path,
+            src_dir_fd=kwargs.get("src_dir_fd"),
+            dst_dir_fd=kwargs.get("dst_dir_fd"),
+        )
 
     monkeypatch.setattr(os, "replace", replace_with_different_inode)
 
@@ -682,11 +821,20 @@ def test_manifest_hard_link_race_during_persistence_is_cleaned(
     def add_hard_link_after_manifest_replace(
         source_path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         destination_path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        **kwargs: int,
     ) -> None:
-        destination_file = Path(os.fsdecode(destination_path))
-        real_replace(source_path, destination_path)
-        if destination_file == paths.manifest:
-            os.link(destination_file, outside)
+        real_replace(
+            source_path,
+            destination_path,
+            src_dir_fd=kwargs.get("src_dir_fd"),
+            dst_dir_fd=kwargs.get("dst_dir_fd"),
+        )
+        if Path(os.fsdecode(destination_path)).name == paths.manifest.name:
+            os.link(
+                destination_path,
+                outside,
+                src_dir_fd=kwargs["dst_dir_fd"],
+            )
 
     monkeypatch.setattr(os, "replace", add_hard_link_after_manifest_replace)
 

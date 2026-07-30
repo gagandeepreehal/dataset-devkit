@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
+import secrets
 import stat
-import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Protocol, cast
@@ -26,8 +29,6 @@ from dataset_devkit.provenance import (
     canonical_hash,
     canonical_json,
     extraction_config_hash,
-    load_manifest,
-    write_manifest,
 )
 
 
@@ -106,6 +107,42 @@ class _VerifiedFile:
     md5: bytes
 
 
+@dataclass(frozen=True)
+class _DirectoryIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _RecordingCache:
+    root_path: Path
+    root_fd: int
+    azure_fd: int
+    recording_fd: int
+    recording_name: str
+    root_identity: _DirectoryIdentity
+    azure_identity: _DirectoryIdentity
+    recording_identity: _DirectoryIdentity
+
+    def validate(self) -> None:
+        try:
+            root_stat = self.root_path.lstat()
+            azure_stat = os.stat("azure", dir_fd=self.root_fd, follow_symlinks=False)
+            recording_stat = os.stat(
+                self.recording_name,
+                dir_fd=self.azure_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise AcquisitionError("trusted cache directory chain changed") from error
+        if (
+            _directory_identity(root_stat) != self.root_identity
+            or _directory_identity(azure_stat) != self.azure_identity
+            or _directory_identity(recording_stat) != self.recording_identity
+        ):
+            raise AcquisitionError("trusted cache directory chain changed")
+
+
 def _identity(file_stat: os.stat_result) -> _FileIdentity | None:
     if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
         return None
@@ -117,44 +154,163 @@ def _identity(file_stat: os.stat_result) -> _FileIdentity | None:
     )
 
 
-def _owned_file_identity(path: Path) -> _FileIdentity | None:
+def _directory_identity(file_stat: os.stat_result) -> _DirectoryIdentity | None:
+    if not stat.S_ISDIR(file_stat.st_mode):
+        return None
+    return _DirectoryIdentity(file_stat.st_dev, file_stat.st_ino)
+
+
+def _open_or_create_directory_at(parent_fd: int, name: str) -> int:
     try:
-        return _identity(path.lstat())
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except FileExistsError:
+        pass
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    if _directory_identity(os.fstat(descriptor)) is None:
+        os.close(descriptor)
+        raise AcquisitionError(f"cache component is not a directory: {name}")
+    return descriptor
+
+
+@contextmanager
+def _open_recording_cache(root_path: Path, recording_name: str) -> Iterator[_RecordingCache]:
+    root_path.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(root_path, flags)
+    azure_fd = -1
+    recording_fd = -1
+    try:
+        root_identity = _directory_identity(os.fstat(root_fd))
+        if root_identity is None:
+            raise AcquisitionError("configured cache root is not a directory")
+        azure_fd = _open_or_create_directory_at(root_fd, "azure")
+        recording_fd = _open_or_create_directory_at(azure_fd, recording_name)
+        azure_identity = _directory_identity(os.fstat(azure_fd))
+        recording_identity = _directory_identity(os.fstat(recording_fd))
+        assert azure_identity is not None and recording_identity is not None
+        cache = _RecordingCache(
+            root_path=root_path,
+            root_fd=root_fd,
+            azure_fd=azure_fd,
+            recording_fd=recording_fd,
+            recording_name=recording_name,
+            root_identity=root_identity,
+            azure_identity=azure_identity,
+            recording_identity=recording_identity,
+        )
+        cache.validate()
+        yield cache
+    finally:
+        if recording_fd >= 0:
+            os.close(recording_fd)
+        if azure_fd >= 0:
+            os.close(azure_fd)
+        os.close(root_fd)
+
+
+def _owned_file_identity_at(directory_fd: int, name: str) -> _FileIdentity | None:
+    try:
+        return _identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False))
     except FileNotFoundError:
         return None
 
 
-def _open_regular_for_read(path: Path) -> IO[bytes]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    if _identity(os.fstat(descriptor)) is None:
-        os.close(descriptor)
-        raise AcquisitionError(f"cache path is not a regular file: {path}")
-    return os.fdopen(descriptor, "rb")
-
-
-def _regular_file_size(path: Path) -> int | None:
-    identity = _owned_file_identity(path)
-    return identity.size if identity is not None else None
-
-
-def _verify_owned_file(path: Path) -> _VerifiedFile:
+def _verify_owned_file_at(directory_fd: int, name: str) -> _VerifiedFile:
     sha256_digest = hashlib.sha256()
     md5_digest = hashlib.md5(usedforsecurity=False)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
     before = _identity(os.fstat(descriptor))
     if before is None:
         os.close(descriptor)
-        raise AcquisitionError(f"cache path is not an owned regular file: {path}")
+        raise AcquisitionError(f"cache leaf is not an owned regular file: {name}")
     with os.fdopen(descriptor, "rb") as stream:
         while chunk := stream.read(1024 * 1024):
             sha256_digest.update(chunk)
             md5_digest.update(chunk)
         after = _identity(os.fstat(stream.fileno()))
-    if after != before or _owned_file_identity(path) != before:
-        raise AcquisitionError(f"cache file identity changed during verification: {path}")
+    if after != before or _owned_file_identity_at(directory_fd, name) != before:
+        raise AcquisitionError(f"cache leaf identity changed during verification: {name}")
     return _VerifiedFile(before, sha256_digest.hexdigest(), md5_digest.digest())
+
+
+def _unlink_at(directory_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return
+    os.fsync(directory_fd)
+
+
+def _atomic_write_text_at(directory_fd: int, name: str, content: str) -> None:
+    temporary_name = f".{name}.{secrets.token_hex(12)}.tmp"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if _owned_file_identity_at(directory_fd, temporary_name) is None:
+            raise AcquisitionError("temporary cache leaf is not exclusively owned")
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+
+
+def _create_owned_empty_file_at(directory_fd: int, name: str) -> None:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        if _identity(os.fstat(descriptor)) is None:
+            raise AcquisitionError(f"new cache leaf is not exclusively owned: {name}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
+def _load_json_at(directory_fd: int, name: str) -> object:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    before = _identity(os.fstat(descriptor))
+    if before is None:
+        os.close(descriptor)
+        raise ValueError("cache JSON leaf is not an owned regular file")
+    with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+        value = json.load(stream)
+        after = _identity(os.fstat(stream.fileno()))
+    if after != before or _owned_file_identity_at(directory_fd, name) != before:
+        raise ValueError("cache JSON leaf identity changed while reading")
+    return value
+
+
+def _load_acquisition_manifest_at(
+    directory_fd: int, name: str
+) -> AcquisitionManifest | None:
+    try:
+        return AcquisitionManifest.from_dict(_load_json_at(directory_fd, name))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _write_acquisition_manifest_at(
+    directory_fd: int, name: str, manifest: AcquisitionManifest
+) -> None:
+    _atomic_write_text_at(
+        directory_fd,
+        name,
+        canonical_json(manifest.to_dict()) + "\n",
+    )
 
 
 def _content_md5(properties: BlobPropertiesProtocol) -> bytes | None:
@@ -162,30 +318,22 @@ def _content_md5(properties: BlobPropertiesProtocol) -> bytes | None:
     return bytes(value) if value is not None else None
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary_path = Path(temporary_name)
+@contextmanager
+def _recording_lock_at(directory_fd: int) -> Iterator[None]:
+    name = ".acquisition.lock"
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    lock_identity = _identity(os.fstat(descriptor))
+    if lock_identity is None:
+        os.close(descriptor)
+        raise AcquisitionError("acquisition lock must be an owned regular file")
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if _owned_file_identity_at(directory_fd, name) != lock_identity:
+            raise AcquisitionError("acquisition lock identity changed")
+        yield
     finally:
-        temporary_path.unlink(missing_ok=True)
-
-
-def _create_owned_empty_file(path: Path) -> None:
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags, 0o600)
-    except OSError as error:
-        raise AcquisitionError(f"failed to create exclusive cache file: {path}") from error
-    try:
-        if _identity(os.fstat(descriptor)) is None:
-            raise AcquisitionError(f"new cache file is not exclusively owned: {path}")
-    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 
@@ -244,14 +392,7 @@ class AzureBlobAcquirer:
 
     def paths_for(self, source: SourceFingerprint) -> CachePaths:
         """Return a hash-derived cache layout that cannot contain blob path traversal."""
-        recording_identity = {
-            "account_url": source.account_url,
-            "container": source.container,
-            "blob_path": source.blob_path,
-        }
-        directory = self.cache_dir / "azure" / canonical_hash(recording_identity)
-        if not directory.resolve().is_relative_to(self.cache_dir):
-            raise AcquisitionError("cache layout would escape the configured cache directory")
+        directory = self._recording_directory(source.blob_path)
         stem = f"artifact-{source.digest}"
         return CachePaths(
             directory=directory,
@@ -262,42 +403,56 @@ class AzureBlobAcquirer:
             partial_sidecar=directory / "download.partial.json",
         )
 
+    def _recording_directory(self, blob_path: str) -> Path:
+        recording_identity = {
+            "account_url": self.azure.account_url,
+            "container": self.azure.container,
+            "blob_path": blob_path,
+        }
+        directory = self.cache_dir / "azure" / canonical_hash(recording_identity)
+        if not directory.resolve().is_relative_to(self.cache_dir):
+            raise AcquisitionError("cache layout would escape the configured cache directory")
+        return directory
+
     def _properties(self, client: BlobClientProtocol, blob_path: str) -> BlobPropertiesProtocol:
         try:
             return client.get_blob_properties()
         except Exception as error:
             raise AcquisitionError(f"failed to read Azure properties for {blob_path!r}") from error
 
-    def _load_partial_source(self, path: Path) -> SourceFingerprint | None:
-        if _regular_file_size(path) is None:
+    def _load_partial_source(
+        self, directory_fd: int, name: str
+    ) -> SourceFingerprint | None:
+        if _owned_file_identity_at(directory_fd, name) is None:
             return None
         try:
-            with _open_regular_for_read(path) as stream:
-                return SourceFingerprint.from_dict(json.load(stream))
+            return SourceFingerprint.from_dict(_load_json_at(directory_fd, name))
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             return None
 
-    def _discard_partial(self, paths: CachePaths) -> None:
-        paths.partial.unlink(missing_ok=True)
-        paths.partial_sidecar.unlink(missing_ok=True)
+    def _discard_partial(self, directory_fd: int, paths: CachePaths) -> None:
+        _unlink_at(directory_fd, paths.partial.name)
+        _unlink_at(directory_fd, paths.partial_sidecar.name)
 
     def _cached_manifest(
         self,
         paths: CachePaths,
         source: SourceFingerprint,
         properties: BlobPropertiesProtocol,
+        directory_fd: int,
     ) -> AcquisitionManifest | None:
         try:
             verified_final = (
-                _verify_owned_file(paths.final)
-                if _owned_file_identity(paths.final) is not None
+                _verify_owned_file_at(directory_fd, paths.final.name)
+                if _owned_file_identity_at(directory_fd, paths.final.name) is not None
                 else None
             )
         except (OSError, AcquisitionError):
             verified_final = None
         manifest = (
-            load_manifest(paths.manifest)
-            if _regular_file_size(paths.manifest) is not None and verified_final is not None
+            _load_acquisition_manifest_at(directory_fd, paths.manifest.name)
+            if _owned_file_identity_at(directory_fd, paths.manifest.name) is not None
+            and verified_final is not None
             else None
         )
         expected_relative = paths.final.relative_to(self.cache_dir).as_posix()
@@ -315,8 +470,8 @@ class AzureBlobAcquirer:
             assert verified_final is not None
             valid = verified_final.md5 == expected_md5
         if not valid:
-            paths.final.unlink(missing_ok=True)
-            paths.manifest.unlink(missing_ok=True)
+            _unlink_at(directory_fd, paths.final.name)
+            _unlink_at(directory_fd, paths.manifest.name)
             return None
         assert manifest is not None
         return manifest
@@ -327,6 +482,7 @@ class AzureBlobAcquirer:
         source: SourceFingerprint,
         before: BlobPropertiesProtocol,
         after: BlobPropertiesProtocol,
+        directory_fd: int,
     ) -> tuple[IntegrityVerification, _VerifiedFile]:
         after_source = self.fingerprint_for(source.blob_path, after)
         before_md5 = _content_md5(before)
@@ -334,7 +490,7 @@ class AzureBlobAcquirer:
         if after_source != source or before_md5 != after_md5:
             raise BlobChangedError(f"Azure blob changed while downloading {source.blob_path!r}")
         try:
-            verified = _verify_owned_file(paths.partial)
+            verified = _verify_owned_file_at(directory_fd, paths.partial.name)
         except (OSError, AcquisitionError) as error:
             raise IntegrityError(
                 f"download partial is not an owned regular file: {source.blob_path!r}"
@@ -369,16 +525,42 @@ class AzureBlobAcquirer:
         before = self._properties(client, blob_path)
         source = self.fingerprint_for(blob_path, before)
         paths = self.paths_for(source)
-        paths.directory.mkdir(parents=True, exist_ok=True)
+        recording_directory = self._recording_directory(blob_path)
+        with (
+            _open_recording_cache(self.cache_dir, recording_directory.name) as cache,
+            _recording_lock_at(cache.recording_fd),
+        ):
+            cache.validate()
+            return self._acquire_locked(
+                blob_path,
+                client,
+                before,
+                source,
+                paths,
+                cache,
+            )
 
-        cached = self._cached_manifest(paths, source, before)
+    def _acquire_locked(
+        self,
+        blob_path: str,
+        client: BlobClientProtocol,
+        before: BlobPropertiesProtocol,
+        source: SourceFingerprint,
+        paths: CachePaths,
+        cache: _RecordingCache,
+    ) -> AcquisitionResult:
+        cache.validate()
+
+        directory_fd = cache.recording_fd
+        cached = self._cached_manifest(paths, source, before, directory_fd)
         if cached is not None:
             cache_hit = replace(
                 cached,
                 status="cache_hit",
                 requested_extraction_config_hash=self.extraction_config_hash,
             )
-            write_manifest(paths.manifest, cache_hit)
+            _write_acquisition_manifest_at(directory_fd, paths.manifest.name, cache_hit)
+            cache.validate()
             return AcquisitionResult(
                 paths.final,
                 paths.manifest,
@@ -386,27 +568,43 @@ class AzureBlobAcquirer:
                 cache_hit,
             )
 
-        partial_size = _regular_file_size(paths.partial)
-        sidecar_is_regular = _regular_file_size(paths.partial_sidecar) is not None
+        partial_identity = _owned_file_identity_at(directory_fd, paths.partial.name)
+        partial_size = partial_identity.size if partial_identity is not None else None
+        sidecar_is_regular = (
+            _owned_file_identity_at(directory_fd, paths.partial_sidecar.name) is not None
+        )
         partial_source = (
-            self._load_partial_source(paths.partial_sidecar) if sidecar_is_regular else None
+            self._load_partial_source(directory_fd, paths.partial_sidecar.name)
+            if sidecar_is_regular
+            else None
         )
         compatible = bool(
             partial_source == source
             and partial_size is not None
             and partial_size <= source.size
+            and (partial_size == 0 or _content_md5(before) is not None)
         )
         if not compatible:
-            self._discard_partial(paths)
-            _atomic_write_text(paths.partial_sidecar, canonical_json(source.to_dict()) + "\n")
-            _create_owned_empty_file(paths.partial)
-        offset = _regular_file_size(paths.partial) or 0
+            self._discard_partial(directory_fd, paths)
+            _atomic_write_text_at(
+                directory_fd,
+                paths.partial_sidecar.name,
+                canonical_json(source.to_dict()) + "\n",
+            )
+            _create_owned_empty_file_at(directory_fd, paths.partial.name)
+        current_partial = _owned_file_identity_at(directory_fd, paths.partial.name)
+        offset = current_partial.size if current_partial is not None else 0
         resumed = offset > 0
 
         try:
             if offset < source.size:
                 flags = os.O_APPEND | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(paths.partial, flags, 0o600)
+                descriptor = os.open(
+                    paths.partial.name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
                 partial_stat = os.fstat(descriptor)
                 if not stat.S_ISREG(partial_stat.st_mode) or partial_stat.st_nlink != 1:
                     os.close(descriptor)
@@ -426,9 +624,15 @@ class AzureBlobAcquirer:
 
         after = self._properties(client, blob_path)
         try:
-            integrity, verified_partial = self._verify_download(paths, source, before, after)
+            integrity, verified_partial = self._verify_download(
+                paths,
+                source,
+                before,
+                after,
+                directory_fd,
+            )
         except IntegrityError:
-            self._discard_partial(paths)
+            self._discard_partial(directory_fd, paths)
             raise
 
         artifact = ArtifactIdentity(
@@ -444,24 +648,38 @@ class AzureBlobAcquirer:
             requested_extraction_config_hash=self.extraction_config_hash,
         )
         try:
-            if _owned_file_identity(paths.partial) != verified_partial.identity:
+            cache.validate()
+            if (
+                _owned_file_identity_at(directory_fd, paths.partial.name)
+                != verified_partial.identity
+            ):
                 raise AcquisitionError("refusing to finalize an unsafe download partial")
-            os.replace(paths.partial, paths.final)
-            if _owned_file_identity(paths.final) != verified_partial.identity:
+            os.replace(
+                paths.partial.name,
+                paths.final.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+            if (
+                _owned_file_identity_at(directory_fd, paths.final.name)
+                != verified_partial.identity
+            ):
                 raise AcquisitionError("final cache artifact has the wrong file identity")
-            verified_final = _verify_owned_file(paths.final)
+            verified_final = _verify_owned_file_at(directory_fd, paths.final.name)
             if verified_final != verified_partial:
                 raise AcquisitionError("final cache artifact failed integrity re-verification")
-            write_manifest(paths.manifest, manifest)
-            if _owned_file_identity(paths.manifest) is None:
+            _write_acquisition_manifest_at(directory_fd, paths.manifest.name, manifest)
+            if _owned_file_identity_at(directory_fd, paths.manifest.name) is None:
                 raise AcquisitionError("acquisition manifest is not an owned regular file")
+            cache.validate()
         except (OSError, AcquisitionError) as error:
-            paths.final.unlink(missing_ok=True)
-            paths.manifest.unlink(missing_ok=True)
+            _unlink_at(directory_fd, paths.final.name)
+            _unlink_at(directory_fd, paths.manifest.name)
             message = f"failed to finalize cache artifact for {blob_path!r}"
             raise AcquisitionError(message) from error
         finally:
-            paths.partial_sidecar.unlink(missing_ok=True)
+            _unlink_at(directory_fd, paths.partial_sidecar.name)
         return AcquisitionResult(
             paths.final,
             paths.manifest,
