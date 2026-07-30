@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import fields, is_dataclass
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageStat
 
+from dataset_devkit.extraction import camera as camera_module
 from dataset_devkit.extraction.camera import (
     AssociatedDecodedFrame,
     CameraDecoderSet,
@@ -54,6 +57,49 @@ class OneFrameDelayedDecoder:
 
     def close(self) -> None:
         self.closed = True
+
+
+class AllFramesDelayedDecoder:
+    def __init__(self) -> None:
+        self.pts: list[int] = []
+
+    def decode(
+        self, payload: bytes, pts: int, time_base: Fraction
+    ) -> list[DecoderOutput]:
+        self.pts.append(pts)
+        return []
+
+    def flush(self) -> list[DecoderOutput]:
+        return [
+            DecoderOutput(pts, Image.new("RGB", (4, 3), (pts % 255, 0, 0)))
+            for pts in self.pts
+        ]
+
+    def close(self) -> None:
+        pass
+
+
+def _object_graph_contains_bytes(value: object, seen: set[int] | None = None) -> bool:
+    if isinstance(value, bytes):
+        return True
+    visited = seen if seen is not None else set()
+    if id(value) in visited:
+        return False
+    visited.add(id(value))
+    if is_dataclass(value) and not isinstance(value, type):
+        return any(
+            _object_graph_contains_bytes(getattr(value, field.name), visited)
+            for field in fields(value)
+        )
+    if isinstance(value, dict):
+        return any(
+            _object_graph_contains_bytes(key, visited)
+            or _object_graph_contains_bytes(item, visited)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_object_graph_contains_bytes(item, visited) for item in value)
+    return False
 
 
 def test_end_to_end_recording_uses_real_camera_timestamps_for_images_and_poses(
@@ -190,6 +236,58 @@ def test_delayed_outputs_stage_only_their_originating_selected_access_units(
     assert len({sample.staged_image.path.name for sample in result.samples}) == 4
 
 
+def test_all_delayed_decoder_pending_state_never_retains_large_payloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "all-delayed-large.mcap"
+    batch_count = 12
+    payloads = tuple(
+        camera_message(
+            1_000_000_000 + index * 1_000_000,
+            (
+                1_000_000_010 + index * 1_000_000,
+                1_000_000_020 + index * 1_000_000,
+            ),
+            payloads=(
+                HEVC_AU + bytes([index]) + b"a" * (128 * 1024),
+                HEVC_AU + bytes([index + 32]) + b"b" * (128 * 1024),
+            ),
+        )
+        for index in range(batch_count)
+    )
+    write_mcap(path, camera_payloads=payloads)
+    original_submit = camera_module.CameraDecoderSet.submit
+    pending_counts: list[int] = []
+
+    def submit_without_payload_retention(
+        decoder_set: CameraDecoderSet,
+        camera_index: int,
+        payload: bytes,
+        metadata: Any,
+    ) -> tuple[AssociatedDecodedFrame, ...]:
+        outputs = original_submit(decoder_set, camera_index, payload, metadata)
+        pending = vars(decoder_set)["_pending"]
+        pending_counts.append(sum(len(items) for items in pending))
+        assert not _object_graph_contains_bytes(pending)
+        return outputs
+
+    monkeypatch.setattr(
+        camera_module.CameraDecoderSet, "submit", submit_without_payload_retention
+    )
+    result = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=Fraction(1_000, 1),
+        tolerance_ns=0,
+        staging_root=tmp_path / "staging",
+        decoder_factory=AllFramesDelayedDecoder,
+    ).extract(path)
+
+    assert max(pending_counts) == batch_count * 2
+    assert len(result.samples) == batch_count * 2
+    assert all(sample.staged_image.path.is_file() for sample in result.samples)
+
+
 def _inter_frame_hevc_access_units() -> list[bytes]:
     av = pytest.importorskip("av", reason="PyAV is unavailable for real HEVC regression")
     np = pytest.importorskip("numpy", reason="NumPy is unavailable for real HEVC regression")
@@ -237,7 +335,7 @@ def test_real_pyav_decoder_keeps_state_for_inter_frame_hevc() -> None:
         fresh.finish()
 
 
-def _b_frame_hevc_access_units() -> list[bytes]:
+def _b_frame_hevc_access_units() -> list[tuple[bytes, int, int]]:
     av = pytest.importorskip("av", reason="PyAV is unavailable for B-frame regression")
     np = pytest.importorskip("numpy", reason="NumPy is unavailable for B-frame regression")
     try:
@@ -256,16 +354,21 @@ def _b_frame_hevc_access_units() -> list[bytes]:
         encoder.open()
     except Exception as error:
         pytest.skip(f"local libx265 B-frame encoder unavailable: {error}")
-    packets: list[bytes] = []
+    encoded_packets: list[Any] = []
     for index in range(10):
         pixels = np.full((32, 32, 3), 10 + 20 * index, dtype=np.uint8)
         frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
         frame.pts = index
-        packets.extend(bytes(packet) for packet in encoder.encode(frame))
-    packets.extend(bytes(packet) for packet in encoder.encode(None))
-    if len(packets) != 10:
-        pytest.skip(f"local libx265 emitted {len(packets)} packets for 10 B-frame inputs")
-    return packets
+        encoded_packets.extend(encoder.encode(frame))
+    encoded_packets.extend(encoder.encode(None))
+    if len(encoded_packets) != 10 or any(packet.pts is None for packet in encoded_packets):
+        pytest.skip(
+            f"local libx265 emitted {len(encoded_packets)} packets or missing B-frame PTS"
+        )
+    return [
+        (bytes(packet), int(packet.pts), 10 + 20 * int(packet.pts))
+        for packet in encoded_packets
+    ]
 
 
 def test_real_pyav_b_frames_are_associated_by_pts_and_flushed_at_eof() -> None:
@@ -273,8 +376,10 @@ def test_real_pyav_b_frames_are_associated_by_pts_and_flushed_at_eof() -> None:
     decoder = CameraDecoderSet(1, PyAvHevcDecoder)
     emitted: list[AssociatedDecodedFrame] = []
     per_submit_counts = []
-    for index, access_unit in enumerate(access_units):
-        current = decoder.submit(0, access_unit, index)
+    for packet_index, (access_unit, source_pts, expected_color) in enumerate(access_units):
+        current = decoder.submit(
+            0, access_unit, (packet_index, source_pts, expected_color)
+        )
         per_submit_counts.append(len(current))
         emitted.extend(current)
     flushed = decoder.finish()
@@ -282,8 +387,12 @@ def test_real_pyav_b_frames_are_associated_by_pts_and_flushed_at_eof() -> None:
 
     assert 0 in per_submit_counts
     assert flushed
-    assert sorted(output.metadata for output in emitted) == list(range(10))
+    assert sorted(output.metadata[1] for output in emitted) == list(range(10))
     assert len({output.submission_index for output in emitted}) == 10
+    for output in emitted:
+        _, _, expected_color = output.metadata
+        decoded_mean = sum(ImageStat.Stat(output.image).mean) / 3
+        assert decoded_mean == pytest.approx(expected_color, abs=8)
 
 
 def test_real_reader_service_rolls_back_staged_files_after_undecodable_hevc(

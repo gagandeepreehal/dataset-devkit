@@ -20,7 +20,6 @@ from dataset_devkit.extraction.gnss import interpolate_gnss
 from dataset_devkit.extraction.grid import select_camera_grid
 from dataset_devkit.extraction.mcap_source import iter_camera_access_units, read_recording
 from dataset_devkit.extraction.models import (
-    CameraAccessUnit,
     EgoPose,
     ExtractedCameraSample,
     RecordingExtractionResult,
@@ -38,8 +37,14 @@ def _recording_id(path: Path) -> str:
 
 
 @dataclass(frozen=True)
-class _Submission:
-    access_unit: CameraAccessUnit
+class _SubmissionMetadata:
+    batch_ordinal: int
+    batch_timestamp_ns: int
+    camera_timestamp_ns: int
+    camera_index: int
+    camera_name: str
+    width: int
+    height: int
     selected_target_ns: int | None
 
 
@@ -115,12 +120,11 @@ class RecordingExtractor:
         def consume(outputs: tuple[AssociatedDecodedFrame, ...]) -> None:
             for output in outputs:
                 metadata = output.metadata
-                if not isinstance(metadata, _Submission):
+                if not isinstance(metadata, _SubmissionMetadata):
                     raise StructuralExtractionError("decoder returned invalid submission metadata")
-                access = metadata.access_unit
-                if output.image.size != (access.batch.width, access.batch.height):
+                if output.image.size != (metadata.width, metadata.height):
                     raise StructuralExtractionError(
-                        f"decoded camera[{access.frame.camera_index}] dimensions "
+                        f"decoded camera[{metadata.camera_index}] dimensions "
                         "differ from schema"
                     )
                 if metadata.selected_target_ns is None:
@@ -128,12 +132,12 @@ class RecordingExtractor:
                 staged = stage_jpeg(
                     self.staging_root,
                     invocation.directory_name,
-                    access.frame.camera_index,
-                    access.frame.camera_name,
-                    access.frame.camera_timestamp_ns,
+                    metadata.camera_index,
+                    metadata.camera_name,
+                    metadata.camera_timestamp_ns,
                     output.image,
-                    (access.batch.width, access.batch.height),
-                    batch_ordinal=access.batch_ordinal,
+                    (metadata.width, metadata.height),
+                    batch_ordinal=metadata.batch_ordinal,
                     invocation=invocation,
                 )
                 samples.append(
@@ -141,12 +145,12 @@ class RecordingExtractor:
                         output.submission_index,
                         ExtractedCameraSample(
                             metadata.selected_target_ns,
-                            access.batch.rec_timestamp_ns,
-                            access.frame.camera_timestamp_ns,
-                            access.frame.camera_index,
-                            access.frame.camera_name,
+                            metadata.batch_timestamp_ns,
+                            metadata.camera_timestamp_ns,
+                            metadata.camera_index,
+                            metadata.camera_name,
                             staged,
-                            pose_for(access.frame.camera_timestamp_ns),
+                            pose_for(metadata.camera_timestamp_ns),
                         ),
                     )
                 )
@@ -154,16 +158,22 @@ class RecordingExtractor:
         try:
             with CameraDecoderSet(len(first_batch.frames), self.decoder_factory) as decoders:
                 for access in iter_camera_access_units(path, self.camera_topic, recording):
-                    consume(
-                        decoders.submit(
-                            access.frame.camera_index,
-                            access.payload,
-                            _Submission(
-                                access,
-                                target_by_batch.get(access.batch.rec_timestamp_ns),
-                            ),
-                        )
+                    metadata = _SubmissionMetadata(
+                        access.batch_ordinal,
+                        access.batch.rec_timestamp_ns,
+                        access.frame.camera_timestamp_ns,
+                        access.frame.camera_index,
+                        access.frame.camera_name,
+                        access.batch.width,
+                        access.batch.height,
+                        target_by_batch.get(access.batch.rec_timestamp_ns),
                     )
+                    camera_index = access.frame.camera_index
+                    payload = access.payload
+                    del access
+                    outputs = decoders.submit(camera_index, payload, metadata)
+                    del payload
+                    consume(outputs)
                 consume(decoders.finish())
         except Exception:
             with suppress(StructuralExtractionError):

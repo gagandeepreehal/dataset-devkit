@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,92 @@ def descriptor_with_top_level_camera_types() -> bytes:
     return file_set.SerializeToString()
 
 
+_PROTO_SCALARS = {
+    "bytes": descriptor_pb2.FieldDescriptorProto.TYPE_BYTES,
+    "double": descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE,
+    "float": descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT,
+    "int32": descriptor_pb2.FieldDescriptorProto.TYPE_INT32,
+    "int64": descriptor_pb2.FieldDescriptorProto.TYPE_INT64,
+    "string": descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+}
+
+
+def _camera_descriptor_from_golden_proto() -> descriptor_pb2.DescriptorProto:
+    """Parse the checked-in sanitized proto into a descriptor independently of fixtures."""
+    path = Path(__file__).parent / "fixtures" / "CompressedVideos.proto"
+    without_comments = re.sub(r"//[^\n]*", "", path.read_text(encoding="utf-8"))
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_.]*|\d+|[{}=;]", without_comments)
+    package_position = tokens.index("package")
+    package = tokens[package_position + 1]
+    position = tokens.index("message")
+
+    def consume(expected: str) -> None:
+        nonlocal position
+        assert tokens[position] == expected
+        position += 1
+
+    def parse_message(scope: str) -> descriptor_pb2.DescriptorProto:
+        nonlocal position
+        consume("message")
+        name = tokens[position]
+        position += 1
+        consume("{")
+        descriptor = descriptor_pb2.DescriptorProto(name=name)
+        full_scope = f"{scope}.{name}"
+        while tokens[position] != "}":
+            if tokens[position] == "message":
+                descriptor.nested_type.add().CopyFrom(parse_message(full_scope))
+                continue
+            repeated = tokens[position] == "repeated"
+            if repeated:
+                position += 1
+            type_name = tokens[position]
+            field_name = tokens[position + 1]
+            position += 2
+            consume("=")
+            number = int(tokens[position])
+            position += 1
+            consume(";")
+            field = descriptor.field.add(name=field_name, number=number)
+            field.label = (
+                descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED
+                if repeated
+                else descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+            )
+            scalar_type = _PROTO_SCALARS.get(type_name)
+            if scalar_type is not None:
+                field.type = scalar_type
+            else:
+                field.type = descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE
+                if "." in type_name:
+                    field.type_name = f".{type_name}"
+                elif any(nested.name == type_name for nested in descriptor.nested_type):
+                    field.type_name = f"{full_scope}.{type_name}"
+                else:
+                    field.type_name = f"{scope}.{type_name}"
+        consume("}")
+        return descriptor
+
+    return parse_message(f".{package}")
+
+
+def _normalized_descriptor_contract(
+    descriptor: descriptor_pb2.DescriptorProto, scope: str
+) -> tuple[object, ...]:
+    full_name = f"{scope}.{descriptor.name}"
+    return (
+        full_name,
+        tuple(
+            (field.name, field.number, field.type, field.label, field.type_name)
+            for field in descriptor.field
+        ),
+        tuple(
+            _normalized_descriptor_contract(nested, full_name)
+            for nested in descriptor.nested_type
+        ),
+    )
+
+
 def test_dynamic_descriptor_loader_resolves_reverse_dependencies() -> None:
     classes = build_message_classes(descriptor_set_bytes())
     assert "autonome.CompressedVideos" in classes
@@ -103,13 +190,17 @@ def test_dynamic_descriptor_loader_resolves_reverse_dependencies() -> None:
 
 
 def test_exact_real_nested_camera_descriptor_shape_is_accepted(tmp_path: Path) -> None:
-    golden_proto = (Path(__file__).parent / "fixtures" / "CompressedVideos.proto").read_text()
-    assert "message CompressedVideos" in golden_proto
-    assert "message CameraIntrinsic" in golden_proto
-    assert "repeated double distortion_coeffs = 7;" in golden_proto
-    assert "repeated float rotation_vector = 1;" in golden_proto
-
     descriptor_data = descriptor_set_bytes()
+    descriptor_files = descriptor_pb2.FileDescriptorSet.FromString(descriptor_data)
+    telemetry = next(file for file in descriptor_files.file if file.name == "telemetry.proto")
+    fixture_camera = next(
+        message for message in telemetry.message_type if message.name == "CompressedVideos"
+    )
+    golden_camera = _camera_descriptor_from_golden_proto()
+    assert _normalized_descriptor_contract(
+        fixture_camera, ".autonome"
+    ) == _normalized_descriptor_contract(golden_camera, ".autonome")
+
     camera_type = build_message_classes(descriptor_data)["autonome.CompressedVideos"]
     descriptor = camera_type.DESCRIPTOR
     intrinsic = descriptor.fields_by_name["camera_intrinsic"].message_type
