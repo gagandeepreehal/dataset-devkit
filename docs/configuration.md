@@ -10,6 +10,20 @@ Start with [`examples/dataset_config.json`](../examples/dataset_config.json) and
 [`schema/dataset_config.schema.json`](../schema/dataset_config.schema.json) for editor or CI
 validation.
 
+JSON Schema 2020-12 directly enforces Task 6 constraints that it can represent, including the rule
+that `reference_camera_policy: "require"` needs a non-null `reference_camera_channel`. Standard
+JSON Schema cannot compare arbitrary numeric sibling values, compare matching values in two maps,
+prove arbitrary predicate arrays disjoint, or require unique nested rule names. Each affected
+definition therefore carries deterministic `x-dataset-devkit-runtime-constraints` entries with the
+exact constraint code, message, and fields. Schema-only validation is not full configuration
+validation: `load_config` is authoritative.
+
+For CI that explicitly runs both layers, use the public combined validator:
+
+```bash
+PYTHONPATH=src python -c 'from pathlib import Path; from dataset_devkit import validate_config_schema_and_runtime; validate_config_schema_and_runtime(Path("dataset_config.json"))'
+```
+
 ## Authentication
 
 The `azure` section contains only a Blob service `account_url`, container name, and blob-list

@@ -15,6 +15,7 @@ from dataset_devkit.scene_models import (
     SampleDataRecord,
     SampleRecord,
     SceneRecord,
+    SourceSampleRecord,
 )
 from dataset_devkit.scenes import validate_scene_graph
 
@@ -74,6 +75,32 @@ class SceneFeatures:
 class RecordingFeatureResult:
     source: SourceFingerprint
     scenes: tuple[SceneFeatures, ...]
+
+
+@dataclass(frozen=True)
+class _FeatureRecordIndex:
+    samples_by_scene: dict[str, tuple[SampleRecord, ...]]
+    data_by_sample: dict[str, tuple[SampleDataRecord, ...]]
+    data_by_scene: dict[str, tuple[SampleDataRecord, ...]]
+    source_by_timestamp: dict[int, SourceSampleRecord]
+
+
+def _index_feature_records(result: RecordingSceneResult) -> _FeatureRecordIndex:
+    """Index each Task 5 feature evidence record exactly once in canonical order."""
+    samples_by_scene_lists: dict[str, list[SampleRecord]] = defaultdict(list)
+    data_by_sample_lists: dict[str, list[SampleDataRecord]] = defaultdict(list)
+    data_by_scene_lists: dict[str, list[SampleDataRecord]] = defaultdict(list)
+    for sample in result.samples:
+        samples_by_scene_lists[sample.scene_token].append(sample)
+    for item in result.sample_data:
+        data_by_sample_lists[item.sample_token].append(item)
+        data_by_scene_lists[item.scene_token].append(item)
+    return _FeatureRecordIndex(
+        {key: tuple(value) for key, value in samples_by_scene_lists.items()},
+        {key: tuple(value) for key, value in data_by_sample_lists.items()},
+        {key: tuple(value) for key, value in data_by_scene_lists.items()},
+        {item.timestamp_ns: item for item in result.source_samples},
+    )
 
 
 def _yaw_wxyz(quaternion: tuple[float, float, float, float]) -> float:
@@ -161,20 +188,14 @@ def _compute_scene(
     result: RecordingSceneResult,
     scene: SceneRecord,
     config: TagsConfig,
+    index: _FeatureRecordIndex,
 ) -> SceneFeatures:
-    samples = tuple(item for item in result.samples if item.scene_token == scene.token)
-    data_grouped: dict[str, list[SampleDataRecord]] = defaultdict(list)
-    for item in result.sample_data:
-        if item.scene_token == scene.token:
-            data_grouped[item.sample_token].append(item)
-    data_by_sample = {
-        key: tuple(sorted(value, key=lambda item: (item.channel, item.camera_index)))
-        for key, value in data_grouped.items()
-    }
+    samples = index.samples_by_scene[scene.token]
+    data_by_sample = index.data_by_sample
     observations, fallback_count = _select_observations(
         scene, samples, data_by_sample, config
     )
-    scene_data = tuple(item for values in data_by_sample.values() for item in values)
+    scene_data = index.data_by_scene[scene.token]
     if any(len(item.gnss_source_validity) != 2 for item in scene_data):
         raise StructuralExtractionError(
             "trajectory source GNSS endpoint-validity evidence is missing"
@@ -237,8 +258,7 @@ def _compute_scene(
         cumulative.append(cumulative[-1] + distance)
     duration = sum(dt)
     distance = sum(distances)
-    source_by_timestamp = {item.timestamp_ns: item for item in result.source_samples}
-    source_records = tuple(source_by_timestamp[item.timestamp_ns] for item in samples)
+    source_records = tuple(index.source_by_timestamp[item.timestamp_ns] for item in samples)
     gnss_ratio = sum(item.source_gnss_valid for item in source_records) / len(source_records)
     expected_slots = sum(len(item.expected_channels) for item in source_records)
     present_slots = sum(len(item.present_channels) for item in source_records)
@@ -319,7 +339,8 @@ def compute_recording_features(
 ) -> RecordingFeatureResult:
     """Validate Task 5 input and compute one immutable feature record per scene."""
     validate_scene_graph(result)
+    index = _index_feature_records(result)
     return RecordingFeatureResult(
         result.source,
-        tuple(_compute_scene(result, scene, config) for scene in result.scenes),
+        tuple(_compute_scene(result, scene, config, index) for scene in result.scenes),
     )

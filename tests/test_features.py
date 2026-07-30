@@ -4,14 +4,15 @@ import math
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+import dataset_devkit.features as features_module
 from dataset_devkit.config import GlobalConfig, TagsConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.features import compute_recording_features, derive_computed_tags
-from dataset_devkit.scene_models import RecordingSceneResult
+from dataset_devkit.scene_models import RecordingSceneResult, SampleDataRecord, SampleRecord
 from dataset_devkit.scenes import build_recording_scenes, validate_scene_graph
 from test_scenes import SOURCE, _annotation_config, _annotations, _camera, _config, _report
 
@@ -89,6 +90,86 @@ def test_trajectory_uses_real_irregular_camera_timestamps(
     assert feature.mean_speed_mps == pytest.approx(7.5)
     assert feature.time_weighted_speed_mps == pytest.approx(20.0 / 3.0)
     assert feature.segment_speeds_mps == pytest.approx((10.0, 5.0))
+
+
+@pytest.mark.parametrize("field", ["samples", "sample_data"])
+def test_task5_rejects_noncanonical_global_feature_record_order(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig], field: str
+) -> None:
+    config = _config(config_factory())
+    graph = build_recording_scenes(_report(tmp_path, (0, 1_000_000_000)), SOURCE, config)
+    reordered = (
+        replace(graph, samples=tuple(reversed(graph.samples)))
+        if field == "samples"
+        else replace(graph, sample_data=tuple(reversed(graph.sample_data)))
+    )
+
+    with pytest.raises(StructuralExtractionError, match="canonical.*order"):
+        validate_scene_graph(reordered)
+    with pytest.raises(StructuralExtractionError, match="canonical.*order"):
+        compute_recording_features(reordered, config.tags)
+
+
+def test_many_short_scenes_index_feature_records_once_with_linear_visits(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scene_count = 40
+    timestamps = tuple(index * 1_000_000_000 for index in range(scene_count))
+    annotations = _annotations(
+        tmp_path / "annotations.jsonl",
+        [
+            {
+                "blob_path": SOURCE.blob_path,
+                "timestamp_ns": timestamp,
+                "labels": ["category/performance"],
+            }
+            for timestamp in timestamps
+        ],
+    )
+    config = _annotation_config(
+        config_factory(), mode="annotation_only", tolerance_ms=1, before_s=0, after_s=0
+    )
+    graph = build_recording_scenes(
+        _report(tmp_path / "recording", timestamps),
+        SOURCE,
+        config,
+        annotations_path=annotations,
+    )
+
+    class CountingTuple(tuple[object, ...]):
+        visits = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            for item in super().__iter__():
+                self.visits += 1
+                yield item
+
+    counted_samples = CountingTuple(graph.samples)
+    counted_data = CountingTuple(graph.sample_data)
+    counted_graph = replace(
+        graph,
+        samples=cast(tuple[SampleRecord, ...], counted_samples),
+        sample_data=cast(tuple[SampleDataRecord, ...], counted_data),
+    )
+    index = features_module._index_feature_records(counted_graph)
+    assert len(index.samples_by_scene) == scene_count
+    assert counted_samples.visits == len(graph.samples)
+    assert counted_data.visits == len(graph.sample_data)
+
+    calls = 0
+    original = features_module._index_feature_records
+
+    def counted_index(result: RecordingSceneResult):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return original(result)
+
+    monkeypatch.setattr(features_module, "_index_feature_records", counted_index)
+    computed = compute_recording_features(graph, config.tags)
+    assert len(computed.scenes) == scene_count
+    assert calls == 1
 
 
 def test_sync_metrics_include_grid_and_every_camera_independent_of_reference(

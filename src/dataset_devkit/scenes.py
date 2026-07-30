@@ -844,6 +844,48 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
     if len(all_tokens) != len(set(all_tokens)):
         raise StructuralExtractionError("scene graph contains a token collision")
     scenes = {item.token: item for item in result.scenes}
+    scene_ordinals = {item.token: item.ordinal for item in result.scenes}
+    canonical_collections: tuple[tuple[str, bool], ...] = (
+        (
+            "source_samples",
+            result.source_samples
+            == tuple(sorted(result.source_samples, key=lambda item: item.timestamp_ns)),
+        ),
+        (
+            "scenes",
+            result.scenes == tuple(sorted(result.scenes, key=lambda item: item.ordinal)),
+        ),
+        (
+            "annotations",
+            result.annotations
+            == tuple(sorted(result.annotations, key=lambda item: item.line_number)),
+        ),
+        (
+            "annotation_matches",
+            result.annotation_matches
+            == tuple(sorted(result.annotation_matches, key=lambda item: item.line_number)),
+        ),
+        (
+            "annotation_windows",
+            result.annotation_windows
+            == tuple(
+                sorted(
+                    result.annotation_windows,
+                    key=lambda item: (item.first_sample_timestamp_ns, item.token),
+                )
+            ),
+        ),
+        (
+            "unassigned",
+            result.unassigned
+            == tuple(sorted(result.unassigned, key=lambda item: item.timestamp_ns)),
+        ),
+    )
+    for label, is_canonical in canonical_collections:
+        if not is_canonical:
+            raise StructuralExtractionError(
+                f"scene graph {label} is not in canonical global tuple order"
+            )
     samples = {item.token: item for item in result.samples}
     source_by_timestamp = {item.timestamp_ns: item for item in result.source_samples}
     if len(source_by_timestamp) != len(result.source_samples):
@@ -1336,6 +1378,31 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         annotation_scene_windows
     ) != sorted(windows):
         raise StructuralExtractionError("annotation windows do not have exactly one scene")
+    if result.samples != tuple(
+        sorted(
+            result.samples,
+            key=lambda item: (
+                scene_ordinals.get(item.scene_token, len(scenes)),
+                item.timestamp_ns,
+            ),
+        )
+    ):
+        raise StructuralExtractionError(
+            "scene graph samples is not in canonical global tuple order"
+        )
+    if result.sample_data != tuple(
+        sorted(
+            result.sample_data,
+            key=lambda item: (
+                scene_ordinals.get(item.scene_token, len(scenes)),
+                item.channel,
+                item.channel_ordinal,
+            ),
+        )
+    ):
+        raise StructuralExtractionError(
+            "scene graph sample_data is not in canonical global tuple order"
+        )
     if result.feature_evidence_token != _feature_evidence_token(
         result.dataset_namespace,
         result.source,

@@ -54,3 +54,30 @@ def test_templates_match_computed_tags_and_annotation_labels_separately(
     assert tuple(item.primary_scenario for item in result.assignments) == tuple(
         rule.name for rule in config.rules
     )
+
+
+def test_realistic_template_overlap_records_prior_claim_and_uses_next_candidate(
+    feature_factory: FeatureFactory,
+) -> None:
+    overlap = feature_factory(
+        scene_token="straight-then-stop",
+        computed_tags=("moving", "stopping", "straight"),
+    )
+    stopping = feature_factory(scene_token="stop-only", computed_tags=("stopping",))
+    rules = list(canonical_scenario_rules(quota=0, annotation_label="weather/rain"))
+    rules[0] = rules[0].model_copy(update={"quota": 1})
+    rules[1] = rules[1].model_copy(update={"quota": 1})
+
+    result = select_scenarios((stopping, overlap), ScenariosConfig(seed=17, rules=rules))
+
+    assert [item.primary_scenario for item in result.assignments[:2]] == [
+        "Straight",
+        "Stopping",
+    ]
+    assert result.assignments[0].scene_token == overlap.scene_token
+    assert result.assignments[1].scene_token == stopping.scene_token
+    claimed = next(
+        item for item in result.rule_audits[1].candidates if item.scene_token == overlap.scene_token
+    )
+    assert claimed.excluded_by_prior_rule is True
+    assert claimed.reason == "claimed_by_prior_rule"

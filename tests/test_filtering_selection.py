@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 
+import dataset_devkit.filtering as filtering_module
+import dataset_devkit.scenario_selection as selection_module
 from conftest import FeatureFactory
 from dataset_devkit.config import FiltersConfig, ScenarioRuleConfig, ScenariosConfig
 from dataset_devkit.features import ChannelCoverage
@@ -51,6 +53,25 @@ def test_empty_filter_accepts_all_in_input_order(feature_factory: FeatureFactory
     assert filter_scenes((first, second), FiltersConfig()).accepted == (first, second)
 
 
+def test_filter_predicate_sets_compile_once_for_many_features(
+    feature_factory: FeatureFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    features = tuple(feature_factory(scene_token=f"scene-{index}") for index in range(250))
+    calls = 0
+    original = filtering_module._compile_filter
+
+    def counted_compile(config: FiltersConfig):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return original(config)
+
+    monkeypatch.setattr(filtering_module, "_compile_filter", counted_compile)
+    result = filter_scenes(features, FiltersConfig(required_all_tags=["moving"]))
+
+    assert result.accepted == features
+    assert calls == 1
+
+
 def test_selection_is_input_order_independent_and_first_rule_claims_overlap(
     feature_factory: FeatureFactory,
 ) -> None:
@@ -70,6 +91,27 @@ def test_selection_is_input_order_independent_and_first_rule_claims_overlap(
     assert first.assignments == second.assignments
     assert len({item.scene_token for item in first.assignments}) == 2
     assert [item.primary_scenario for item in first.assignments] == ["Straight", "Moving"]
+
+
+def test_candidate_fingerprint_streams_each_many_candidate_record_once(
+    feature_factory: FeatureFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    features = tuple(feature_factory(scene_token=f"scene-{index:05d}") for index in range(500))
+    visits = 0
+    original = selection_module._update_hash_with_feature
+
+    def counted_update(hasher: object, feature: object) -> None:
+        nonlocal visits
+        visits += 1
+        original(hasher, feature)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(selection_module, "_update_hash_with_feature", counted_update)
+    first = selection_module._candidate_fingerprint(features)
+    second = selection_module._candidate_fingerprint(tuple(reversed(features)))
+
+    assert first == second
+    assert first == canonical_hash([asdict(feature) for feature in features])
+    assert visits == 2 * len(features)
 
 
 def test_strict_exact_quota_deficit_has_deterministic_partial_audit(

@@ -7,7 +7,9 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
-from dataset_devkit.config import GlobalConfig
+from dataset_devkit.config import GlobalConfig, validate_config_schema_and_runtime
+
+__all__ = ["validate_config_schema_and_runtime"]
 
 DEFAULT_OUTPUT = Path("schema/dataset_config.schema.json")
 

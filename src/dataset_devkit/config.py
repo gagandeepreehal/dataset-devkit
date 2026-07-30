@@ -371,6 +371,32 @@ class AnnotationsConfig(StrictModel):
 
 
 class TagsConfig(StrictModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "if": {
+                "properties": {"reference_camera_policy": {"const": "require"}},
+                "required": ["reference_camera_policy"],
+            },
+            "then": {
+                "properties": {"reference_camera_channel": {"not": {"type": "null"}}},
+                "required": ["reference_camera_channel"],
+            },
+            "x-dataset-devkit-runtime-constraints": [
+                {
+                    "code": "tags.heading_threshold_order",
+                    "message": (
+                        "straight_max_heading_change_deg < curvature_min_heading_change_deg < "
+                        "turn_min_heading_change_deg is required"
+                    ),
+                    "fields": [
+                        "straight_max_heading_change_deg",
+                        "curvature_min_heading_change_deg",
+                        "turn_min_heading_change_deg",
+                    ],
+                }
+            ],
+        }
+    )
     reference_camera_channel: SafeSegment | None = None
     reference_camera_policy: Literal["require", "lexicographic_fallback"] = (
         "lexicographic_fallback"
@@ -400,6 +426,66 @@ class TagsConfig(StrictModel):
 
 
 class FiltersConfig(StrictModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "x-dataset-devkit-runtime-constraints": [
+                {
+                    "code": "filters.min_duration_s_lte_max_duration_s",
+                    "message": "min_duration_s must be <= max_duration_s",
+                    "fields": ["min_duration_s", "max_duration_s"],
+                },
+                {
+                    "code": "filters.min_scene_valid_ratio_lte_max_scene_valid_ratio",
+                    "message": "min_scene_valid_ratio must be <= max_scene_valid_ratio",
+                    "fields": ["min_scene_valid_ratio", "max_scene_valid_ratio"],
+                },
+                {
+                    "code": (
+                        "filters.min_source_gnss_valid_ratio_lte_max_source_gnss_valid_ratio"
+                    ),
+                    "message": (
+                        "min_source_gnss_valid_ratio must be <= max_source_gnss_valid_ratio"
+                    ),
+                    "fields": [
+                        "min_source_gnss_valid_ratio",
+                        "max_source_gnss_valid_ratio",
+                    ],
+                },
+                {
+                    "code": "filters.min_camera_coverage_ratio_lte_max_camera_coverage_ratio",
+                    "message": "min_camera_coverage_ratio must be <= max_camera_coverage_ratio",
+                    "fields": ["min_camera_coverage_ratio", "max_camera_coverage_ratio"],
+                },
+                {
+                    "code": "filters.min_distance_m_lte_max_distance_m",
+                    "message": "min_distance_m must be <= max_distance_m",
+                    "fields": ["min_distance_m", "max_distance_m"],
+                },
+                {
+                    "code": "filters.channel_coverage_min_lte_max",
+                    "message": "camera coverage minimum exceeds maximum for {channel}",
+                    "fields": [
+                        "min_camera_coverage_by_channel",
+                        "max_camera_coverage_by_channel",
+                    ],
+                },
+                {
+                    "code": "filters.required_excluded_tags_disjoint",
+                    "message": "required and excluded tags overlap",
+                    "fields": ["required_any_tags", "required_all_tags", "excluded_tags"],
+                },
+                {
+                    "code": "filters.required_excluded_labels_disjoint",
+                    "message": "required and excluded labels overlap",
+                    "fields": [
+                        "required_any_labels",
+                        "required_all_labels",
+                        "excluded_labels",
+                    ],
+                },
+            ]
+        }
+    )
     min_duration_s: float | None = Field(default=None, ge=0)
     max_duration_s: float | None = Field(default=None, ge=0)
     min_scene_valid_ratio: float | None = Field(default=None, ge=0, le=1)
@@ -498,6 +584,26 @@ class FiltersConfig(StrictModel):
 
 
 class ScenarioRuleConfig(StrictModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "x-dataset-devkit-runtime-constraints": [
+                {
+                    "code": "scenario_rule.required_excluded_tags_disjoint",
+                    "message": "required and excluded tags overlap",
+                    "fields": ["required_any_tags", "required_all_tags", "excluded_tags"],
+                },
+                {
+                    "code": "scenario_rule.required_excluded_labels_disjoint",
+                    "message": "required and excluded labels overlap",
+                    "fields": [
+                        "required_any_labels",
+                        "required_all_labels",
+                        "excluded_labels",
+                    ],
+                },
+            ]
+        }
+    )
     name: str = Field(min_length=1)
     quota: int = Field(ge=0)
     required_any_tags: list[str] = Field(
@@ -551,6 +657,17 @@ class ScenarioRuleConfig(StrictModel):
 
 
 class ScenariosConfig(StrictModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "x-dataset-devkit-runtime-constraints": [
+                {
+                    "code": "scenarios.unique_rule_names",
+                    "message": "scenario rule names must be unique",
+                    "fields": ["rules[].name"],
+                }
+            ]
+        }
+    )
     seed: int
     strict_quotas: bool = True
     rules: list[ScenarioRuleConfig]
@@ -707,3 +824,15 @@ def load_config(path: Path) -> GlobalConfig:
             value = Path(section_data[field])
             section_data[field] = value if value.is_absolute() else (base / value).resolve()
     return GlobalConfig.model_validate(data)
+
+
+def validate_config_schema_and_runtime(path: Path) -> GlobalConfig:
+    """Validate a JSON config against the public schema and authoritative runtime rules."""
+    from jsonschema import Draft202012Validator
+
+    config_path = path.resolve()
+    value = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ConfigRootError("configuration must be a top-level JSON object")
+    Draft202012Validator(GlobalConfig.model_json_schema()).validate(value)
+    return load_config(config_path)

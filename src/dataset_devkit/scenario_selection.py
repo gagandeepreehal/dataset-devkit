@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Literal
+import hashlib
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, fields, is_dataclass
+from typing import Literal, Protocol
 
 from dataset_devkit.config import ScenarioRuleConfig, ScenariosConfig
 from dataset_devkit.features import SceneFeatures
 from dataset_devkit.filtering import filter_scenes
-from dataset_devkit.provenance import canonical_hash
+from dataset_devkit.provenance import canonical_hash, canonical_json
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,10 @@ class ScenarioQuotaError(ValueError):
         self.selected = selected
         self.deficit = deficit
         self.partial_rule_audits = partial_rule_audits
+
+
+class _HashWriter(Protocol):
+    def update(self, data: bytes) -> object: ...
 
 
 def validate_scenario_selection(
@@ -218,12 +224,50 @@ def _rules_fingerprint(config: ScenariosConfig) -> str:
 def _candidate_fingerprint(
     features: tuple[SceneFeatures, ...] | list[SceneFeatures],
 ) -> str:
-    return canonical_hash(
-        [
-            asdict(feature)
-            for feature in sorted(features, key=lambda item: _identity(item))
-        ]
-    )
+    hasher = hashlib.sha256()
+    hasher.update(b"[")
+    for index, feature in enumerate(sorted(features, key=lambda item: _identity(item))):
+        if index:
+            hasher.update(b",")
+        _update_hash_with_feature(hasher, feature)
+    hasher.update(b"]")
+    return hasher.hexdigest()
+
+
+def _canonical_chunks(value: object) -> Iterator[str]:
+    if is_dataclass(value) and not isinstance(value, type):
+        yield "{"
+        for index, field in enumerate(sorted(fields(value), key=lambda item: item.name)):
+            if index:
+                yield ","
+            yield canonical_json(field.name)
+            yield ":"
+            yield from _canonical_chunks(getattr(value, field.name))
+        yield "}"
+    elif isinstance(value, Mapping):
+        yield "{"
+        for index, (key, item) in enumerate(sorted(value.items(), key=lambda pair: str(pair[0]))):
+            if index:
+                yield ","
+            yield canonical_json(str(key))
+            yield ":"
+            yield from _canonical_chunks(item)
+        yield "}"
+    elif isinstance(value, (list, tuple)):
+        yield "["
+        for index, item in enumerate(value):
+            if index:
+                yield ","
+            yield from _canonical_chunks(item)
+        yield "]"
+    else:
+        yield canonical_json(value)
+
+
+def _update_hash_with_feature(hasher: _HashWriter, feature: SceneFeatures) -> None:
+    """Stream one canonical feature record without constructing a deep-copy tree."""
+    for chunk in _canonical_chunks(feature):
+        hasher.update(chunk.encode("utf-8"))
 
 
 def _rank(

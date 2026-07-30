@@ -351,7 +351,75 @@
         }
       },
       "title": "FiltersConfig",
-      "type": "object"
+      "type": "object",
+      "x-dataset-devkit-runtime-constraints": [
+        {
+          "code": "filters.min_duration_s_lte_max_duration_s",
+          "fields": [
+            "min_duration_s",
+            "max_duration_s"
+          ],
+          "message": "min_duration_s must be <= max_duration_s"
+        },
+        {
+          "code": "filters.min_scene_valid_ratio_lte_max_scene_valid_ratio",
+          "fields": [
+            "min_scene_valid_ratio",
+            "max_scene_valid_ratio"
+          ],
+          "message": "min_scene_valid_ratio must be <= max_scene_valid_ratio"
+        },
+        {
+          "code": "filters.min_source_gnss_valid_ratio_lte_max_source_gnss_valid_ratio",
+          "fields": [
+            "min_source_gnss_valid_ratio",
+            "max_source_gnss_valid_ratio"
+          ],
+          "message": "min_source_gnss_valid_ratio must be <= max_source_gnss_valid_ratio"
+        },
+        {
+          "code": "filters.min_camera_coverage_ratio_lte_max_camera_coverage_ratio",
+          "fields": [
+            "min_camera_coverage_ratio",
+            "max_camera_coverage_ratio"
+          ],
+          "message": "min_camera_coverage_ratio must be <= max_camera_coverage_ratio"
+        },
+        {
+          "code": "filters.min_distance_m_lte_max_distance_m",
+          "fields": [
+            "min_distance_m",
+            "max_distance_m"
+          ],
+          "message": "min_distance_m must be <= max_distance_m"
+        },
+        {
+          "code": "filters.channel_coverage_min_lte_max",
+          "fields": [
+            "min_camera_coverage_by_channel",
+            "max_camera_coverage_by_channel"
+          ],
+          "message": "camera coverage minimum exceeds maximum for {channel}"
+        },
+        {
+          "code": "filters.required_excluded_tags_disjoint",
+          "fields": [
+            "required_any_tags",
+            "required_all_tags",
+            "excluded_tags"
+          ],
+          "message": "required and excluded tags overlap"
+        },
+        {
+          "code": "filters.required_excluded_labels_disjoint",
+          "fields": [
+            "required_any_labels",
+            "required_all_labels",
+            "excluded_labels"
+          ],
+          "message": "required and excluded labels overlap"
+        }
+      ]
     },
     "FrameValidityConfig": {
       "additionalProperties": false,
@@ -679,7 +747,27 @@
         "quota"
       ],
       "title": "ScenarioRuleConfig",
-      "type": "object"
+      "type": "object",
+      "x-dataset-devkit-runtime-constraints": [
+        {
+          "code": "scenario_rule.required_excluded_tags_disjoint",
+          "fields": [
+            "required_any_tags",
+            "required_all_tags",
+            "excluded_tags"
+          ],
+          "message": "required and excluded tags overlap"
+        },
+        {
+          "code": "scenario_rule.required_excluded_labels_disjoint",
+          "fields": [
+            "required_any_labels",
+            "required_all_labels",
+            "excluded_labels"
+          ],
+          "message": "required and excluded labels overlap"
+        }
+      ]
     },
     "ScenariosConfig": {
       "additionalProperties": false,
@@ -706,7 +794,16 @@
         "rules"
       ],
       "title": "ScenariosConfig",
-      "type": "object"
+      "type": "object",
+      "x-dataset-devkit-runtime-constraints": [
+        {
+          "code": "scenarios.unique_rule_names",
+          "fields": [
+            "rules[].name"
+          ],
+          "message": "scenario rule names must be unique"
+        }
+      ]
     },
     "ScenesConfig": {
       "additionalProperties": false,
@@ -791,6 +888,16 @@
     },
     "TagsConfig": {
       "additionalProperties": false,
+      "if": {
+        "properties": {
+          "reference_camera_policy": {
+            "const": "require"
+          }
+        },
+        "required": [
+          "reference_camera_policy"
+        ]
+      },
       "properties": {
         "curvature_min_heading_change_deg": {
           "exclusiveMaximum": 180,
@@ -851,8 +958,31 @@
         "curvature_min_heading_change_deg",
         "turn_min_heading_change_deg"
       ],
+      "then": {
+        "properties": {
+          "reference_camera_channel": {
+            "not": {
+              "type": "null"
+            }
+          }
+        },
+        "required": [
+          "reference_camera_channel"
+        ]
+      },
       "title": "TagsConfig",
-      "type": "object"
+      "type": "object",
+      "x-dataset-devkit-runtime-constraints": [
+        {
+          "code": "tags.heading_threshold_order",
+          "fields": [
+            "straight_max_heading_change_deg",
+            "curvature_min_heading_change_deg",
+            "turn_min_heading_change_deg"
+          ],
+          "message": "straight_max_heading_change_deg < curvature_min_heading_change_deg < turn_min_heading_change_deg is required"
+        }
+      ]
     },
     "TopicsConfig": {
       "additionalProperties": false,

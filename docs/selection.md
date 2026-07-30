@@ -13,6 +13,12 @@ the channels used plus the fallback count. The observation uses that camera's in
 timestamp and Web-Mercator ego-pose `(x, y)` coordinates. Logical-grid intervals and configured
 FPS are never used as elapsed trajectory time.
 
+EPSG:3857 Web Mercator coordinates are projected map units, not locally corrected geodesic
+distances. Their scale grows with latitude (approximately by `sec(latitude)`), so reported planar
+distance, speed, and curvature inherit that distortion. These deterministic features are suitable
+for like-for-like selection within the same operating region; applications requiring physical
+ground distance across latitudes must use an appropriate local/geodesic projection upstream.
+
 Segment duration is the positive difference between consecutive real timestamps in seconds.
 Distance is planar Euclidean Web-Mercator distance. `mean_speed_mps` is the arithmetic mean of the
 segment speeds; median and maximum are calculated over the same segment population.
@@ -45,6 +51,10 @@ interpolation/source identity and validity evidence consumed by feature derivati
 Task 6 raises `StructuralExtractionError` for missing,
 nonfinite, inconsistent, or non-increasing reference evidence; such failures are not filter
 rejections.
+Task 5 also seals canonical global tuple order for scenes, samples, sample-data, annotations,
+matches, windows, unassigned records, and source samples. Task 6 validates that boundary, then
+indexes samples by scene and sample-data by sample/scene in one linear pass; it never rescans all
+recording records for each scene.
 
 ## Declarative filters
 
@@ -54,6 +64,8 @@ exact scene-token/source-digest/blob-path blacklists are independent criteria. E
 criterion is evaluated, so one rejected scene may carry multiple stable `RejectionReason` records.
 Each reason contains its code, measured value, operator, threshold or expected set, scene token,
 source digest, and exact blob path. Accepted and rejected outputs preserve input order.
+Predicate and blacklist sets are compiled once for each `filter_scenes` call and reused for every
+feature in that call.
 
 ## Ordered exact-quota rules
 
@@ -71,6 +83,8 @@ Reordering identical inputs produces the same canonical result.
 The immutable result persists seed, strict-mode, canonical rule/config fingerprints, and a
 fingerprint of the complete accepted feature candidates. Validation recomputes canonical candidate
 rank order and first-quota selection for every rule; coherent lower-rank substitutions are invalid.
+Candidate fingerprints stream canonical feature records into SHA-256 in sorted identity order;
+they do not construct a deep-copied duplicate candidate array.
 
 Copy [`examples/scenario_templates.json`](../examples/scenario_templates.json) for the canonical
 Straight, Stopping, Left Turn, Right Turn, Left Curvature, Right Curvature, and annotation-label
