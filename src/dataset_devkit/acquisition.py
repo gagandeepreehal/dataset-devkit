@@ -24,6 +24,7 @@ from dataset_devkit.config import AzureConfig, GlobalConfig
 from dataset_devkit.provenance import (
     AcquisitionManifest,
     ArtifactIdentity,
+    ExtractionManifest,
     IntegrityVerification,
     SourceFingerprint,
     canonical_hash,
@@ -313,6 +314,25 @@ def _write_acquisition_manifest_at(
     )
 
 
+def _load_extraction_manifest_at(
+    directory_fd: int, name: str
+) -> ExtractionManifest | None:
+    try:
+        return ExtractionManifest.from_dict(_load_json_at(directory_fd, name))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _write_extraction_manifest_at(
+    directory_fd: int, name: str, manifest: ExtractionManifest
+) -> None:
+    _atomic_write_text_at(
+        directory_fd,
+        name,
+        canonical_json(manifest.to_dict()) + "\n",
+    )
+
+
 def _content_md5(properties: BlobPropertiesProtocol) -> bytes | None:
     value = properties.content_settings.content_md5
     return bytes(value) if value is not None else None
@@ -419,6 +439,106 @@ class AzureBlobAcquirer:
             return client.get_blob_properties()
         except Exception as error:
             raise AcquisitionError(f"failed to read Azure properties for {blob_path!r}") from error
+
+    def _validate_owned_source(self, source: SourceFingerprint) -> None:
+        validate_blob_path(source.blob_path)
+        if (
+            source.account_url != self.azure.account_url
+            or source.container != self.azure.container
+        ):
+            raise AcquisitionError("source fingerprint does not belong to this Azure cache")
+
+    def record_extraction_complete(
+        self,
+        source: SourceFingerprint,
+        completed_extraction_config_hash: str,
+    ) -> Path:
+        """Record completed extraction inside the source's trusted, locked cache."""
+        self._validate_owned_source(source)
+        paths = self.paths_for(source)
+        recording_directory = self._recording_directory(source.blob_path)
+        manifest = ExtractionManifest.from_dict(
+            ExtractionManifest(
+                source=source,
+                extraction_config_hash=completed_extraction_config_hash,
+            ).to_dict()
+        )
+        with (
+            _open_recording_cache(self.cache_dir, recording_directory.name) as cache,
+            _recording_lock_at(cache.recording_fd),
+        ):
+            self._record_extraction_complete_locked(cache, paths, manifest)
+        return paths.extraction_manifest
+
+    def _record_extraction_complete_locked(
+        self,
+        cache: _RecordingCache,
+        paths: CachePaths,
+        manifest: ExtractionManifest,
+    ) -> None:
+        cache.validate()
+        try:
+            _write_extraction_manifest_at(
+                cache.recording_fd,
+                paths.extraction_manifest.name,
+                manifest,
+            )
+            if (
+                _owned_file_identity_at(
+                    cache.recording_fd,
+                    paths.extraction_manifest.name,
+                )
+                is None
+            ):
+                raise AcquisitionError(
+                    "extraction manifest is not an owned regular cache file"
+                )
+            cache.validate()
+        except (OSError, AcquisitionError):
+            _unlink_at(cache.recording_fd, paths.extraction_manifest.name)
+            raise
+
+    def extraction_cache_reusable(
+        self,
+        source: SourceFingerprint,
+        expected_extraction_config_hash: str,
+    ) -> bool:
+        """Check completed extraction inside the source's trusted, locked cache."""
+        try:
+            self._validate_owned_source(source)
+            paths = self.paths_for(source)
+            recording_directory = self._recording_directory(source.blob_path)
+            with (
+                _open_recording_cache(self.cache_dir, recording_directory.name) as cache,
+                _recording_lock_at(cache.recording_fd),
+            ):
+                return self._extraction_cache_reusable_locked(
+                    cache,
+                    paths,
+                    source,
+                    expected_extraction_config_hash,
+                )
+        except (OSError, AcquisitionError):
+            return False
+
+    def _extraction_cache_reusable_locked(
+        self,
+        cache: _RecordingCache,
+        paths: CachePaths,
+        source: SourceFingerprint,
+        expected_extraction_config_hash: str,
+    ) -> bool:
+        cache.validate()
+        manifest = _load_extraction_manifest_at(
+            cache.recording_fd,
+            paths.extraction_manifest.name,
+        )
+        cache.validate()
+        return bool(
+            manifest is not None
+            and manifest.source == source
+            and manifest.extraction_config_hash == expected_extraction_config_hash
+        )
 
     def _load_partial_source(
         self, directory_fd: int, name: str

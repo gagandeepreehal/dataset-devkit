@@ -92,16 +92,23 @@ otherwise the partial is discarded and restarted. Azure properties are checked b
 download, exact size is mandatory, and a supplied content MD5 must match before atomic rename.
 When Azure provides no content MD5, the manifest explicitly records `size_etag`, meaning exact
 size plus stable ETag was the available integrity check.
+Integrity metadata is accepted only when `verified` is true. `content_md5` requires a canonical
+base64-encoded 16-byte MD5 value, while `size_etag` must not include an MD5 claim.
 
 Each recording manifest is canonical JSON and contains the source fingerprint, download status
 (`downloaded`, `resumed`, or `cache_hit`), cache-relative artifact path, local size and SHA-256,
 integrity method/result, and `requested_extraction_config_hash`. This acquisition field describes
 the current request; it does not claim that extraction completed. After producing actual output,
-the extraction stage must explicitly call `record_extraction_complete` to atomically write the
-separate extraction-completion manifest. Only that file proves a source fingerprint and
-extraction-config hash pair. Acquisition cache hits can update acquisition request/status
-provenance but never write or replace extraction-completion provenance. Missing, malformed, or
-symlinked completion manifests are cache misses.
+the extraction stage must explicitly call
+`AzureBlobAcquirer.record_extraction_complete(source, config_hash)` to atomically write the
+separate extraction-completion manifest. Reuse must be decided through
+`AzureBlobAcquirer.extraction_cache_reusable(source, config_hash)`. Neither method accepts a
+caller-supplied path; both derive the manifest leaf from the source fingerprint, traverse the
+trusted cache with directory descriptors, and hold the recording lock for the complete write or
+read decision. Only that file proves a source fingerprint and extraction-config hash pair.
+Acquisition cache hits can update acquisition request/status provenance but never write or replace
+extraction-completion provenance. Missing, malformed, linked, or inconsistent completion manifests
+are cache misses.
 
 Cache artifacts, partials, sidecars, and manifests are required to be single-link regular files
 within the configured cache. Unsafe symbolic or hard links are never followed, modified, or
@@ -113,6 +120,8 @@ only when Azure supplies a whole-blob content MD5; otherwise acquisition restart
 because the existing prefix cannot be verified. Acquisitions for the same recording are serialized
 with an operating-system file lock. Cache directories are opened component by component without
 following symbolic links, and leaf operations remain relative to those trusted directory handles.
+This secure cache backend is POSIX-only because it requires `flock`, directory-relative file
+operations, and no-follow opens. Windows is not a supported runtime.
 
 ## Managed-identity smoke check
 

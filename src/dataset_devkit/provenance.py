@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -124,6 +126,23 @@ class IntegrityVerification:
             or (content_md5 is not None and not isinstance(content_md5, str))
         ):
             raise ValueError("invalid integrity verification values")
+        if not verified:
+            raise ValueError("integrity verification must be successful")
+        if method == "size_etag":
+            if content_md5 is not None:
+                raise ValueError("size_etag integrity cannot claim content MD5")
+        else:
+            if not isinstance(content_md5, str):
+                raise ValueError("content_md5 integrity requires an MD5 value")
+            try:
+                decoded_md5 = base64.b64decode(content_md5, validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise ValueError("invalid content_md5 integrity value") from error
+            if (
+                len(decoded_md5) != 16
+                or base64.b64encode(decoded_md5).decode("ascii") != content_md5
+            ):
+                raise ValueError("invalid content_md5 integrity value")
         return cls(cast(IntegrityMethod, method), verified, content_md5)
 
 
@@ -255,39 +274,3 @@ def load_manifest(path: Path) -> AcquisitionManifest | None:
         return AcquisitionManifest.from_dict(value)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
         return None
-
-
-def record_extraction_complete(
-    path: Path,
-    source: SourceFingerprint,
-    completed_extraction_config_hash: str,
-) -> None:
-    """Atomically record provenance only after extraction output has completed."""
-    manifest = ExtractionManifest(
-        source=source,
-        extraction_config_hash=completed_extraction_config_hash,
-    )
-    validated = ExtractionManifest.from_dict(manifest.to_dict())
-    _write_canonical_manifest(path, validated.to_dict())
-
-
-def load_extraction_manifest(path: Path) -> ExtractionManifest | None:
-    """Load completed-extraction provenance; unsafe or malformed files are misses."""
-    try:
-        return ExtractionManifest.from_dict(_load_manifest_value(path))
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
-        return None
-
-
-def extraction_cache_reusable(
-    manifest_path: Path,
-    source: SourceFingerprint,
-    expected_extraction_config_hash: str,
-) -> bool:
-    """Decide whether extraction output provenance exactly matches this request."""
-    manifest = load_extraction_manifest(manifest_path)
-    return bool(
-        manifest is not None
-        and manifest.source == source
-        and manifest.extraction_config_hash == expected_extraction_config_hash
-    )

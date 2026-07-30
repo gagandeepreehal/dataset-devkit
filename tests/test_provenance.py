@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -16,11 +17,8 @@ from dataset_devkit.provenance import (
     IntegrityVerification,
     SourceFingerprint,
     canonical_json,
-    extraction_cache_reusable,
     extraction_config_hash,
-    load_extraction_manifest,
     load_manifest,
-    record_extraction_complete,
     write_manifest,
 )
 
@@ -96,77 +94,49 @@ def test_manifest_round_trip_and_malformed_manifest_is_a_cache_miss(tmp_path: Pa
     assert load_manifest(path) == expected
     path.write_text("{broken", encoding="utf-8")
     assert load_manifest(path) is None
+    invalid = expected.to_dict()
+    invalid["integrity"] = {
+        "method": "size_etag",
+        "verified": False,
+        "content_md5": None,
+    }
+    path.write_text(canonical_json(invalid) + "\n", encoding="utf-8")
+    assert load_manifest(path) is None
     assert load_manifest(tmp_path / "missing.json") is None
 
 
-def test_extraction_cache_requires_exact_source_and_config_hash(tmp_path: Path) -> None:
-    path = tmp_path / "manifest.json"
-    manifest = _manifest(tmp_path)
-    record_extraction_complete(
-        path, manifest.source, manifest.requested_extraction_config_hash
-    )
-
-    assert extraction_cache_reusable(
-        path, manifest.source, manifest.requested_extraction_config_hash
-    )
-    assert not extraction_cache_reusable(
-        path,
-        SourceFingerprint(
-            account_url=manifest.source.account_url,
-            container=manifest.source.container,
-            blob_path=manifest.source.blob_path,
-            etag='"changed"',
-            size=manifest.source.size,
-        ),
-        manifest.requested_extraction_config_hash,
-    )
-    assert not extraction_cache_reusable(path, manifest.source, "c" * 64)
-    path.write_text("[]", encoding="utf-8")
-    assert not extraction_cache_reusable(
-        path, manifest.source, manifest.requested_extraction_config_hash
-    )
-
-
-def test_extraction_completion_manifest_round_trip(tmp_path: Path) -> None:
-    acquisition = _manifest(tmp_path)
-    path = tmp_path / "extraction.manifest.json"
-
-    record_extraction_complete(
-        path, acquisition.source, acquisition.requested_extraction_config_hash
-    )
-
-    assert load_extraction_manifest(path) == ExtractionManifest(
-        source=acquisition.source,
-        extraction_config_hash=acquisition.requested_extraction_config_hash,
-    )
-
-
-def test_extraction_manifest_symlink_is_a_miss_and_completion_replaces_link(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "integrity",
+    [
+        {"method": "size_etag", "verified": False, "content_md5": None},
+        {"method": "size_etag", "verified": True, "content_md5": "claimed"},
+        {"method": "content_md5", "verified": False, "content_md5": "claimed"},
+        {"method": "content_md5", "verified": True, "content_md5": None},
+        {"method": "content_md5", "verified": True, "content_md5": "not-base64"},
+        {
+            "method": "content_md5",
+            "verified": True,
+            "content_md5": base64.b64encode(b"too-short").decode("ascii"),
+        },
+    ],
+)
+def test_integrity_verification_rejects_inconsistent_or_malformed_values(
+    integrity: dict[str, object],
 ) -> None:
-    acquisition = _manifest(tmp_path)
-    outside = tmp_path / "outside-extraction-manifest"
-    record_extraction_complete(
-        outside, acquisition.source, acquisition.requested_extraction_config_hash
-    )
-    outside_content = outside.read_text(encoding="utf-8")
-    link = tmp_path / "extraction.manifest.json"
-    link.symlink_to(outside)
+    with pytest.raises(ValueError, match="integrity"):
+        IntegrityVerification.from_dict(integrity)
 
-    assert not extraction_cache_reusable(
-        link, acquisition.source, acquisition.requested_extraction_config_hash
+
+def test_extraction_manifest_round_trip_requires_exact_fields(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    expected = ExtractionManifest(
+        source=manifest.source,
+        extraction_config_hash=manifest.requested_extraction_config_hash,
     )
 
-    record_extraction_complete(
-        link, acquisition.source, acquisition.requested_extraction_config_hash
-    )
-
-    assert outside.read_text(encoding="utf-8") == outside_content
-    assert link.is_file()
-    assert not link.is_symlink()
-    assert extraction_cache_reusable(
-        link, acquisition.source, acquisition.requested_extraction_config_hash
-    )
+    assert ExtractionManifest.from_dict(expected.to_dict()) == expected
+    with pytest.raises(ValueError, match="extraction manifest"):
+        ExtractionManifest.from_dict({"manifest_version": 1})
 
 
 def test_manifest_hard_link_is_a_cache_miss(tmp_path: Path) -> None:

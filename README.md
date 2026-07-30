@@ -33,6 +33,9 @@ The command parsers and explicit service boundaries exist now. Build, validation
 inspection services intentionally report that they are not implemented until their pipeline
 tasks land.
 
+The secure cache backend is supported on POSIX platforms only. It requires POSIX file locks and
+descriptor-relative, no-follow filesystem operations; Windows is not a supported runtime.
+
 ## Azure acquisition
 
 Blob-list entries must be exact container-relative paths under `mcap-h265/` ending in `.mcap`.
@@ -43,8 +46,11 @@ partials restart. Each finalized recording has a canonical provenance manifest r
 source fingerprint, local SHA-256 and size, Azure MD5 verification when available (or the
 size-and-stable-ETag fallback), result status, and requested extraction-config hash. That request
 hash is not proof that extraction ran. Extraction reuse becomes valid only when the extraction
-stage explicitly records a separate completion manifest for the source fingerprint and config
-hash; acquisition cache hits never create that proof.
+stage calls `AzureBlobAcquirer.record_extraction_complete(source, config_hash)`. Reuse decisions
+must use `AzureBlobAcquirer.extraction_cache_reusable(source, config_hash)`. These source-keyed
+methods record and read the separate completion manifest under the same trusted cache traversal
+and per-recording lock as acquisition; they do not accept caller-supplied manifest paths.
+Acquisition cache hits never create that proof.
 
 See [configuration.md](docs/configuration.md#managed-identity-smoke-check) for authentication and
 an optional one-blob smoke check.

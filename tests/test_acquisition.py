@@ -22,11 +22,10 @@ from dataset_devkit.acquisition import (
 )
 from dataset_devkit.config import AzureConfig
 from dataset_devkit.provenance import (
+    ExtractionManifest,
     SourceFingerprint,
     canonical_json,
-    extraction_cache_reusable,
     load_manifest,
-    record_extraction_complete,
 )
 
 
@@ -179,6 +178,26 @@ def test_exact_fingerprint_cache_hit_reverifies_without_downloading(tmp_path: Pa
     assert second.artifact_path == first.artifact_path
     assert second.manifest.status == "cache_hit"
     assert client.download_offsets == [0]
+
+
+def test_unverified_cached_manifest_is_rejected_and_redownloaded(tmp_path: Path) -> None:
+    payload = b"cached-mcap"
+    prop = properties(payload, md5=False)
+    client = FakeBlobClient(payload, [prop, prop, prop, prop])
+    downloader = acquirer(tmp_path, client)
+    first = downloader.acquire("mcap-h265/fleet/unverified-manifest.mcap")
+    serialized = first.manifest.to_dict()
+    serialized["integrity"] = {
+        "method": "size_etag",
+        "verified": False,
+        "content_md5": None,
+    }
+    first.manifest_path.write_text(canonical_json(serialized) + "\n", encoding="utf-8")
+
+    second = downloader.acquire("mcap-h265/fleet/unverified-manifest.mcap")
+
+    assert second.manifest.status == "downloaded"
+    assert client.download_offsets == [0, 0]
 
 
 def test_empty_blob_is_verified_and_finalized_as_an_empty_regular_file(tmp_path: Path) -> None:
@@ -701,26 +720,189 @@ def test_cache_hit_does_not_claim_extraction_complete_for_new_config(tmp_path: P
     client = FakeBlobClient(payload, [prop, prop, prop])
     hash_a = "a" * 64
     hash_b = "b" * 64
-    first = acquirer(tmp_path, client, hash_a).acquire("mcap-h265/a.mcap")
+    downloader_a = acquirer(tmp_path, client, hash_a)
+    first = downloader_a.acquire("mcap-h265/a.mcap")
 
-    assert not extraction_cache_reusable(
-        first.extraction_manifest_path, first.manifest.source, hash_a
+    assert not downloader_a.extraction_cache_reusable(first.manifest.source, hash_a)
+    downloader_a.record_extraction_complete(first.manifest.source, hash_a)
+    assert downloader_a.extraction_cache_reusable(first.manifest.source, hash_a)
+    changed_source = SourceFingerprint(
+        account_url=first.manifest.source.account_url,
+        container=first.manifest.source.container,
+        blob_path=first.manifest.source.blob_path,
+        etag='"changed"',
+        size=first.manifest.source.size,
     )
-    record_extraction_complete(first.extraction_manifest_path, first.manifest.source, hash_a)
-    assert extraction_cache_reusable(
-        first.extraction_manifest_path, first.manifest.source, hash_a
-    )
+    assert not downloader_a.extraction_cache_reusable(changed_source, hash_a)
 
-    second = acquirer(tmp_path, client, hash_b).acquire("mcap-h265/a.mcap")
+    downloader_b = acquirer(tmp_path, client, hash_b)
+    second = downloader_b.acquire("mcap-h265/a.mcap")
 
     assert second.manifest.status == "cache_hit"
     assert second.manifest.requested_extraction_config_hash == hash_b
-    assert not extraction_cache_reusable(
-        second.extraction_manifest_path, second.manifest.source, hash_b
+    assert not downloader_b.extraction_cache_reusable(second.manifest.source, hash_b)
+    assert downloader_b.extraction_cache_reusable(second.manifest.source, hash_a)
+
+
+def test_record_extraction_complete_rejects_swapped_recording_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    downloader = acquirer(tmp_path, FakeBlobClient(payload, [prop, prop]))
+    acquired = downloader.acquire("mcap-h265/extraction-record-race.mcap")
+    recording_directory = acquired.artifact_path.parent
+    moved_directory = tmp_path / "moved-extraction-record-cache"
+    outside = tmp_path / "outside-extraction-record"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"must-not-change")
+    original_record_locked = downloader._record_extraction_complete_locked
+
+    def swap_ancestor_then_record(*args: object, **kwargs: object) -> object:
+        recording_directory.rename(moved_directory)
+        recording_directory.symlink_to(outside, target_is_directory=True)
+        return original_record_locked(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        downloader,
+        "_record_extraction_complete_locked",
+        swap_ancestor_then_record,
     )
-    assert extraction_cache_reusable(
-        second.extraction_manifest_path, second.manifest.source, hash_a
+
+    with pytest.raises(AcquisitionError, match="cache|directory|safe"):
+        downloader.record_extraction_complete(
+            acquired.manifest.source,
+            acquired.manifest.requested_extraction_config_hash,
+        )
+
+    assert sentinel.read_bytes() == b"must-not-change"
+    assert list(outside.iterdir()) == [sentinel]
+
+
+def test_extraction_reuse_rejects_forged_manifest_through_swapped_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    downloader = acquirer(tmp_path, FakeBlobClient(payload, [prop, prop]))
+    acquired = downloader.acquire("mcap-h265/extraction-reuse-race.mcap")
+    recording_directory = acquired.artifact_path.parent
+    moved_directory = tmp_path / "moved-extraction-reuse-cache"
+    outside = tmp_path / "outside-extraction-reuse"
+    outside.mkdir()
+    forged = outside / acquired.extraction_manifest_path.name
+    forged.write_text(
+        canonical_json(
+            ExtractionManifest(
+                source=acquired.manifest.source,
+                extraction_config_hash=acquired.manifest.requested_extraction_config_hash,
+            ).to_dict()
+        )
+        + "\n",
+        encoding="utf-8",
     )
+    original_reuse_locked = downloader._extraction_cache_reusable_locked
+
+    def swap_ancestor_then_check(*args: object, **kwargs: object) -> object:
+        recording_directory.rename(moved_directory)
+        recording_directory.symlink_to(outside, target_is_directory=True)
+        return original_reuse_locked(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        downloader,
+        "_extraction_cache_reusable_locked",
+        swap_ancestor_then_check,
+    )
+
+    assert not downloader.extraction_cache_reusable(
+        acquired.manifest.source,
+        acquired.manifest.requested_extraction_config_hash,
+    )
+
+    assert forged.is_file()
+
+
+@pytest.mark.parametrize("leaf_kind", ["symlink", "hardlink"])
+def test_extraction_completion_rejects_unsafe_leaf_and_replaces_it_safely(
+    tmp_path: Path,
+    leaf_kind: str,
+) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    downloader = acquirer(tmp_path, FakeBlobClient(payload, [prop, prop]))
+    acquired = downloader.acquire(f"mcap-h265/extraction-{leaf_kind}.mcap")
+    completion_path = acquired.extraction_manifest_path
+    outside = tmp_path / f"outside-extraction-{leaf_kind}"
+    outside.write_text(
+        canonical_json(
+            ExtractionManifest(
+                source=acquired.manifest.source,
+                extraction_config_hash=acquired.manifest.requested_extraction_config_hash,
+            ).to_dict()
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    outside_content = outside.read_bytes()
+    if leaf_kind == "symlink":
+        completion_path.symlink_to(outside)
+    else:
+        os.link(outside, completion_path)
+
+    assert not downloader.extraction_cache_reusable(
+        acquired.manifest.source,
+        acquired.manifest.requested_extraction_config_hash,
+    )
+
+    written_path = downloader.record_extraction_complete(
+        acquired.manifest.source,
+        acquired.manifest.requested_extraction_config_hash,
+    )
+
+    assert outside.read_bytes() == outside_content
+    assert written_path == completion_path
+    assert written_path.is_file()
+    assert not written_path.is_symlink()
+    assert written_path.stat().st_nlink == 1
+    assert downloader.extraction_cache_reusable(
+        acquired.manifest.source,
+        acquired.manifest.requested_extraction_config_hash,
+    )
+
+
+def test_extraction_completion_waits_for_the_recording_acquisition_lock(
+    tmp_path: Path,
+) -> None:
+    payload = b"safe-payload"
+    prop = properties(payload)
+    entered = Event()
+    release = Event()
+    client = BlockingBlobClient(payload, [prop, prop], entered, release)
+    downloader = acquirer(tmp_path, client)
+    blob_path = "mcap-h265/extraction-lock.mcap"
+    source = downloader.fingerprint_for(blob_path, prop)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        acquisition_future = executor.submit(downloader.acquire, blob_path)
+        assert entered.wait(timeout=2)
+        completion_future = executor.submit(
+            downloader.record_extraction_complete,
+            source,
+            "a" * 64,
+        )
+        try:
+            with pytest.raises(TimeoutError):
+                completion_future.result(timeout=0.1)
+        finally:
+            release.set()
+        acquired = acquisition_future.result(timeout=2)
+        completion_path = completion_future.result(timeout=2)
+
+    assert completion_path == acquired.extraction_manifest_path
+    assert downloader.extraction_cache_reusable(source, "a" * 64)
 
 
 def test_unsafe_leaf_swap_during_finalization_is_cleaned(
