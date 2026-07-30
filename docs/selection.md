@@ -14,9 +14,11 @@ timestamp and Web-Mercator ego-pose `(x, y)` coordinates. Logical-grid intervals
 FPS are never used as elapsed trajectory time.
 
 Segment duration is the positive difference between consecutive real timestamps in seconds.
-Distance is planar Euclidean Web-Mercator distance. Mean speed is total distance divided by total
-real duration; median and maximum speed are calculated over segment speeds. A one-sample scene has
-zero finite duration, distance, and speed. Zero-distance segments have zero speed and curvature.
+Distance is planar Euclidean Web-Mercator distance. `mean_speed_mps` is the arithmetic mean of the
+segment speeds; median and maximum are calculated over the same segment population.
+`time_weighted_speed_mps` is separately named and equals total distance divided by total real
+duration. A one-sample scene has zero finite duration, distance, and speed. Zero-distance segments
+have zero speed and curvature.
 
 Quaternion input is normalized `(w, x, y, z)`. Yaw follows a right-handed ENU frame, so positive
 shortest signed yaw change is left and negative change is right. Heading deltas are unwrapped into
@@ -31,15 +33,17 @@ configured middle band. Straight, turn, and curvature tags are mutually exclusiv
 are `camera_coverage_complete`/`camera_coverage_partial`; GNSS state tags are `gnss_valid`,
 `gnss_partial`, or `gnss_invalid`.
 
-Source-GNSS ratio, expected/present camera coverage, and grid/camera synchronization error are
-computed from the sealed Task 5 evidence. Task 6 raises `StructuralExtractionError` for missing,
+Source-GNSS ratio, expected/present camera coverage, and synchronization error are computed from
+the sealed Task 5 evidence. The sync population contains one grid error per source sample plus one
+camera error per present camera record; it is independent of the trajectory reference channel.
+Task 6 raises `StructuralExtractionError` for missing,
 nonfinite, inconsistent, or non-increasing reference evidence; such failures are not filter
 rejections.
 
 ## Declarative filters
 
-An empty `filters` object accepts everything. Duration, scene-valid ratio, overall/per-channel
-camera coverage, maximum synchronization error (milliseconds), distance, tags, human labels, and
+An empty `filters` object accepts everything. Duration, scene-valid and source-GNSS-valid ratios,
+overall/per-channel camera coverage, maximum synchronization error (milliseconds), distance, tags, human labels, and
 exact scene-token/source-digest/blob-path blacklists are independent criteria. Every configured
 criterion is evaluated, so one rejected scene may carry multiple stable `RejectionReason` records.
 Each reason contains its code, measured value, operator, threshold or expected set, scene token,

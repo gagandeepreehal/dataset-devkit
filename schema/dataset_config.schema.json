@@ -107,37 +107,43 @@
             "type": "string"
           },
           "title": "Blacklisted Blob Paths",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "blacklisted_scene_tokens": {
           "items": {
             "type": "string"
           },
           "title": "Blacklisted Scene Tokens",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "blacklisted_source_digests": {
           "items": {
             "type": "string"
           },
           "title": "Blacklisted Source Digests",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "excluded_labels": {
           "items": {
             "type": "string"
           },
           "title": "Excluded Labels",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "excluded_tags": {
           "items": {
             "type": "string"
           },
           "title": "Excluded Tags",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "max_camera_coverage_by_channel": {
+          "additionalProperties": false,
           "patternProperties": {
             "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$": {
               "type": "number"
@@ -203,6 +209,20 @@
           "default": null,
           "title": "Max Scene Valid Ratio"
         },
+        "max_source_gnss_valid_ratio": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Source Gnss Valid Ratio"
+        },
         "max_sync_error_ms": {
           "anyOf": [
             {
@@ -217,6 +237,7 @@
           "title": "Max Sync Error Ms"
         },
         "min_camera_coverage_by_channel": {
+          "additionalProperties": false,
           "patternProperties": {
             "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$": {
               "type": "number"
@@ -282,33 +303,51 @@
           "default": null,
           "title": "Min Scene Valid Ratio"
         },
+        "min_source_gnss_valid_ratio": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Source Gnss Valid Ratio"
+        },
         "required_all_labels": {
           "items": {
             "type": "string"
           },
           "title": "Required All Labels",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "required_all_tags": {
           "items": {
             "type": "string"
           },
           "title": "Required All Tags",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "required_any_labels": {
           "items": {
             "type": "string"
           },
           "title": "Required Any Labels",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "required_any_tags": {
           "items": {
             "type": "string"
           },
           "title": "Required Any Tags",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "title": "FiltersConfig",
@@ -570,14 +609,16 @@
             "type": "string"
           },
           "title": "Excluded Labels",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "excluded_tags": {
           "items": {
             "type": "string"
           },
           "title": "Excluded Tags",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "filters": {
           "anyOf": [
@@ -605,28 +646,32 @@
             "type": "string"
           },
           "title": "Required All Labels",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "required_all_tags": {
           "items": {
             "type": "string"
           },
           "title": "Required All Tags",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "required_any_labels": {
           "items": {
             "type": "string"
           },
           "title": "Required Any Labels",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "required_any_tags": {
           "items": {
             "type": "string"
           },
           "title": "Required Any Tags",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [

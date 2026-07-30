@@ -61,7 +61,7 @@ are not treated as credentials merely because their text contains words such as 
   meters, and ordered straight/curvature/turn net-heading thresholds in degrees. The required
   relationship is `straight_max_heading_change_deg < curvature_min_heading_change_deg <
   turn_min_heading_change_deg`.
-- `filters`: optional duration seconds, scene-valid and camera-coverage ratios, per-channel
+- `filters`: optional duration seconds, scene-valid, source-GNSS-valid, and camera-coverage ratios, per-channel
   coverage, maximum sync error milliseconds, distance meters, computed-tag and human-label
   predicates, and exact scene/source/blob blacklists. Empty means accept all.
 - `scenarios`: deterministic integer seed, strict exact-quota policy, and uniquely named ordered

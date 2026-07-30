@@ -404,22 +404,46 @@ class FiltersConfig(StrictModel):
     max_duration_s: float | None = Field(default=None, ge=0)
     min_scene_valid_ratio: float | None = Field(default=None, ge=0, le=1)
     max_scene_valid_ratio: float | None = Field(default=None, ge=0, le=1)
+    min_source_gnss_valid_ratio: float | None = Field(default=None, ge=0, le=1)
+    max_source_gnss_valid_ratio: float | None = Field(default=None, ge=0, le=1)
     min_camera_coverage_ratio: float | None = Field(default=None, ge=0, le=1)
     max_camera_coverage_ratio: float | None = Field(default=None, ge=0, le=1)
-    min_camera_coverage_by_channel: dict[SafeSegment, float] = Field(default_factory=dict)
-    max_camera_coverage_by_channel: dict[SafeSegment, float] = Field(default_factory=dict)
+    min_camera_coverage_by_channel: dict[SafeSegment, float] = Field(
+        default_factory=dict, json_schema_extra={"additionalProperties": False}
+    )
+    max_camera_coverage_by_channel: dict[SafeSegment, float] = Field(
+        default_factory=dict, json_schema_extra={"additionalProperties": False}
+    )
     max_sync_error_ms: float | None = Field(default=None, ge=0)
     min_distance_m: float | None = Field(default=None, ge=0)
     max_distance_m: float | None = Field(default=None, ge=0)
-    required_any_tags: list[str] = Field(default_factory=list)
-    required_all_tags: list[str] = Field(default_factory=list)
-    excluded_tags: list[str] = Field(default_factory=list)
-    required_any_labels: list[str] = Field(default_factory=list)
-    required_all_labels: list[str] = Field(default_factory=list)
-    excluded_labels: list[str] = Field(default_factory=list)
-    blacklisted_scene_tokens: list[str] = Field(default_factory=list)
-    blacklisted_source_digests: list[str] = Field(default_factory=list)
-    blacklisted_blob_paths: list[str] = Field(default_factory=list)
+    required_any_tags: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    required_all_tags: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    excluded_tags: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    required_any_labels: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    required_all_labels: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    excluded_labels: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    blacklisted_scene_tokens: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    blacklisted_source_digests: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    blacklisted_blob_paths: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
 
     @field_validator(
         "required_any_tags",
@@ -448,6 +472,7 @@ class FiltersConfig(StrictModel):
         for minimum_name, maximum_name in (
             ("min_duration_s", "max_duration_s"),
             ("min_scene_valid_ratio", "max_scene_valid_ratio"),
+            ("min_source_gnss_valid_ratio", "max_source_gnss_valid_ratio"),
             ("min_camera_coverage_ratio", "max_camera_coverage_ratio"),
             ("min_distance_m", "max_distance_m"),
         ):
@@ -475,12 +500,24 @@ class FiltersConfig(StrictModel):
 class ScenarioRuleConfig(StrictModel):
     name: str = Field(min_length=1)
     quota: int = Field(ge=0)
-    required_any_tags: list[str] = Field(default_factory=list)
-    required_all_tags: list[str] = Field(default_factory=list)
-    excluded_tags: list[str] = Field(default_factory=list)
-    required_any_labels: list[str] = Field(default_factory=list)
-    required_all_labels: list[str] = Field(default_factory=list)
-    excluded_labels: list[str] = Field(default_factory=list)
+    required_any_tags: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    required_all_tags: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    excluded_tags: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    required_any_labels: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    required_all_labels: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    excluded_labels: list[str] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
     filters: FiltersConfig | None = None
 
     @field_validator("name")

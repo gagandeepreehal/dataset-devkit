@@ -138,6 +138,8 @@ def test_jpeg_quality_must_be_in_valid_range(tmp_path: Path, quality: int) -> No
         ("tags.turn_min_heading_change_deg", 181),
         ("filters.min_scene_valid_ratio", -0.1),
         ("filters.min_scene_valid_ratio", 1.1),
+        ("filters.min_source_gnss_valid_ratio", -0.1),
+        ("filters.max_source_gnss_valid_ratio", 1.1),
         ("split.test_fraction", 0),
         ("split.test_fraction", 1),
         ("execution.workers", 0),

@@ -13,7 +13,13 @@ from PIL import Image
 
 from dataset_devkit import scenes as scenes_module
 from dataset_devkit.annotations import ParsedAnnotation
-from dataset_devkit.config import GlobalConfig, InvalidationRulesConfig
+from dataset_devkit.config import (
+    FiltersConfig,
+    GlobalConfig,
+    InvalidationRulesConfig,
+    ScenarioRuleConfig,
+    ScenariosConfig,
+)
 from dataset_devkit.extraction.camera import DecoderOutput
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import (
@@ -26,7 +32,10 @@ from dataset_devkit.extraction.models import (
 )
 from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.extraction.staging import stage_jpeg
+from dataset_devkit.features import compute_recording_features
+from dataset_devkit.filtering import filter_scenes
 from dataset_devkit.provenance import SourceFingerprint, canonical_json
+from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scene_models import SourceSampleRecord
 from dataset_devkit.scenes import build_recording_scenes, validate_scene_graph
 from dataset_devkit.validity import (
@@ -693,6 +702,28 @@ def test_actual_synthetic_extraction_to_validity_to_scene_graph_boundary(
         1_500_000_010,
         1_500_000_020,
     }
+    feature_config = scene_config.tags.model_copy(
+        update={
+            "reference_camera_channel": None,
+            "reference_camera_policy": "lexicographic_fallback",
+        }
+    )
+    features = compute_recording_features(result, feature_config)
+    accepted = filter_scenes(features.scenes, FiltersConfig()).accepted
+    selection_config = ScenariosConfig(
+        seed=23,
+        rules=[
+            ScenarioRuleConfig(
+                name="Integrated",
+                quota=1,
+                required_any_tags=["moving", "stationary"],
+            )
+        ],
+    )
+    first_selection = select_scenarios(accepted, selection_config)
+    second_selection = select_scenarios(accepted, selection_config)
+    assert first_selection == second_selection
+    assert first_selection.assignments[0].scene_token == result.scenes[0].token
 
 
 def test_actual_task4_invalid_audit_and_grid_miss_never_enter_scenes(

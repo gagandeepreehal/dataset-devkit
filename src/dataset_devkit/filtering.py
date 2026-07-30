@@ -61,6 +61,12 @@ def _evaluate(feature: SceneFeatures, config: FiltersConfig) -> tuple[RejectionR
             config.min_camera_coverage_ratio,
             config.max_camera_coverage_ratio,
         ),
+        (
+            "source_gnss_valid_ratio",
+            feature.source_gnss_valid_ratio,
+            config.min_source_gnss_valid_ratio,
+            config.max_source_gnss_valid_ratio,
+        ),
         ("distance", feature.total_distance_m, config.min_distance_m, config.max_distance_m),
     )
     for name, value, minimum, maximum in ranges:

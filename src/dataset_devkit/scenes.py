@@ -92,12 +92,24 @@ def _validate_input(
     if any(id(item) not in audit_ids or not item.valid for item in samples):
         raise StructuralExtractionError("final candidate is not a final valid audit sample")
     for audit in samples:
+        if (
+            not isinstance(audit.grid_target_timestamp_ns, int)
+            or isinstance(audit.grid_target_timestamp_ns, bool)
+            or not isinstance(audit.batch_timestamp_ns, int)
+            or isinstance(audit.batch_timestamp_ns, bool)
+        ):
+            raise StructuralExtractionError("logical or batch timestamp is not an integer")
         if not audit.samples:
             raise StructuralExtractionError("final candidate has no staged camera samples")
         cameras = tuple((item.camera_name, item.camera_timestamp_ns) for item in audit.samples)
         if cameras != audit.camera_timestamps or len(cameras) != len(set(cameras)):
             raise StructuralExtractionError("final candidate camera references are inconsistent")
         for camera in audit.samples:
+            if (
+                not isinstance(camera.camera_timestamp_ns, int)
+                or isinstance(camera.camera_timestamp_ns, bool)
+            ):
+                raise StructuralExtractionError("camera timestamp is not an integer")
             try:
                 validate_safe_segment(camera.camera_name)
             except ValueError as error:

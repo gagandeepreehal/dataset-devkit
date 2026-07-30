@@ -67,6 +67,7 @@ class SceneFeatures:
     max_abs_sync_error_ms: float
     mean_abs_sync_error_ms: float
     scene_valid_ratio: float = 1.0
+    time_weighted_speed_mps: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -136,12 +137,21 @@ def _tags(
     if starting:
         tags.add("starting")
     degrees = math.degrees(abs(heading_change))
+    at_straight = math.isclose(
+        degrees, config.straight_max_heading_change_deg, rel_tol=0.0, abs_tol=1e-12
+    )
+    at_curvature = math.isclose(
+        degrees, config.curvature_min_heading_change_deg, rel_tol=0.0, abs_tol=1e-12
+    )
+    at_turn = math.isclose(
+        degrees, config.turn_min_heading_change_deg, rel_tol=0.0, abs_tol=1e-12
+    )
     direction = "left" if heading_change > 0 else "right"
-    if degrees <= config.straight_max_heading_change_deg:
+    if degrees < config.straight_max_heading_change_deg or at_straight:
         tags.add("straight")
-    elif degrees >= config.turn_min_heading_change_deg:
+    elif degrees > config.turn_min_heading_change_deg or at_turn:
         tags.add(f"{direction}_turn")
-    elif degrees >= config.curvature_min_heading_change_deg:
+    elif degrees > config.curvature_min_heading_change_deg or at_curvature:
         tags.add(f"{direction}_curvature")
     if gnss_ratio == 1.0:
         tags.add("gnss_valid")
@@ -253,13 +263,9 @@ def _compute_scene(
         )
         for channel in channels
     )
-    sync_errors_ns = tuple(
-        abs(value)
-        for source_record, sample_data in zip(source_records, observations, strict=True)
-        for value in (
-            source_record.grid_signed_sync_error_ns,
-            sample_data.camera_signed_sync_error_ns,
-        )
+    sync_errors_ns = (
+        *(abs(item.grid_signed_sync_error_ns) for item in source_records),
+        *(abs(item.camera_signed_sync_error_ns) for item in scene_data),
     )
     net_heading = sum(heading_changes)
     return SceneFeatures(
@@ -290,7 +296,7 @@ def _compute_scene(
         segment_stationary,
         duration,
         distance,
-        distance / duration if duration else 0.0,
+        statistics.fmean(speeds) if speeds else 0.0,
         statistics.median(speeds) if speeds else 0.0,
         max(speeds, default=0.0),
         speeds[0] if speeds else 0.0,
@@ -313,6 +319,7 @@ def _compute_scene(
         channel_coverage,
         max(sync_errors_ns, default=0) / 1_000_000,
         statistics.fmean(sync_errors_ns) / 1_000_000 if sync_errors_ns else 0.0,
+        time_weighted_speed_mps=distance / duration if duration else 0.0,
     )
 
 
