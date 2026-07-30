@@ -24,8 +24,10 @@ signature fields such as `sig` make a SAS URL credential-bearing; SAS metadata s
 `st`, `se`, `sr`, and `sv` is not secret by itself. The same query checks apply to other URL
 values, while ordinary query parameters remain valid. Opaque bearer tokens are recognized only
 when the complete value uses the bearer scheme followed by a conservative RFC 6750 token-shaped
-payload. Ordinary URLs, paths, source identifiers, and prose are not treated as credentials
-merely because their text contains words such as `bearer` or `secret`.
+payload. Clearly filesystem-shaped values—absolute paths, explicit relative paths, or paths with
+multiple separators—are allowed before token classification. Ordinary URLs, paths, source
+identifiers, and prose are not treated as credentials merely because their text contains words
+such as `bearer` or `secret`.
 
 ## Sections
 

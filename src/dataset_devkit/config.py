@@ -17,10 +17,8 @@ _JWT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}"
     r"\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?![A-Za-z0-9_-])"
 )
-_BEARER_TOKEN_PATTERN = re.compile(
-    r"^bearer[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{32,})(?P<padding>=*)$",
-    re.IGNORECASE,
-)
+_BEARER_VALUE_PATTERN = re.compile(r"^bearer[ \t]+(?P<payload>.+)$", re.IGNORECASE)
+_BEARER_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~+/\-]{32,}=*$")
 _CREDENTIAL_KEY_NAMES = {
     "auth",
     "authentication",
@@ -88,17 +86,16 @@ def _has_credential_url_query(value: str) -> bool:
 
 
 def _looks_like_opaque_bearer_token(value: str) -> bool:
-    match = _BEARER_TOKEN_PATTERN.fullmatch(value.strip())
-    if match is None:
+    bearer_match = _BEARER_VALUE_PATTERN.fullmatch(value.strip())
+    if bearer_match is None:
         return False
-    token = match.group("token")
-    final_component = token.rsplit("/", maxsplit=1)[-1]
-    looks_like_path = re.search(r"\.[A-Za-z][A-Za-z0-9]{0,9}$", final_component) is not None
-    if looks_like_path:
+    payload = bearer_match.group("payload")
+    explicit_path_prefixes = ("/", "\\", "./", "../", ".\\", "..\\")
+    has_drive_prefix = re.match(r"^[A-Za-z]:[\\/]", payload) is not None
+    separator_count = payload.count("/") + payload.count("\\")
+    if payload.startswith(explicit_path_prefixes) or has_drive_prefix or separator_count >= 2:
         return False
-    return any(character.isalpha() for character in token) and any(
-        character.isdigit() for character in token
-    )
+    return _BEARER_TOKEN_PATTERN.fullmatch(payload) is not None
 
 
 class StrictModel(BaseModel):

@@ -286,7 +286,7 @@ def test_opaque_bearer_tokens_are_rejected(tmp_path: Path, scheme: str) -> None:
         "abcdefghijklmnopqrstuvwxyz123456~",
         "abcdefghijklmnopqrstuvwxyz123456+",
         "abcdefghijklmnopqrstuvwxyz123456/",
-        "abcdefghijklmnop/qrstuvwxyz12/345678",
+        "abcdefghijklmnop/qrstuvwxyzABCDEFGH",
         "abcdefghijklmnopqrstuvwxyz123456==",
     ],
 )
@@ -305,6 +305,40 @@ def test_bearer_prefixed_path_with_digits_is_allowed(tmp_path: Path) -> None:
     config = load_config(write_config(tmp_path, data))
 
     assert config.publication.version.endswith("annotations.jsonl")
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "abcdefghijklmnopqrstuvwxyz123456.abc",
+        "abcdefghijklmnop/qrstuvwxyzABCDEFGH",
+    ],
+)
+def test_standalone_bearer_token_shapes_are_rejected(tmp_path: Path, token: str) -> None:
+    data = minimal_config()
+    set_nested(data, "publication.version", f"Bearer {token}")
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "bearer archive/2026/recording12345678901234567890",
+        "bearer /var/archive/recording12345678901234567890",
+        "bearer ../archive/recording12345678901234567890",
+        r"bearer C:\archive\recording12345678901234567890",
+    ],
+)
+def test_clearly_path_like_bearer_values_are_allowed(tmp_path: Path, value: str) -> None:
+    data = minimal_config()
+    set_nested(data, "publication.version", value)
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.publication.version == value
 
 
 @pytest.mark.parametrize(
