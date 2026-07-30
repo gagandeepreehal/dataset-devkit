@@ -3,7 +3,9 @@
 `dataset-devkit` is a Python 3.12 package for building deterministic robotics datasets
 from MCAP recordings in Azure Blob Storage. This foundation release defines the public
 configuration, CLI, and Python API boundaries. Azure acquisition is implemented as a focused,
-injectable service; MCAP decoding and later pipeline stages remain separate.
+injectable service. Native MCAP/protobuf extraction, persistent HEVC decode, deterministic camera
+selection, GNSS interpolation, and verified JPEG staging are a separate focused service; validity
+policy, scene construction, export, and publication remain later stages.
 
 ## Install for development
 
@@ -54,6 +56,9 @@ Acquisition cache hits never create that proof.
 
 See [configuration.md](docs/configuration.md#managed-identity-smoke-check) for authentication and
 an optional one-blob smoke check.
+
+See [extraction.md](docs/extraction.md) for the exact source schema, timestamp, interpolation,
+staging, and structural-failure contract.
 
 The stable Python import is:
 

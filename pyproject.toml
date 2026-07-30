@@ -36,6 +36,7 @@ dev = [
   "mypy>=1.14,<2",
   "pytest>=8,<10",
   "ruff>=0.9,<1",
+  "types-protobuf>=6,<7",
 ]
 
 [project.scripts]
@@ -60,9 +61,14 @@ select = ["B", "E", "F", "I", "SIM", "UP"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+mypy_path = ["src", "tests"]
 files = ["src", "tests"]
 plugins = ["pydantic.mypy"]
 
 [tool.pydantic-mypy]
 init_forbid_extra = true
 warn_required_dynamic_aliases = true
+
+[[tool.mypy.overrides]]
+module = ["mcap", "mcap.*"]
+follow_imports = "skip"
