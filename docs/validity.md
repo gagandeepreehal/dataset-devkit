@@ -21,7 +21,7 @@ misses. Threshold equality is accepted; `*_exceeded` means strict `measured > th
 | --- | --- |
 | `gnss_source_invalid` | Interpolation is unavailable or either preserved endpoint/source has `is_valid == false`; availability, endpoint booleans/timestamps, and interpolation fraction are retained. |
 | `position_sigma_exceeded` | Any interpolated `east_sigma_m`, `north_sigma_m`, or `up_sigma_m` strictly exceeds `gnss.position_sigma_max_m`; all interpolated axes plus both raw endpoint uncertainty mappings, fraction, timestamps, and endpoint gaps are reported. |
-| `orientation_variance_exceeded` | The conservative maximum across every finite numeric `orientation_error` field whose name contains `variance` strictly exceeds `gnss.orientation_variance_max`; interpolated and both raw endpoint mappings, fraction, timestamps, and endpoint gaps remain in details. |
+| `orientation_variance_exceeded` | The conservative maximum across all finite numeric leaves in interpolated `orientation_error` strictly exceeds `gnss.orientation_variance_max`; stable flattened paths, the deterministic maximum path, incompatible/uninterpolated paths, both raw endpoint mappings, fraction, timestamps, and endpoint gaps remain in details. |
 | `gnss_sync_gap_exceeded` | The maximum of the preserved before/after bracket gaps strictly exceeds `gnss.sync_gap_max_ms`; each gap and the maximum are reported in nanoseconds. |
 | `camera_timestamp_non_monotonic` | For one exact camera identity across the recording, current minus previous real camera timestamp is zero or negative. Previous/current/delta are reported for selected and unselected batches. Batch/grid times are not substituted. |
 | `camera_timestamp_gap_exceeded` | That per-camera real timestamp delta strictly exceeds `frame_validity.camera_timestamp_gap_max_ms`. |
@@ -32,6 +32,13 @@ All eight names are explicit fields below `frame_validity.invalidate_on`; unknow
 errors. GNSS thresholds are finite and nonnegative, the camera gap threshold is finite and
 positive, and required camera names are nonblank, unique, traversal-safe single segments. Camera
 matching is exact and case-sensitive.
+
+Orientation numeric leaves are traversed recursively through mappings and repeated sequences.
+Canonical protobuf-JSON `int64`/`uint64` integer strings count as numeric; booleans and arbitrary
+prose/decimal strings do not. The measured mapping uses sorted dotted mapping paths and bracketed
+sequence indexes. If multiple leaves share the maximum, the lexicographically first flattened path
+is reported. Equality with the configured threshold remains accepted, and disabling the invalidator
+changes only sample validity—the observation is still emitted when the threshold is exceeded.
 
 ## Retain and drop
 

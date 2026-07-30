@@ -365,3 +365,102 @@ def test_drop_refuses_ancestor_symlink_without_deleting_owned_inodes(
         (moved_root / "recording-owned" / path.name).is_file()
         for path in original_paths
     )
+
+
+def _nested_orientation_result(tmp_path: Path) -> RecordingExtractionResult:
+    result = _result(tmp_path)
+    before = replace(
+        result.gnss_samples[0],
+        is_valid=True,
+        position_uncertainty={
+            "east_sigma_m": 0.1,
+            "north_sigma_m": 0.1,
+            "up_sigma_m": 0.1,
+        },
+        orientation_uncertainty={
+            "nested": {"z_variance": 3.0, "a_variance": 3.0},
+            "repeated": [0.4, "2"],
+            "boolean": True,
+            "decimal_prose": "99.5",
+        },
+    )
+    after = replace(before, timestamp_ns=4_000_000_000, rec_timestamp_ns=4_000_000_000)
+    interpolation = interpolate_gnss((before, after), 100)
+    pose = replace(result.samples[0].ego_pose, interpolation=interpolation)
+    sample = replace(result.samples[0], ego_pose=pose)
+    second_batch = replace(result.camera_batches[1], frames=(result.camera_batches[1].frames[0],))
+    return replace(
+        result,
+        camera_batches=(result.camera_batches[0], second_batch),
+        samples=(sample,),
+        ego_poses_by_timestamp={100: pose},
+        gnss_samples=(before, after),
+    )
+
+
+@pytest.mark.parametrize(
+    ("threshold", "enabled", "expected_observation"),
+    [(3.0, True, False), (2.9, True, True), (2.9, False, True)],
+)
+def test_orientation_policy_recurses_all_numeric_leaves_with_deterministic_max(
+    tmp_path: Path,
+    config_factory: object,
+    threshold: float,
+    enabled: bool,
+    expected_observation: bool,
+) -> None:
+    base = config_factory()  # type: ignore[operator]
+    toggles: dict[str, bool] = {code: False for code in INVALIDITY_CODES}
+    toggles["orientation_variance_exceeded"] = enabled
+    config = base.model_copy(
+        update={
+            "gnss": base.gnss.model_copy(
+                update={"orientation_variance_max": threshold}
+            ),
+            "frame_validity": base.frame_validity.model_copy(
+                update={
+                    "required_cameras": [],
+                    "invalidate_on": InvalidationRulesConfig.model_validate(toggles),
+                }
+            ),
+        }
+    )
+
+    report = evaluate_validity(
+        _nested_orientation_result(tmp_path / f"{threshold}-{enabled}"), config
+    )
+    observations = tuple(
+        item for item in report.observations
+        if item.code == "orientation_variance_exceeded"
+    )
+
+    assert bool(observations) is expected_observation
+    if not observations:
+        return
+    observation = observations[0]
+    assert observation.enabled_as_invalidator is enabled
+    assert observation.measured_values == {
+        "nested.a_variance": 3.0,
+        "nested.z_variance": 3.0,
+        "repeated[0]": pytest.approx(0.4),
+        "repeated[1]": 2.0,
+        "maximum_variance": 3.0,
+    }
+    assert observation.details["maximum_variance_path"] == "nested.a_variance"
+    assert observation.details["numeric_orientation_paths"] == (
+        "nested.a_variance",
+        "nested.z_variance",
+        "repeated[0]",
+        "repeated[1]",
+    )
+    assert observation.details["before_orientation_uncertainty"]["nested"] == {
+        "z_variance": 3.0,
+        "a_variance": 3.0,
+    }
+    assert observation.details["before_orientation_uncertainty"]["repeated"] == (
+        0.4,
+        "2",
+    )
+    assert observation.details["after_orientation_uncertainty"] == observation.details[
+        "before_orientation_uncertainty"
+    ]

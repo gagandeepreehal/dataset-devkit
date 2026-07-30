@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
+from dataset_devkit.extraction.gnss import parse_numeric_uncertainty_leaf
 from dataset_devkit.extraction.models import ExtractedCameraSample, RecordingExtractionResult
 from dataset_devkit.extraction.staging import (
     remove_owned_staged_images,
@@ -116,23 +117,23 @@ def _observation(
     )
 
 
-def _numeric_variances(value: Mapping[str, Any]) -> dict[str, float]:
+def _numeric_orientation_values(value: Mapping[str, Any]) -> dict[str, float]:
     found: dict[str, float] = {}
 
     def visit(item: object, prefix: str) -> None:
-        if not isinstance(item, Mapping):
+        number = parse_numeric_uncertainty_leaf(item)
+        if number is not None:
+            found[prefix] = number
             return
-        for key in sorted(item, key=str):
-            nested = item[key]
-            name = f"{prefix}.{key}" if prefix else str(key)
-            if isinstance(nested, Mapping):
-                visit(nested, name)
-            elif "variance" in str(key).lower() and isinstance(nested, (int, float)) \
-                    and not isinstance(nested, bool):
-                number = float(nested)
-                if not math.isfinite(number):
-                    raise StructuralExtractionError("orientation variance must be finite")
-                found[name] = number
+        if isinstance(item, Mapping):
+            for key in sorted(item, key=str):
+                name = f"{prefix}.{key}" if prefix else str(key)
+                visit(item[key], name)
+        elif isinstance(item, Sequence) and not isinstance(
+            item, (str, bytes, bytearray)
+        ):
+            for index, nested in enumerate(item):
+                visit(nested, f"{prefix}[{index}]")
 
     visit(value, "")
     return found
@@ -371,7 +372,7 @@ def _pose_observations(
                 **common,
             )
         )
-    variances = _numeric_variances(interpolation.orientation_uncertainty)
+    variances = _numeric_orientation_values(interpolation.orientation_uncertainty)
     maximum = max(variances.values(), default=None)
     if maximum is not None and maximum > config.gnss.orientation_variance_max:
         orientation_details = dict(interpolation.orientation_uncertainty)
@@ -386,6 +387,13 @@ def _pose_observations(
                 threshold=config.gnss.orientation_variance_max,
                 details={
                     **endpoint_details,
+                    "maximum_variance_path": min(
+                        path for path, value in variances.items() if value == maximum
+                    ),
+                    "numeric_orientation_paths": tuple(sorted(variances)),
+                    "uninterpolated_orientation_paths": (
+                        interpolation.orientation_uncertainty_uninterpolated_paths
+                    ),
                     "orientation_uncertainty": orientation_details,
                     "interpolated_orientation_uncertainty": (
                         interpolation.orientation_uncertainty

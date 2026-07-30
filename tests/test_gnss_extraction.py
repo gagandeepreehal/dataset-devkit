@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import cast
 
 import pytest
@@ -144,3 +145,57 @@ def test_mixed_axis_active_xyz_euler_quaternion_golden() -> None:
     assert quaternion == pytest.approx(
         (0.8785122060499201, 0.296882904556291, -0.0704393377846027, 0.36758011983238364)
     )
+
+
+def test_uncertainty_interpolation_recurses_mappings_sequences_and_int64_strings() -> None:
+    before = sample(0, lon=0, yaw=0)
+    after = sample(10, lon=0, yaw=0)
+    before = replace(
+        before,
+        orientation_uncertainty={
+            "axes": {"roll_variance": 0.2, "counter": "2"},
+            "history": [0.4, "4"],
+            "label": "123.4",
+            "enabled": True,
+        },
+    )
+    after = replace(
+        after,
+        orientation_uncertainty={
+            "axes": {"roll_variance": 0.6, "counter": "6"},
+            "history": [0.8, "8"],
+            "label": "999.9",
+            "enabled": False,
+        },
+    )
+
+    result = interpolate_gnss((before, after), 5)
+
+    assert result.orientation_uncertainty == {
+        "axes": {"counter": 4.0, "roll_variance": pytest.approx(0.4)},
+        "history": (pytest.approx(0.6), 6.0),
+    }
+    assert result.orientation_uncertainty_uninterpolated_paths == ()
+    assert result.before is before and result.after is after
+
+
+def test_incompatible_uncertainty_sequences_are_explicitly_endpoint_only() -> None:
+    before = sample(0, lon=0, yaw=0)
+    after = sample(10, lon=0, yaw=0)
+    before = replace(
+        before,
+        orientation_uncertainty={"history": [0.1, 0.2]},
+    )
+    after = replace(
+        after,
+        orientation_uncertainty={"history": [0.3]},
+    )
+
+    result = interpolate_gnss((before, after), 5)
+
+    assert result.orientation_uncertainty == {}
+    assert result.orientation_uncertainty_uninterpolated_paths == (
+        "history[0]",
+        "history[1]",
+    )
+    assert result.before is before and result.after is after

@@ -81,14 +81,21 @@ the invocation root and staged paths for later publication.
 Every staged candidate keeps three distinct times: grid target, chosen batch `rec_timestamp`, and
 its real camera timestamp. Ego poses are keyed by the real camera timestamp. GNSS values are
 bracketed without extrapolation; outside-range results are explicit and unavailable. Available
-poses linearly interpolate geodetic position/height and numeric uncertainty. GNSS roll, pitch, and
-yaw use a right-handed Cartesian frame and active body-to-world rotation. They are applied as
+poses linearly interpolate geodetic position/height and numeric uncertainty. Uncertainty
+interpolation recursively preserves compatible mappings and equal-length sequences. Finite numeric
+scalars and canonical protobuf-JSON `int64`/`uint64` integer strings are interpolated; booleans,
+decimal/prose strings, and other nonnumeric leaves are not treated as numbers. An incompatible
+mapping branch or sequence length is endpoint-only: its numeric leaves are omitted from the
+interpolated mapping, listed by deterministic flattened path, and remain available in both raw
+endpoint mappings. GNSS roll, pitch, and yaw use a right-handed Cartesian frame and active
+body-to-world rotation. They are applied as
 fixed-axis roll about +X, then pitch about +Y, then yaw about +Z, so composition is
 `qz * qy * qx`; the quaternion is stored in `(w, x, y, z)` order. Endpoint attitudes use
 shortest-path quaternion SLERP. Longitude/latitude are projected from EPSG:4326 to EPSG:3857 with
-`always_xy=True`. Raw geodetic endpoints, source validity, uncertainties, fraction, and both
-synchronization gaps remain available for audit and later policy. Result mappings are defensive,
-read-only copies; nested mapping/list/set values are recursively frozen.
+`always_xy=True`. Raw geodetic endpoints, source validity, uncertainties, interpolation fraction,
+uninterpolated numeric paths, and both synchronization gaps remain available for audit and later
+policy. Result mappings are defensive, read-only copies; nested mapping/list/set values are
+recursively frozen.
 
 ## Structural failures
 

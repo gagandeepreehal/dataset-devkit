@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import bisect
 import math
+import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import overload
+from typing import cast, overload
 
 from pyproj import Transformer
 
@@ -105,23 +106,139 @@ def _linear(first: float, second: float, fraction: float) -> float:
     return first + (second - first) * fraction
 
 
+_CANONICAL_PROTOBUF_INTEGER = re.compile(r"(?:0|-?[1-9][0-9]*)")
+_MIN_PROTOBUF_INTEGER = -(2**63)
+_MAX_PROTOBUF_INTEGER = 2**64 - 1
+_MISSING = object()
+
+
+def parse_numeric_uncertainty_leaf(value: object) -> float | None:
+    """Parse numeric scalars and canonical protobuf-JSON int64/uint64 strings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if not math.isfinite(number):
+            raise StructuralExtractionError("uncertainty numeric value must be finite")
+        return number
+    if isinstance(value, str) and _CANONICAL_PROTOBUF_INTEGER.fullmatch(value):
+        integer = int(value)
+        if _MIN_PROTOBUF_INTEGER <= integer <= _MAX_PROTOBUF_INTEGER:
+            number = float(integer)
+            if math.isfinite(number):
+                return number
+    return None
+
+
+def _numeric_paths(value: object, path: str) -> tuple[str, ...]:
+    if parse_numeric_uncertainty_leaf(value) is not None:
+        return (path,)
+    if isinstance(value, Mapping):
+        return tuple(
+            nested
+            for key in sorted(value, key=str)
+            for nested in _numeric_paths(
+                value[key], f"{path}.{key}" if path else str(key)
+            )
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(
+            nested
+            for index, item in enumerate(value)
+            for nested in _numeric_paths(item, f"{path}[{index}]")
+        )
+    return ()
+
+
+def _interpolate_uncertainty_value(
+    first: object,
+    second: object,
+    fraction: float,
+    path: str,
+    uninterpolated: set[str],
+) -> object:
+    left_number = parse_numeric_uncertainty_leaf(first)
+    right_number = parse_numeric_uncertainty_leaf(second)
+    if left_number is not None and right_number is not None:
+        return _linear(left_number, right_number, fraction)
+    if left_number is not None or right_number is not None:
+        uninterpolated.update(_numeric_paths(first, path))
+        uninterpolated.update(_numeric_paths(second, path))
+        return _MISSING
+    if isinstance(first, Mapping) and isinstance(second, Mapping):
+        result: dict[str, object] = {}
+        first_keys = {str(key): key for key in first}
+        second_keys = {str(key): key for key in second}
+        for key in sorted(first_keys.keys() | second_keys.keys()):
+            child_path = f"{path}.{key}" if path else key
+            if key not in first_keys:
+                uninterpolated.update(
+                    _numeric_paths(second[second_keys[key]], child_path)
+                )
+                continue
+            if key not in second_keys:
+                uninterpolated.update(
+                    _numeric_paths(first[first_keys[key]], child_path)
+                )
+                continue
+            interpolated = _interpolate_uncertainty_value(
+                first[first_keys[key]],
+                second[second_keys[key]],
+                fraction,
+                child_path,
+                uninterpolated,
+            )
+            if interpolated is not _MISSING:
+                result[key] = interpolated
+        return result if result else _MISSING
+    first_sequence = (
+        isinstance(first, Sequence) and not isinstance(first, (str, bytes, bytearray))
+    )
+    second_sequence = (
+        isinstance(second, Sequence) and not isinstance(second, (str, bytes, bytearray))
+    )
+    if first_sequence and second_sequence:
+        left_items: tuple[object, ...] = tuple(cast(Sequence[object], first))
+        right_items: tuple[object, ...] = tuple(cast(Sequence[object], second))
+        if len(left_items) != len(right_items):
+            uninterpolated.update(_numeric_paths(left_items, path))
+            uninterpolated.update(_numeric_paths(right_items, path))
+            return _MISSING
+        result_items: list[object] = []
+        for index, (left, right) in enumerate(
+            zip(left_items, right_items, strict=True)
+        ):
+            interpolated = _interpolate_uncertainty_value(
+                left,
+                right,
+                fraction,
+                f"{path}[{index}]",
+                uninterpolated,
+            )
+            if interpolated is _MISSING:
+                uninterpolated.update(_numeric_paths(left_items, path))
+                uninterpolated.update(_numeric_paths(right_items, path))
+                return _MISSING
+            result_items.append(interpolated)
+        return tuple(result_items)
+    uninterpolated.update(_numeric_paths(first, path))
+    uninterpolated.update(_numeric_paths(second, path))
+    return _MISSING
+
+
 def _numeric_interpolation(
     first: Mapping[str, object], second: Mapping[str, object], fraction: float
-) -> dict[str, float]:
-    result: dict[str, float] = {}
-    for key in sorted(first.keys() & second.keys()):
-        left = first[key]
-        right = second[key]
-        if (
-            isinstance(left, (int, float))
-            and not isinstance(left, bool)
-            and isinstance(right, (int, float))
-            and not isinstance(right, bool)
-        ):
-            left_float, right_float = float(left), float(right)
-            if math.isfinite(left_float) and math.isfinite(right_float):
-                result[key] = _linear(left_float, right_float, fraction)
-    return result
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    uninterpolated: set[str] = set()
+    result = _interpolate_uncertainty_value(
+        first, second, fraction, "", uninterpolated
+    )
+    mapping = (
+        {}
+        if result is _MISSING
+        else dict(cast(Mapping[str, object], result))
+    )
+    return mapping, tuple(sorted(uninterpolated))
 
 
 def _unavailable(
@@ -177,6 +294,12 @@ def interpolate_gnss(
         raise StructuralExtractionError(
             "GNSS interpolation or projection produced non-finite values"
         )
+    position_uncertainty, position_uninterpolated = _numeric_interpolation(
+        before.position_uncertainty, after.position_uncertainty, fraction
+    )
+    orientation_uncertainty, orientation_uninterpolated = _numeric_interpolation(
+        before.orientation_uncertainty, after.orientation_uncertainty, fraction
+    )
     return GnssInterpolation(
         timestamp_ns=timestamp_ns,
         available=True,
@@ -191,11 +314,9 @@ def interpolate_gnss(
         quaternion_wxyz=quaternion,
         projected_x_m=projected_x,
         projected_y_m=projected_y,
-        position_uncertainty=_numeric_interpolation(
-            before.position_uncertainty, after.position_uncertainty, fraction
-        ),
-        orientation_uncertainty=_numeric_interpolation(
-            before.orientation_uncertainty, after.orientation_uncertainty, fraction
-        ),
+        position_uncertainty=position_uncertainty,
+        orientation_uncertainty=orientation_uncertainty,
         source_validity=(before.is_valid, after.is_valid),
+        position_uncertainty_uninterpolated_paths=position_uninterpolated,
+        orientation_uncertainty_uninterpolated_paths=orientation_uninterpolated,
     )

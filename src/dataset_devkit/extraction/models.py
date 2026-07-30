@@ -130,7 +130,7 @@ class GnssSample:
     roll_rad: float
     pitch_rad: float
     yaw_rad: float
-    position_uncertainty: Mapping[str, float]
+    position_uncertainty: Mapping[str, Any]
     orientation_uncertainty: Mapping[str, Any]
     raw_identifiers: Mapping[str, Any] = field(default_factory=dict)
 
@@ -157,9 +157,11 @@ class GnssInterpolation:
     quaternion_wxyz: tuple[float, float, float, float] | None = None
     projected_x_m: float | None = None
     projected_y_m: float | None = None
-    position_uncertainty: Mapping[str, float] = field(default_factory=dict)
+    position_uncertainty: Mapping[str, Any] = field(default_factory=dict)
     orientation_uncertainty: Mapping[str, Any] = field(default_factory=dict)
     source_validity: tuple[bool, bool] | None = None
+    position_uncertainty_uninterpolated_paths: tuple[str, ...] = ()
+    orientation_uncertainty_uninterpolated_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "position_uncertainty", _freeze_value(self.position_uncertainty))
