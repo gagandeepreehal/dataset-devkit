@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import dataset_devkit.split as split_module
 from conftest import FeatureFactory
 from dataset_devkit.config import (
     GlobalConfig,
@@ -356,6 +357,32 @@ def test_rejects_any_mutated_task6_selection_evidence(
 
     with pytest.raises(ValueError):
         _split(selection, (graph,), SplitConfig(test_fraction=0.5, seed=3, stratify=True))
+
+
+def test_split_fingerprint_reuses_validated_task6_compact_fingerprints(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    feature_factory: FeatureFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _graph(tmp_path, config_factory(), "compact", 3)
+    selection = _selection((graph,), feature_factory)
+    calls = 0
+    original = split_module._jsonable
+
+    def counted_jsonable(value: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(split_module, "_jsonable", counted_jsonable)
+    result = _split(
+        selection, (graph,), SplitConfig(test_fraction=0.5, seed=3, stratify=True)
+    )
+
+    assert calls == 0
+    assert result.upstream_fingerprint
+    assert result.candidate_fingerprint
 
 
 def test_adjacent_cross_split_leakage_and_no_leakage_are_truthful(

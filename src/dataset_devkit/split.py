@@ -195,17 +195,34 @@ def _validate_inputs(
     return tuple(candidates)
 
 
-def _candidate_fingerprint(candidates: Sequence[_Candidate]) -> str:
-    records = [
+def _upstream_fingerprint(
+    selection: ScenarioSelectionResult,
+    features_population: Sequence[SceneFeatures],
+    scenarios_config: ScenariosConfig,
+) -> str:
+    """Bind validated Task 6 evidence without serializing its full records again.
+
+    ``validate_scenario_selection`` has already recomputed the candidate, rules, and
+    configuration fingerprints and all derived assignments/audits. Reusing those
+    cryptographic commitments keeps Task 7 memory bounded instead of deep-copying the
+    feature population and selection audit into another complete JSON document.
+    """
+    return canonical_hash(
         {
-            "identity": candidate.identity,
-            "primary_scenario": candidate.scenario,
-            "feature": _jsonable(candidate.feature),
-            "scenario_assignment": _jsonable(candidate.assignment),
+            "scenarios_config_fingerprint": canonical_hash(
+                scenarios_config.model_dump(mode="json")
+            ),
+            "task6_config_fingerprint": selection.config_fingerprint,
+            "task6_rules_fingerprint": selection.rules_fingerprint,
+            "task6_candidate_fingerprint": selection.candidate_fingerprint,
+            "task6_seed": selection.seed,
+            "task6_strict_quotas": selection.strict_quotas,
+            "feature_population_count": len(features_population),
+            "selected_count": len(selection.assignments),
+            "unselected_count": len(selection.unselected),
+            "rule_count": len(selection.rule_audits),
         }
-        for candidate in sorted(candidates, key=lambda item: item.identity)
-    ]
-    return canonical_hash(records)
+    )
 
 
 def _graph_fingerprint(graphs: Sequence[RecordingSceneResult]) -> str:
@@ -391,20 +408,8 @@ def _compute_split(
         target,
         "floor(n * test_fraction + 0.5)",
         canonical_hash(config.model_dump(mode="json")),
-        canonical_hash(
-            {
-                "scenarios_config": scenarios_config.model_dump(mode="json"),
-                "features_population": [
-                    _jsonable(feature)
-                    for feature in sorted(
-                        features_population,
-                        key=lambda item: (item.scene_token, item.source.digest),
-                    )
-                ],
-                "validated_selection": _jsonable(selection),
-            }
-        ),
-        _candidate_fingerprint(candidates),
+        _upstream_fingerprint(selection, features_population, scenarios_config),
+        selection.candidate_fingerprint,
         _graph_fingerprint(graphs),
     )
 
