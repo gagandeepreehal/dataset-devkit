@@ -28,16 +28,24 @@
   },
   "frame_validity": {
     "invalid_sample_policy": "retain_for_audit",
+    "required_cameras": ["front", "rear"],
+    "camera_timestamp_gap_max_ms": 1000.0,
     "invalidate_on": {
-      "missing_camera": true,
-      "invalid_gnss": true,
-      "sync_gap_exceeded": true
+      "gnss_source_invalid": true,
+      "position_sigma_exceeded": true,
+      "orientation_variance_exceeded": true,
+      "gnss_sync_gap_exceeded": true,
+      "camera_timestamp_non_monotonic": true,
+      "camera_timestamp_gap_exceeded": true,
+      "missing_required_camera": true,
+      "grid_miss": true
     }
   },
   "sanity_checks": {
-    "timestamp_policy": "quarantine",
-    "max_speed_mps": 70.0,
-    "max_position_jump_m": 20.0
+    "empty_selected_grid": "error",
+    "empty_final_candidates": "error",
+    "all_gnss_sources_invalid": "warn",
+    "zero_required_camera_coverage": "error"
   },
   "scenes": {
     "mode": "hybrid",

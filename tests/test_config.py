@@ -33,6 +33,8 @@ def minimal_config() -> dict[str, object]:
         },
         "frame_validity": {
             "invalid_sample_policy": "retain_for_audit",
+            "required_cameras": [],
+            "camera_timestamp_gap_max_ms": 1000.0,
             "invalidate_on": {},
         },
         "sanity_checks": {},
@@ -214,7 +216,7 @@ def test_enabled_quarantine_directory_must_not_overlap_destructive_paths(
         load_config(write_config(tmp_path, data))
 
 
-def test_disabled_quarantine_directory_may_overlap_output(tmp_path: Path) -> None:
+def test_quarantine_cannot_be_disabled(tmp_path: Path) -> None:
     data = minimal_config()
     data["quarantine"] = {
         "enabled": False,
@@ -222,9 +224,8 @@ def test_disabled_quarantine_directory_may_overlap_output(tmp_path: Path) -> Non
         "manifest_name": "rejected.jsonl",
     }
 
-    config = load_config(write_config(tmp_path, data))
-
-    assert config.quarantine.directory == config.paths.output_dir
+    with pytest.raises(ValidationError, match="quarantine.*enabled|enabled"):
+        load_config(write_config(tmp_path, data))
 
 
 @pytest.mark.parametrize(
@@ -549,16 +550,19 @@ def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> N
     data = minimal_config()
     data["frame_validity"] = {
         "invalid_sample_policy": "retain_for_audit",
+        "required_cameras": ["front"],
+        "camera_timestamp_gap_max_ms": 1000.0,
         "invalidate_on": {
-            "missing_camera": True,
-            "invalid_gnss": True,
-            "sync_gap_exceeded": True,
+            "missing_required_camera": True,
+            "gnss_source_invalid": True,
+            "gnss_sync_gap_exceeded": True,
         },
     }
     data["sanity_checks"] = {
-        "timestamp_policy": "quarantine",
-        "max_speed_mps": 70.0,
-        "max_position_jump_m": 20.0,
+        "empty_selected_grid": "error",
+        "empty_final_candidates": "error",
+        "all_gnss_sources_invalid": "warn",
+        "zero_required_camera_coverage": "error",
     }
     data["scenarios"] = {
         "seed": 42,

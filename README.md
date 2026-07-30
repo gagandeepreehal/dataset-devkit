@@ -4,8 +4,9 @@
 from MCAP recordings in Azure Blob Storage. This foundation release defines the public
 configuration, CLI, and Python API boundaries. Azure acquisition is implemented as a focused,
 injectable service. Native MCAP/protobuf extraction, persistent HEVC decode, deterministic camera
-selection, GNSS interpolation, and verified JPEG staging are a separate focused service; validity
-policy, scene construction, export, and publication remain later stages.
+selection, GNSS interpolation, and verified JPEG staging are a separate focused service. Typed
+validity/sanity policy, safe quarantine reports, and independent-recording partial-export gating
+are implemented. Scene construction, export, and publication remain later stages.
 
 ## Install for development
 
@@ -59,6 +60,9 @@ an optional one-blob smoke check.
 
 See [extraction.md](docs/extraction.md) for the exact source schema, timestamp, interpolation,
 staging, and structural-failure contract.
+
+See [validity.md](docs/validity.md) for invalidity codes and thresholds, audit/drop behavior,
+sanity modes, quarantine reports, and the partial-export authorization gate.
 
 The stable Python import is:
 

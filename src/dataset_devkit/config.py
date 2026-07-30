@@ -232,21 +232,36 @@ class GnssConfig(StrictModel):
     sync_gap_max_ms: float = Field(ge=0)
 
 
-class FrameValidityConfig(StrictModel):
-    invalid_sample_policy: Literal["retain_for_audit", "drop"]
-    invalidate_on: InvalidationRulesConfig
-
-
 class InvalidationRulesConfig(StrictModel):
-    missing_camera: bool = True
-    invalid_gnss: bool = True
-    sync_gap_exceeded: bool = True
+    gnss_source_invalid: bool = True
+    position_sigma_exceeded: bool = True
+    orientation_variance_exceeded: bool = True
+    gnss_sync_gap_exceeded: bool = True
+    camera_timestamp_non_monotonic: bool = True
+    camera_timestamp_gap_exceeded: bool = True
+    missing_required_camera: bool = True
+    grid_miss: bool = True
+
+
+class FrameValidityConfig(StrictModel):
+    invalid_sample_policy: Literal["retain_for_audit", "drop"] = "retain_for_audit"
+    required_cameras: list[SafeSegment] = Field(default_factory=list)
+    camera_timestamp_gap_max_ms: float = Field(gt=0)
+    invalidate_on: InvalidationRulesConfig = Field(default_factory=InvalidationRulesConfig)
+
+    @field_validator("required_cameras")
+    @classmethod
+    def validate_required_cameras(cls, values: list[SafeSegment]) -> list[SafeSegment]:
+        if len(values) != len(set(values)):
+            raise ValueError("required_cameras must be unique exact camera identities")
+        return values
 
 
 class SanityChecksConfig(StrictModel):
-    timestamp_policy: Literal["error", "quarantine", "warn"] = "quarantine"
-    max_speed_mps: float = Field(default=70.0, gt=0)
-    max_position_jump_m: float = Field(default=20.0, gt=0)
+    empty_selected_grid: Literal["error", "warn", "off"] = "error"
+    empty_final_candidates: Literal["error", "warn", "off"] = "error"
+    all_gnss_sources_invalid: Literal["error", "warn", "off"] = "warn"
+    zero_required_camera_coverage: Literal["error", "warn", "off"] = "error"
 
 
 class ScenesConfig(StrictModel):
@@ -340,7 +355,7 @@ class ExecutionConfig(StrictModel):
 
 
 class QuarantineConfig(StrictModel):
-    enabled: bool = True
+    enabled: Literal[True] = True
     directory: Path = Path("quarantine")
     manifest_name: SafeSegment = "rejected.jsonl"
 
@@ -372,8 +387,6 @@ class GlobalConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_quarantine_isolation(self) -> GlobalConfig:
-        if not self.quarantine.enabled:
-            return self
         quarantine_dir = self.quarantine.directory
         for name, destructive_path in (
             ("work_dir", self.paths.work_dir),

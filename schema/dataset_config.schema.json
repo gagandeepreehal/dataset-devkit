@@ -126,7 +126,13 @@
     "FrameValidityConfig": {
       "additionalProperties": false,
       "properties": {
+        "camera_timestamp_gap_max_ms": {
+          "exclusiveMinimum": 0,
+          "title": "Camera Timestamp Gap Max Ms",
+          "type": "number"
+        },
         "invalid_sample_policy": {
+          "default": "retain_for_audit",
           "enum": [
             "retain_for_audit",
             "drop"
@@ -136,11 +142,18 @@
         },
         "invalidate_on": {
           "$ref": "#/$defs/InvalidationRulesConfig"
+        },
+        "required_cameras": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Required Cameras",
+          "type": "array"
         }
       },
       "required": [
-        "invalid_sample_policy",
-        "invalidate_on"
+        "camera_timestamp_gap_max_ms"
       ],
       "title": "FrameValidityConfig",
       "type": "object"
@@ -191,19 +204,44 @@
     "InvalidationRulesConfig": {
       "additionalProperties": false,
       "properties": {
-        "invalid_gnss": {
+        "camera_timestamp_gap_exceeded": {
           "default": true,
-          "title": "Invalid Gnss",
+          "title": "Camera Timestamp Gap Exceeded",
           "type": "boolean"
         },
-        "missing_camera": {
+        "camera_timestamp_non_monotonic": {
           "default": true,
-          "title": "Missing Camera",
+          "title": "Camera Timestamp Non Monotonic",
           "type": "boolean"
         },
-        "sync_gap_exceeded": {
+        "gnss_source_invalid": {
           "default": true,
-          "title": "Sync Gap Exceeded",
+          "title": "Gnss Source Invalid",
+          "type": "boolean"
+        },
+        "gnss_sync_gap_exceeded": {
+          "default": true,
+          "title": "Gnss Sync Gap Exceeded",
+          "type": "boolean"
+        },
+        "grid_miss": {
+          "default": true,
+          "title": "Grid Miss",
+          "type": "boolean"
+        },
+        "missing_required_camera": {
+          "default": true,
+          "title": "Missing Required Camera",
+          "type": "boolean"
+        },
+        "orientation_variance_exceeded": {
+          "default": true,
+          "title": "Orientation Variance Exceeded",
+          "type": "boolean"
+        },
+        "position_sigma_exceeded": {
+          "default": true,
+          "title": "Position Sigma Exceeded",
           "type": "boolean"
         }
       },
@@ -267,6 +305,7 @@
           "type": "string"
         },
         "enabled": {
+          "const": true,
           "default": true,
           "title": "Enabled",
           "type": "boolean"
@@ -313,26 +352,44 @@
     "SanityChecksConfig": {
       "additionalProperties": false,
       "properties": {
-        "max_position_jump_m": {
-          "default": 20.0,
-          "exclusiveMinimum": 0,
-          "title": "Max Position Jump M",
-          "type": "number"
-        },
-        "max_speed_mps": {
-          "default": 70.0,
-          "exclusiveMinimum": 0,
-          "title": "Max Speed Mps",
-          "type": "number"
-        },
-        "timestamp_policy": {
-          "default": "quarantine",
+        "all_gnss_sources_invalid": {
+          "default": "warn",
           "enum": [
             "error",
-            "quarantine",
-            "warn"
+            "warn",
+            "off"
           ],
-          "title": "Timestamp Policy",
+          "title": "All Gnss Sources Invalid",
+          "type": "string"
+        },
+        "empty_final_candidates": {
+          "default": "error",
+          "enum": [
+            "error",
+            "warn",
+            "off"
+          ],
+          "title": "Empty Final Candidates",
+          "type": "string"
+        },
+        "empty_selected_grid": {
+          "default": "error",
+          "enum": [
+            "error",
+            "warn",
+            "off"
+          ],
+          "title": "Empty Selected Grid",
+          "type": "string"
+        },
+        "zero_required_camera_coverage": {
+          "default": "error",
+          "enum": [
+            "error",
+            "warn",
+            "off"
+          ],
+          "title": "Zero Required Camera Coverage",
           "type": "string"
         }
       },

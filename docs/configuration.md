@@ -45,9 +45,12 @@ are not treated as credentials merely because their text contains words such as 
 - `downsampling`: positive target FPS and non-negative timestamp tolerance.
 - `image`: JPEG quality from 1 through 100.
 - `gnss`: non-negative position, orientation-variance, and synchronization thresholds.
-- `frame_validity`: audit/drop policy and typed invalidation rules for missing camera data,
-  invalid GNSS, and excessive synchronization gaps.
-- `sanity_checks`: timestamp violation action plus positive speed and position-jump limits.
+- `frame_validity`: `retain_for_audit`/`drop`, exact required camera identities, a positive
+  per-camera timestamp-gap limit, and eight independent typed invalidator toggles. Unknown reason
+  names are rejected.
+- `sanity_checks`: an explicit `error`, `warn`, or `off` policy for each of
+  `empty_selected_grid`, `empty_final_candidates`, `all_gnss_sources_invalid`, and
+  `zero_required_camera_coverage`. Unknown check names and other policy words are rejected.
 - `scenes`: segmentation mode, duration bounds, sample minimum, gap limit, and scene spacing.
 - `annotations`: relative JSONL path, match tolerance, and before/after windows.
 - `tags`: stationary-speed and turn-angle thresholds.
@@ -57,8 +60,9 @@ are not treated as credentials merely because their text contains words such as 
   `(0, 1]` plus an optional positive scene cap.
 - `split`: deterministic test fraction in `(0, 1)`, seed, and stratification switch.
 - `execution`: positive worker count and partial-export policy.
-- `quarantine`: enablement, isolated output directory, and basename-only rejection-manifest
-  filename. When enabled, its directory cannot overlap work, cache, or output.
+- `quarantine`: mandatory `enabled: true`, an isolated output directory, and a basename-only
+  rejection-manifest filename. The directory cannot overlap work, cache, or output; disabling
+  quarantine is rejected because every failed recording must receive a report.
 - `publication`: safe single-segment public dataset version and overwrite refusal. Cross-platform
   safety rejects traversal, Windows reserved device stems, and names ending in a dot or space.
 

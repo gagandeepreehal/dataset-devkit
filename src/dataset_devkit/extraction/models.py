@@ -115,6 +115,8 @@ class StagedImage:
     path: Path
     width: int
     height: int
+    device: int | None = None
+    inode: int | None = None
 
 
 @dataclass(frozen=True)

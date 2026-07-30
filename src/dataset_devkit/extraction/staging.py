@@ -200,6 +200,73 @@ def rollback_staging_invocation(invocation: StagingInvocation) -> None:
         os.close(root_fd)
 
 
+def _open_verified_owned_images(
+    staging_root: Path, images: tuple[StagedImage, ...]
+) -> tuple[int, tuple[tuple[str, _Identity], ...]]:
+    directory_fd, _ = _open_directory_chain(staging_root, create=False)
+    verified: list[tuple[str, _Identity]] = []
+    try:
+        for image in images:
+            if (
+                image.path.parent != staging_root
+                or image.device is None
+                or image.inode is None
+            ):
+                raise StructuralExtractionError(
+                    "staged image is not owned by this extraction invocation"
+                )
+            try:
+                current = os.stat(
+                    image.path.name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except OSError as error:
+                raise StructuralExtractionError("staged image is unavailable") from error
+            expected = (image.device, image.inode)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or _identity(current) != expected
+            ):
+                raise StructuralExtractionError(
+                    "staged image ownership or identity changed"
+                )
+            verified.append((image.path.name, expected))
+        return directory_fd, tuple(verified)
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def verify_owned_staged_images(
+    staging_root: Path, images: tuple[StagedImage, ...]
+) -> None:
+    """Verify every image through a component-wise no-follow invocation directory."""
+    directory_fd, _ = _open_verified_owned_images(staging_root, images)
+    os.close(directory_fd)
+
+
+def remove_owned_staged_images(
+    staging_root: Path, images: tuple[StagedImage, ...]
+) -> None:
+    """Preflight, then remove only still-identical single-link invocation JPEGs."""
+    directory_fd, verified = _open_verified_owned_images(staging_root, images)
+    try:
+        for filename, expected in verified:
+            current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or _identity(current) != expected
+            ):
+                raise StructuralExtractionError(
+                    "refusing to remove changed or linked staged image"
+                )
+            os.unlink(filename, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def stage_jpeg(
     staging_root: Path,
     recording_id: str,
@@ -327,4 +394,6 @@ def stage_jpeg(
         path,
         expected_dimensions[0],
         expected_dimensions[1],
+        current_stat.st_dev,
+        current_stat.st_ino,
     )

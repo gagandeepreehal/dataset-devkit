@@ -1,9 +1,9 @@
 # Native MCAP extraction contract
 
 `dataset_devkit.extraction.RecordingExtractor` is the one-recording boundary between verified
-acquisition and later validity/scene/export policy. It reads a local MCAP, stages selected camera
-images, and returns immutable typed records. It does not decide whether timestamp gaps, GNSS
-quality, or individual samples are acceptable.
+acquisition and validity/scene/export policy. It reads a local MCAP, stages selected camera images,
+and returns immutable typed records. It does not decide whether timestamp gaps, GNSS quality, or
+individual samples are acceptable; `evaluate_validity` applies those Task 4 policies afterward.
 
 ## Required source streams
 
@@ -99,4 +99,4 @@ If decoding fails after earlier frames were staged, this extraction invocation r
 inode-bound files and directory before propagating the failure.
 
 Backward or gapped but otherwise valid camera timestamps are not a structural failure. The result
-contains per-stream timestamp deltas so the later validity stage can apply the configured policy.
+contains per-stream timestamp deltas so the validity stage can apply the configured policy.
