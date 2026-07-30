@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from dataset_devkit.blob_list import parse_blob_list
 from dataset_devkit.config import load_config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +16,7 @@ def test_shipped_example_configuration_is_valid() -> None:
 
 
 def test_shipped_blob_list_has_only_relative_mcap_blob_names() -> None:
-    lines = (ROOT / "examples" / "mcap_blobs.txt").read_text(encoding="utf-8").splitlines()
+    lines = parse_blob_list(ROOT / "examples" / "mcap_blobs.txt")
 
     assert lines
-    assert all(line and not line.startswith("/") and line.endswith(".mcap") for line in lines)
+    assert all(line.startswith("mcap-h265/") for line in lines)

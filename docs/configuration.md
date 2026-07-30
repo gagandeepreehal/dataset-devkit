@@ -17,6 +17,10 @@ path. Runtime Azure access must use `azure.identity.DefaultAzureCredential`. In 
 prefer a managed identity. For local development, authenticate with `az login`; the same
 credential chain can then use the Azure CLI session.
 
+For a VM managed identity, grant the identity the narrowest suitable data-plane role (normally
+`Storage Blob Data Reader`) on the required storage scope. No account key, SAS token, connection
+string, client secret, or other credential belongs in the configuration or blob-list file.
+
 Never place account keys, SAS tokens, connection strings, client secrets, passwords, bearer
 tokens, private keys, JWTs, or other credentials in JSON. The loader rejects explicit
 credential-bearing field names and structured secret values before configuration is accepted.
@@ -71,8 +75,42 @@ pytest tests/test_schema.py
 
 ## Blob list
 
-The blob-list file contains one container-relative `.mcap` blob name per line. It is not a URL
-list and must not contain credentials. See [`examples/mcap_blobs.txt`](../examples/mcap_blobs.txt).
+The blob-list file contains one exact container-relative blob name per line. Blank lines and
+comment-only lines (including comments preceded by whitespace) are ignored. Every accepted path
+must begin with `mcap-h265/` and end with `.mcap`. Duplicate paths, absolute or traversal paths,
+backslashes, percent-encoded/normalization-ambiguous paths, query strings, fragments, directories,
+and paths outside the prefix are rejected. Non-comment path text is used exactly as written; it
+is not stripped or normalized. See [`examples/mcap_blobs.txt`](../examples/mcap_blobs.txt).
+
+## Cache and provenance
+
+Acquisition uses a hash-derived layout below `paths.cache_dir`; blob names never become local
+path components. A cache object is reusable only when the account URL, container, exact blob
+path, ETag, and size match and the local file re-verifies. Downloads first land in a same-directory
+`.partial` file. Resume is allowed only when its sidecar proves that exact source fingerprint;
+otherwise the partial is discarded and restarted. Azure properties are checked before and after
+download, exact size is mandatory, and a supplied content MD5 must match before atomic rename.
+When Azure provides no content MD5, the manifest explicitly records `size_etag`, meaning exact
+size plus stable ETag was the available integrity check.
+
+Each recording manifest is canonical JSON and contains the source fingerprint, download status
+(`downloaded`, `resumed`, or `cache_hit`), cache-relative artifact path, local size and SHA-256,
+integrity method/result, and extraction-config hash. An extraction cache is reusable only when
+both its source fingerprint and extraction-config hash match. Missing or malformed manifests are
+cache misses.
+
+## Managed-identity smoke check
+
+After assigning the VM identity Blob Data Reader access and placing one valid path in the
+configured blob list, this optional command downloads and verifies only the first blob:
+
+```bash
+PYTHONPATH=src python -c 'from pathlib import Path; from dataset_devkit.acquisition import AzureBlobAcquirer; from dataset_devkit.blob_list import parse_blob_list; from dataset_devkit.config import load_config; c=load_config(Path("dataset_config.json")); p=parse_blob_list(c.azure.blob_list)[0]; r=AzureBlobAcquirer.from_config(c).acquire(p); print(r.manifest.status, r.artifact_path)'
+```
+
+On a developer workstation, run `az login` first and use the same command. The credential chain
+selects the managed identity on Azure or the Azure CLI login locally; the command and config are
+identical and contain no credentials.
 
 ## Regenerating the schema
 
