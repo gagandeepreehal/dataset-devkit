@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -12,10 +14,14 @@ from google.protobuf.message import DecodeError, Message
 from google.protobuf.timestamp_pb2 import Timestamp
 from mcap.reader import make_reader
 
-from dataset_devkit.extraction.camera import validate_camera_batch
+from dataset_devkit.extraction.camera import (
+    validate_annex_b_hevc_access_unit,
+    validate_camera_batch,
+)
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.gnss import index_gnss_samples
 from dataset_devkit.extraction.models import (
+    CameraAccessUnit,
     CameraCalibration,
     CameraExtrinsic,
     CameraIntrinsic,
@@ -24,6 +30,7 @@ from dataset_devkit.extraction.models import (
     RawCameraBatch,
     RawCameraFrame,
     RawRecording,
+    SourceIdentity,
     TimestampObservation,
 )
 
@@ -291,7 +298,7 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
         )
 
 
-def _parse_camera(message: Message) -> RawCameraBatch:
+def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
     dynamic: Any = message
     try:
         number_of_cameras = int(dynamic.number_of_cameras)
@@ -310,6 +317,7 @@ def _parse_camera(message: Message) -> RawCameraBatch:
                 "camera indexed-array length mismatch for " + ", ".join(mismatched)
             )
         frames: list[RawCameraFrame] = []
+        payloads: list[bytes] = []
         for index in range(number_of_cameras):
             timestamp_holder = dynamic.camera_timestamp[index]
             timestamp = Timestamp(
@@ -345,19 +353,24 @@ def _parse_camera(message: Message) -> RawCameraBatch:
                     index,
                     str(dynamic.name[index]),
                     camera_timestamp_ns,
-                    bytes(dynamic.data[index]),
                     calibration,
                 )
             )
-        return RawCameraBatch(
-            rec_timestamp_ns=_timestamp_ns(message, "rec_timestamp", "camera message"),
-            recorded_timestamp_ns=_timestamp_ns(message, "timestamp", "camera message"),
-            frame_id=int(dynamic.frame_id),
-            rec_frame_id=int(dynamic.rec_frame_id),
-            format=str(dynamic.format),
-            width=int(dynamic.width),
-            height=int(dynamic.height),
-            frames=tuple(frames),
+            payload = bytes(dynamic.data[index])
+            validate_annex_b_hevc_access_unit(payload)
+            payloads.append(payload)
+        return (
+            RawCameraBatch(
+                rec_timestamp_ns=_timestamp_ns(message, "rec_timestamp", "camera message"),
+                recorded_timestamp_ns=_timestamp_ns(message, "timestamp", "camera message"),
+                frame_id=int(dynamic.frame_id),
+                rec_frame_id=int(dynamic.rec_frame_id),
+                format=str(dynamic.format),
+                width=int(dynamic.width),
+                height=int(dynamic.height),
+                frames=tuple(frames),
+            ),
+            tuple(payloads),
         )
     except StructuralExtractionError:
         raise
@@ -531,16 +544,41 @@ def _timestamp_observations(batches: list[RawCameraBatch]) -> tuple[TimestampObs
     return tuple(observations)
 
 
+def _source_identity(file_stat: os.stat_result) -> SourceIdentity:
+    return SourceIdentity(
+        device=file_stat.st_dev,
+        inode=file_stat.st_ino,
+        size=file_stat.st_size,
+        modified_ns=file_stat.st_mtime_ns,
+        changed_ns=file_stat.st_ctime_ns,
+    )
+
+
+def _assert_source_identity(path: Path, expected: SourceIdentity) -> None:
+    try:
+        actual = _source_identity(path.stat(follow_symlinks=False))
+    except OSError as error:
+        raise StructuralExtractionError(
+            "recording changed between extraction passes: source is unavailable"
+        ) from error
+    if actual != expected:
+        raise StructuralExtractionError(
+            "recording changed between extraction passes; reacquire and retry"
+        )
+
+
 def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecording:
-    """Decode configured topics in deterministic MCAP log-time order."""
+    """Index configured topics without retaining compressed camera payload bytes."""
     camera_batches: list[RawCameraBatch] = []
     gnss_samples: list[GnssSample] = []
     camera_seen = False
     gnss_seen = False
     camera_state: CameraStructure | None = None
     schema_cache: dict[int, tuple[str, type[Message]]] = {}
+    source_identity: SourceIdentity | None = None
     try:
         with path.open("rb") as stream:
+            source_identity = _source_identity(os.fstat(stream.fileno()))
             reader = make_reader(stream)
             for schema, channel, record in reader.iter_messages(
                 topics=[camera_topic, gnss_topic], log_time_order=True
@@ -571,7 +609,7 @@ def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecordi
                 if channel.topic == camera_topic:
                     camera_seen = True
                     _validate_camera_schema(cast(Descriptor, message_type.DESCRIPTOR))
-                    batch = _parse_camera(
+                    batch, _ = _parse_camera(
                         _parse_message(message_type, record.data, "camera")
                     )
                     camera_state = validate_camera_batch(batch, camera_state)
@@ -582,6 +620,8 @@ def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecordi
                     gnss_samples.append(
                         _parse_gnss(_parse_message(message_type, record.data, "GNSS"))
                     )
+            if _source_identity(os.fstat(stream.fileno())) != source_identity:
+                raise StructuralExtractionError("recording changed while building extraction index")
     except StructuralExtractionError:
         raise
     except Exception as error:
@@ -590,7 +630,83 @@ def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecordi
         raise StructuralExtractionError(f"missing required camera topic {camera_topic!r}")
     if not gnss_seen:
         raise StructuralExtractionError(f"missing required GNSS topic {gnss_topic!r}")
+    assert source_identity is not None
+    _assert_source_identity(path, source_identity)
     indexed_gnss = index_gnss_samples(gnss_samples)
     return RawRecording(
-        tuple(camera_batches), indexed_gnss, _timestamp_observations(camera_batches)
+        source_identity,
+        tuple(camera_batches),
+        indexed_gnss,
+        _timestamp_observations(camera_batches),
     )
+
+
+def iter_camera_access_units(
+    path: Path,
+    camera_topic: str,
+    recording: RawRecording,
+) -> Iterator[CameraAccessUnit]:
+    """Reopen and stream structurally verified camera AUs for the decode pass."""
+    _assert_source_identity(path, recording.source_identity)
+    camera_state: CameraStructure | None = None
+    schema_cache: dict[int, type[Message]] = {}
+    batch_ordinal = 0
+    try:
+        with path.open("rb") as stream:
+            if _source_identity(os.fstat(stream.fileno())) != recording.source_identity:
+                raise StructuralExtractionError(
+                    "recording changed between extraction passes; reacquire and retry"
+                )
+            reader = make_reader(stream)
+            for schema, channel, record in reader.iter_messages(
+                topics=[camera_topic], log_time_order=True
+            ):
+                if schema is None:
+                    raise StructuralExtractionError(
+                        f"topic {channel.topic!r} message has no protobuf schema"
+                    )
+                if schema.encoding != "protobuf" or channel.message_encoding != "protobuf":
+                    raise StructuralExtractionError(
+                        f"topic {channel.topic!r} must use protobuf encoding"
+                    )
+                if schema.name != CAMERA_SCHEMA_NAME:
+                    raise StructuralExtractionError(
+                        f"camera topic requires exact schema {CAMERA_SCHEMA_NAME!r}"
+                    )
+                message_type = schema_cache.get(schema.id)
+                if message_type is None:
+                    message_type = build_message_classes(schema.data).get(schema.name)
+                    if message_type is None:
+                        raise StructuralExtractionError(
+                            f"embedded descriptor does not define MCAP schema {schema.name!r}"
+                        )
+                    _validate_camera_schema(cast(Descriptor, message_type.DESCRIPTOR))
+                    schema_cache[schema.id] = message_type
+                batch, payloads = _parse_camera(
+                    _parse_message(message_type, record.data, "camera")
+                )
+                camera_state = validate_camera_batch(batch, camera_state)
+                if batch_ordinal >= len(recording.camera_batches):
+                    raise StructuralExtractionError(
+                        "camera stream changed between extraction passes: extra batch"
+                    )
+                if batch != recording.camera_batches[batch_ordinal]:
+                    raise StructuralExtractionError(
+                        "camera metadata changed between extraction passes"
+                    )
+                for frame, payload in zip(batch.frames, payloads, strict=True):
+                    yield CameraAccessUnit(batch_ordinal, batch, frame, payload)
+                batch_ordinal += 1
+            if batch_ordinal != len(recording.camera_batches):
+                raise StructuralExtractionError(
+                    "camera stream changed between extraction passes: missing batch"
+                )
+            if _source_identity(os.fstat(stream.fileno())) != recording.source_identity:
+                raise StructuralExtractionError("recording changed during camera decode pass")
+    except StructuralExtractionError:
+        raise
+    except Exception as error:
+        raise StructuralExtractionError(
+            f"failed to stream MCAP recording {path}: {error}"
+        ) from error
+    _assert_source_identity(path, recording.source_identity)

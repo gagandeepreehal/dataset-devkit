@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 
+from dataset_devkit.extraction import gnss as gnss_module
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.gnss import (
     Quaternion,
@@ -38,6 +39,7 @@ def test_gnss_index_sorts_and_rejects_duplicate_recorded_timestamps() -> None:
         [sample(10, lon=1, yaw=0), sample(0, lon=0, yaw=0)]
     )
     assert [item.timestamp_ns for item in indexed] == [0, 10]
+    assert getattr(indexed, "timestamps", None) == (0, 10)
     with pytest.raises(StructuralExtractionError, match="duplicate GNSS timestamp"):
         index_gnss_samples([sample(0, lon=0, yaw=0), sample(0, lon=1, yaw=0)])
 
@@ -87,3 +89,58 @@ def test_web_mercator_known_point_and_quaternion_shortest_path() -> None:
     assert abs(midpoint[3]) == pytest.approx(1.0)
     antipodal = cast(Quaternion, tuple(-value for value in first))
     assert quaternion_slerp_shortest(first, antipodal, 0.5) == pytest.approx(first)
+
+
+def test_gnss_index_is_built_once_and_reused_for_many_interpolations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = index_gnss_samples(
+        sample(timestamp, lon=float(timestamp) / 1_000, yaw=0)
+        for timestamp in range(10_000, -1, -1)
+    )
+    rebuilds = 0
+    real_index = gnss_module.index_gnss_samples
+
+    def counted_index(samples: object) -> object:
+        nonlocal rebuilds
+        rebuilds += 1
+        return real_index(samples)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(gnss_module, "index_gnss_samples", counted_index)
+    for timestamp in range(50, 9_950, 50):
+        assert interpolate_gnss(index, timestamp).available
+    assert rebuilds == 0
+
+
+def test_result_uncertainty_mappings_are_defensively_immutable() -> None:
+    mutable_position = {"east_sigma_m": 1.0}
+    mutable_orientation: dict[str, object] = {"nested": {"yaw": 0.1}}
+    item = GnssSample(
+        timestamp_ns=0,
+        rec_timestamp_ns=1,
+        is_valid=True,
+        latitude_deg=0,
+        longitude_deg=0,
+        height_m=0,
+        roll_rad=0,
+        pitch_rad=0,
+        yaw_rad=0,
+        position_uncertainty=mutable_position,
+        orientation_uncertainty=mutable_orientation,
+    )
+    mutable_position["east_sigma_m"] = 99
+    cast(dict[str, object], mutable_orientation["nested"])["yaw"] = 99
+
+    assert item.position_uncertainty["east_sigma_m"] == 1
+    assert cast(object, item.orientation_uncertainty["nested"])["yaw"] == 0.1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        item.position_uncertainty["east_sigma_m"] = 2  # type: ignore[index]
+
+
+def test_mixed_axis_active_xyz_euler_quaternion_golden() -> None:
+    quaternion = euler_to_quaternion_wxyz(
+        math.radians(30), math.radians(-20), math.radians(40)
+    )
+    assert quaternion == pytest.approx(
+        (0.8785122060499201, 0.296882904556291, -0.0704393377846027, 0.36758011983238364)
+    )

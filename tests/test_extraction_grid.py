@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from fractions import Fraction
+from typing import Any, cast
 
 import pytest
 
+from dataset_devkit.extraction import grid as grid_module
 from dataset_devkit.extraction.grid import select_camera_grid
 
 
@@ -71,3 +73,35 @@ def test_fractional_fps_has_no_cumulative_float_drift() -> None:
         66_733_333,
         100_100_000,
     ]
+
+
+def test_grid_rejects_sub_nanosecond_period_and_excessive_target_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="at least 1 ns|1e9"):
+        select_camera_grid([0, 1], Fraction(1_000_000_001, 1), 0)
+
+    monkeypatch.setattr(grid_module, "MAX_GRID_TARGETS", 5, raising=False)
+    with pytest.raises(ValueError, match="target count.*5|safety limit.*5"):
+        select_camera_grid([0, 10], Fraction(1_000_000_000, 1), 0)
+
+
+def test_grid_sorts_candidates_once_and_scales_to_large_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_sorted = sorted
+    sort_calls = 0
+
+    def counted_sorted(*args: Any, **kwargs: Any) -> list[int]:
+        nonlocal sort_calls
+        sort_calls += 1
+        return cast(list[int], real_sorted(*args, **kwargs))
+
+    monkeypatch.setattr(grid_module, "sorted", counted_sorted, raising=False)
+    timestamps = list(range(0, 100_000, 2))
+    result = select_camera_grid(timestamps, Fraction(500_000_000, 1), 0)
+
+    assert len(result.entries) == len(timestamps)
+    assert sort_calls == 1
+    targets = [entry.target_timestamp_ns for entry in result.entries]
+    assert all(left < right for left, right in zip(targets, targets[1:], strict=False))

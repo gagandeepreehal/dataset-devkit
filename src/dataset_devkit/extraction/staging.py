@@ -9,6 +9,7 @@ import re
 import stat
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 
@@ -23,6 +24,20 @@ _DIRECTORY_FLAGS = (
 )
 _FILE_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _Identity = tuple[int, int]
+
+
+@dataclass
+class StagingInvocation:
+    staging_root: Path
+    directory_name: str
+    path: Path
+    directory_identity: _Identity
+    owned_files: dict[str, _Identity] = field(default_factory=dict)
+
+
+def _recording_slug(recording_id: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", recording_id).strip("._-")
+    return slug or "recording"
 
 
 def _camera_slug(name: str) -> str:
@@ -103,17 +118,86 @@ def _unlink_relative(directory_fd: int, filename: str) -> None:
         os.fsync(directory_fd)
 
 
-def remove_staged_jpeg(staging_root: Path, recording_id: str, filename: str) -> None:
-    """Remove one known staged leaf through a no-follow recording directory descriptor."""
-    if _SAFE_RECORDING.fullmatch(recording_id) is None:
-        raise StructuralExtractionError("unsafe recording identifier for staging cleanup")
-    if Path(filename).name != filename or not filename.endswith(".jpg"):
-        raise StructuralExtractionError("unsafe staged JPEG filename for cleanup")
-    directory_fd, _ = _open_directory_chain(staging_root / recording_id, create=False)
+def _unlink_if_identity(
+    directory_fd: int, filename: str, expected_identity: _Identity | None
+) -> None:
+    if expected_identity is None:
+        return
     try:
+        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISREG(current.st_mode) and _identity(current) == expected_identity:
         _unlink_relative(directory_fd, filename)
+
+
+def create_staging_invocation(staging_root: Path, recording_id: str) -> StagingInvocation:
+    """Exclusively create one collision-isolated staging directory."""
+    prefix = _recording_slug(recording_id)
+    root_fd, _ = _open_directory_chain(staging_root, create=True)
+    try:
+        while True:
+            directory_name = f"{prefix}-{uuid.uuid4().hex}"
+            try:
+                os.mkdir(directory_name, mode=0o700, dir_fd=root_fd)
+                break
+            except FileExistsError:
+                continue
+        directory_stat = os.stat(directory_name, dir_fd=root_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise StructuralExtractionError("new staging invocation is not a directory")
+        os.fsync(root_fd)
     finally:
-        os.close(directory_fd)
+        os.close(root_fd)
+    path = staging_root / directory_name
+    return StagingInvocation(staging_root, directory_name, path, _identity(directory_stat))
+
+
+def rollback_staging_invocation(invocation: StagingInvocation) -> None:
+    """Remove only invocation-owned inodes, then its still-identical empty directory."""
+    root_fd, _ = _open_directory_chain(invocation.staging_root, create=False)
+    try:
+        try:
+            directory_stat = os.stat(
+                invocation.directory_name, dir_fd=root_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or _identity(directory_stat) != invocation.directory_identity
+        ):
+            raise StructuralExtractionError("staging invocation directory identity changed")
+        directory_fd = os.open(invocation.directory_name, _DIRECTORY_FLAGS, dir_fd=root_fd)
+        try:
+            for filename, expected_identity in tuple(invocation.owned_files.items()):
+                try:
+                    current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and current.st_nlink == 1
+                    and _identity(current) == expected_identity
+                ):
+                    _unlink_relative(directory_fd, filename)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        current_dir = os.stat(
+            invocation.directory_name, dir_fd=root_fd, follow_symlinks=False
+        )
+        if _identity(current_dir) != invocation.directory_identity:
+            raise StructuralExtractionError("staging invocation directory identity changed")
+        try:
+            os.rmdir(invocation.directory_name, dir_fd=root_fd)
+        except OSError as error:
+            raise StructuralExtractionError(
+                "staging invocation rollback left unowned or unsafe entries"
+            ) from error
+        os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
 
 
 def stage_jpeg(
@@ -124,12 +208,23 @@ def stage_jpeg(
     timestamp_ns: int,
     image: Image.Image,
     expected_dimensions: tuple[int, int],
+    *,
+    batch_ordinal: int | None = None,
+    invocation: StagingInvocation | None = None,
 ) -> StagedImage:
     """Atomically persist and bind verification to one quality-95 JPEG byte sequence."""
     if _SAFE_RECORDING.fullmatch(recording_id) is None:
         raise StructuralExtractionError("unsafe recording identifier for staging")
+    if invocation is not None and (
+        invocation.staging_root != staging_root
+        or invocation.directory_name != recording_id
+    ):
+        raise StructuralExtractionError("staging invocation does not match target directory")
     recording_dir = staging_root / recording_id
-    filename = f"{camera_index:03d}-{_camera_slug(camera_name)}-{timestamp_ns}.jpg"
+    ordinal_prefix = "" if batch_ordinal is None else f"{batch_ordinal:09d}-"
+    filename = (
+        f"{ordinal_prefix}{camera_index:03d}-{_camera_slug(camera_name)}-{timestamp_ns}.jpg"
+    )
     temporary_name = f".{filename}.{uuid.uuid4().hex}.tmp"
     encoded_stream = BytesIO()
     try:
@@ -140,6 +235,7 @@ def stage_jpeg(
     expected_digest = hashlib.sha256(encoded).digest()
     directory_fd, directory_identities = _open_directory_chain(recording_dir, create=True)
     published = False
+    temporary_identity: _Identity | None = None
     try:
         try:
             existing = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
@@ -149,6 +245,8 @@ def stage_jpeg(
             not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1
         ):
             raise StructuralExtractionError("unsafe existing staging target")
+        if existing is not None:
+            raise StructuralExtractionError("staging target already exists; refusing to clobber")
 
         temporary_fd = os.open(
             temporary_name,
@@ -160,19 +258,22 @@ def stage_jpeg(
             temporary_stat = os.fstat(temporary_fd)
             if not stat.S_ISREG(temporary_stat.st_mode) or temporary_stat.st_nlink != 1:
                 raise StructuralExtractionError("unsafe temporary staging file")
+            temporary_identity = _identity(temporary_stat)
             _write_all(temporary_fd, encoded)
             os.fsync(temporary_fd)
         finally:
             os.close(temporary_fd)
 
         _assert_directory_chain_unchanged(recording_dir, directory_identities)
-        os.replace(
+        os.link(
             temporary_name,
             filename,
             src_dir_fd=directory_fd,
             dst_dir_fd=directory_fd,
+            follow_symlinks=False,
         )
         published = True
+        os.unlink(temporary_name, dir_fd=directory_fd)
         os.fsync(directory_fd)
         _assert_directory_chain_unchanged(recording_dir, directory_identities)
 
@@ -192,6 +293,11 @@ def stage_jpeg(
             raise StructuralExtractionError("staged JPEG content changed during verification")
         _assert_directory_chain_unchanged(recording_dir, directory_identities)
 
+        if invocation is not None:
+            if _identity(os.fstat(directory_fd)) != invocation.directory_identity:
+                raise StructuralExtractionError("staging invocation directory identity changed")
+            invocation.owned_files[filename] = _identity(current_stat)
+
         with Image.open(BytesIO(actual)) as reopened:
             reopened.load()
             if reopened.format != "JPEG" or reopened.mode != "RGB":
@@ -203,14 +309,14 @@ def stage_jpeg(
         _assert_directory_chain_unchanged(recording_dir, directory_identities)
     except StructuralExtractionError:
         if published:
-            _unlink_relative(directory_fd, filename)
+            _unlink_if_identity(directory_fd, filename, temporary_identity)
         raise
     except Exception as error:
         if published:
-            _unlink_relative(directory_fd, filename)
+            _unlink_if_identity(directory_fd, filename, temporary_identity)
         raise StructuralExtractionError("staged JPEG verification failed") from error
     finally:
-        _unlink_relative(directory_fd, temporary_name)
+        _unlink_if_identity(directory_fd, temporary_name, temporary_identity)
         os.close(directory_fd)
 
     path = recording_dir / filename

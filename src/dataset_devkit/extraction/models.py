@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from dataset_devkit.extraction.grid import GridSelection
+
+
+def _freeze_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(item) for item in value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -39,7 +51,6 @@ class RawCameraFrame:
     camera_index: int
     camera_name: str
     camera_timestamp_ns: int
-    payload: bytes
     calibration: CameraCalibration
 
 
@@ -72,10 +83,28 @@ class TimestampObservation:
 
 
 @dataclass(frozen=True)
+class SourceIdentity:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True)
 class RawRecording:
+    source_identity: SourceIdentity
     camera_batches: tuple[RawCameraBatch, ...]
-    gnss_samples: tuple[GnssSample, ...]
+    gnss_samples: Sequence[GnssSample]
     timestamp_observations: tuple[TimestampObservation, ...]
+
+
+@dataclass(frozen=True)
+class CameraAccessUnit:
+    batch_ordinal: int
+    batch: RawCameraBatch
+    frame: RawCameraFrame
+    payload: bytes
 
 
 @dataclass(frozen=True)
@@ -99,9 +128,16 @@ class GnssSample:
     roll_rad: float
     pitch_rad: float
     yaw_rad: float
-    position_uncertainty: dict[str, float]
-    orientation_uncertainty: dict[str, Any]
-    raw_identifiers: dict[str, Any] = field(default_factory=dict)
+    position_uncertainty: Mapping[str, float]
+    orientation_uncertainty: Mapping[str, Any]
+    raw_identifiers: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "position_uncertainty", _freeze_value(self.position_uncertainty))
+        object.__setattr__(
+            self, "orientation_uncertainty", _freeze_value(self.orientation_uncertainty)
+        )
+        object.__setattr__(self, "raw_identifiers", _freeze_value(self.raw_identifiers))
 
 
 @dataclass(frozen=True)
@@ -119,9 +155,15 @@ class GnssInterpolation:
     quaternion_wxyz: tuple[float, float, float, float] | None = None
     projected_x_m: float | None = None
     projected_y_m: float | None = None
-    position_uncertainty: dict[str, float] = field(default_factory=dict)
-    orientation_uncertainty: dict[str, Any] = field(default_factory=dict)
+    position_uncertainty: Mapping[str, float] = field(default_factory=dict)
+    orientation_uncertainty: Mapping[str, Any] = field(default_factory=dict)
     source_validity: tuple[bool, bool] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "position_uncertainty", _freeze_value(self.position_uncertainty))
+        object.__setattr__(
+            self, "orientation_uncertainty", _freeze_value(self.orientation_uncertainty)
+        )
 
 
 @dataclass(frozen=True)
@@ -147,9 +189,17 @@ class ExtractedCameraSample:
 @dataclass(frozen=True)
 class RecordingExtractionResult:
     source_path: Path
+    staging_root: Path
     camera_batches: tuple[RawCameraBatch, ...]
     gnss_samples: tuple[GnssSample, ...]
     selected_grid: GridSelection
     samples: tuple[ExtractedCameraSample, ...]
-    ego_poses_by_timestamp: dict[int, EgoPose]
+    ego_poses_by_timestamp: Mapping[int, EgoPose]
     timestamp_observations: tuple[TimestampObservation, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "ego_poses_by_timestamp",
+            MappingProxyType(dict(self.ego_poses_by_timestamp)),
+        )

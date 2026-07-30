@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 from google.protobuf import descriptor_pb2
 
+from dataset_devkit.extraction import mcap_source
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.mcap_source import build_message_classes, read_recording
 from mcap_fixture import (
+    HEVC_AU,
     camera_message,
     descriptor_set_bytes,
     gnss_message,
@@ -100,6 +103,12 @@ def test_dynamic_descriptor_loader_resolves_reverse_dependencies() -> None:
 
 
 def test_exact_real_nested_camera_descriptor_shape_is_accepted(tmp_path: Path) -> None:
+    golden_proto = (Path(__file__).parent / "fixtures" / "CompressedVideos.proto").read_text()
+    assert "message CompressedVideos" in golden_proto
+    assert "message CameraIntrinsic" in golden_proto
+    assert "repeated double distortion_coeffs = 7;" in golden_proto
+    assert "repeated float rotation_vector = 1;" in golden_proto
+
     descriptor_data = descriptor_set_bytes()
     camera_type = build_message_classes(descriptor_data)["autonome.CompressedVideos"]
     descriptor = camera_type.DESCRIPTOR
@@ -139,6 +148,59 @@ def test_real_mcap_reader_decodes_exact_topics_and_per_camera_timestamps(tmp_pat
         2_100_000_000,
     ]
     assert recording.gnss_samples[0].raw_identifiers["receiver_id"] == "rx-1"
+
+
+def _contains_bytes(value: object, seen: set[int] | None = None) -> bool:
+    if isinstance(value, bytes):
+        return True
+    visited = seen if seen is not None else set()
+    if id(value) in visited:
+        return False
+    visited.add(id(value))
+    if is_dataclass(value) and not isinstance(value, type):
+        return any(_contains_bytes(getattr(value, field.name), visited) for field in fields(value))
+    if isinstance(value, dict):
+        return any(
+            _contains_bytes(key, visited) or _contains_bytes(item, visited)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_bytes(item, visited) for item in value)
+    return False
+
+
+def test_index_pass_does_not_retain_many_large_camera_payload_objects(tmp_path: Path) -> None:
+    path = tmp_path / "large-recording.mcap"
+    large_au = HEVC_AU + b"x" * (256 * 1024)
+    batches = tuple(
+        camera_message(
+            1_000_000_000 + index * 1_000_000,
+            (
+                1_000_000_010 + index * 1_000_000,
+                1_000_000_020 + index * 1_000_000,
+            ),
+            payloads=(large_au, large_au),
+        )
+        for index in range(24)
+    )
+    write_mcap(path, camera_payloads=batches)
+
+    recording = read_recording(path, "rec_cameras", "gnss")
+
+    assert not _contains_bytes(recording)
+    assert len(recording.camera_batches) == 24
+
+
+def test_streaming_pass_rejects_recording_changed_after_index(tmp_path: Path) -> None:
+    path = tmp_path / "changed-between-passes.mcap"
+    write_mcap(path)
+    recording = read_recording(path, "rec_cameras", "gnss")
+    path.write_bytes(path.read_bytes() + b"changed")
+
+    stream = getattr(mcap_source, "iter_camera_access_units", None)
+    assert callable(stream), "two-pass camera streaming API is required"
+    with pytest.raises(StructuralExtractionError, match="changed between extraction passes"):
+        list(stream(path, "rec_cameras", recording))
 
 
 def test_backward_camera_timestamp_is_observed_without_structural_rejection(

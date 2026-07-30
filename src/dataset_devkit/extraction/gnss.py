@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import bisect
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from typing import overload
 
 from pyproj import Transformer
 
@@ -13,6 +15,29 @@ from dataset_devkit.extraction.models import GnssInterpolation, GnssSample
 
 Quaternion = tuple[float, float, float, float]
 _WEB_MERCATOR = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+
+
+@dataclass(frozen=True)
+class GnssIndex(Sequence[GnssSample]):
+    """One validated timestamp-sorted GNSS index reusable across all camera queries."""
+
+    samples: tuple[GnssSample, ...]
+    timestamps: tuple[int, ...]
+
+    def __iter__(self) -> Iterator[GnssSample]:
+        return iter(self.samples)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    @overload
+    def __getitem__(self, index: int) -> GnssSample: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[GnssSample, ...]: ...
+
+    def __getitem__(self, index: int | slice) -> GnssSample | tuple[GnssSample, ...]:
+        return self.samples[index]
 
 
 def _normalize_quaternion(quaternion: Quaternion) -> Quaternion:
@@ -24,7 +49,7 @@ def _normalize_quaternion(quaternion: Quaternion) -> Quaternion:
 
 
 def euler_to_quaternion_wxyz(roll: float, pitch: float, yaw: float) -> Quaternion:
-    """Convert intrinsic roll/pitch/yaw radians to normalized quaternion order (w,x,y,z)."""
+    """Return active right-handed fixed-axis XYZ qz*qy*qx, in (w,x,y,z) order."""
     if not all(math.isfinite(value) for value in (roll, pitch, yaw)):
         raise StructuralExtractionError("GNSS orientation values must be finite")
     cr, sr = math.cos(roll / 2), math.sin(roll / 2)
@@ -67,13 +92,13 @@ def quaternion_slerp_shortest(first: Quaternion, second: Quaternion, fraction: f
     )
 
 
-def index_gnss_samples(samples: Iterable[GnssSample]) -> tuple[GnssSample, ...]:
+def index_gnss_samples(samples: Iterable[GnssSample]) -> GnssIndex:
     """Deterministically order by protobuf timestamp and reject duplicate ambiguity."""
     ordered = tuple(sorted(samples, key=lambda sample: sample.timestamp_ns))
     for previous, current in zip(ordered, ordered[1:], strict=False):
         if previous.timestamp_ns == current.timestamp_ns:
             raise StructuralExtractionError("duplicate GNSS timestamp is structurally ambiguous")
-    return ordered
+    return GnssIndex(ordered, tuple(sample.timestamp_ns for sample in ordered))
 
 
 def _linear(first: float, second: float, fraction: float) -> float:
@@ -114,14 +139,13 @@ def _unavailable(
 
 
 def interpolate_gnss(
-    samples: tuple[GnssSample, ...] | list[GnssSample], timestamp_ns: int
+    samples: GnssIndex | Iterable[GnssSample], timestamp_ns: int
 ) -> GnssInterpolation:
     """Bracket without extrapolation and interpolate geodetic, attitude, and numeric uncertainty."""
-    indexed = index_gnss_samples(samples)
+    indexed = samples if isinstance(samples, GnssIndex) else index_gnss_samples(samples)
     if not indexed:
         return _unavailable(timestamp_ns, None, None)
-    timestamps = [sample.timestamp_ns for sample in indexed]
-    position = bisect.bisect_left(timestamps, timestamp_ns)
+    position = bisect.bisect_left(indexed.timestamps, timestamp_ns)
     if position == len(indexed):
         return _unavailable(timestamp_ns, indexed[-1], None)
     if indexed[position].timestamp_ns == timestamp_ns:
