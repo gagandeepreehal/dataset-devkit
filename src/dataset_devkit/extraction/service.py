@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -29,6 +28,10 @@ from dataset_devkit.extraction.staging import (
     create_staging_invocation,
     rollback_staging_invocation,
     stage_jpeg,
+)
+from dataset_devkit.publication import (
+    OwnedDirectoryAuthority,
+    OwnedDirectoryCleanupError,
 )
 
 
@@ -92,6 +95,7 @@ class RecordingExtractor:
         samples: list[tuple[int, ExtractedCameraSample]] = []
         recording_id = _recording_id(path)
         invocation = create_staging_invocation(self.staging_root, recording_id)
+        working_authority = OwnedDirectoryAuthority.capture(invocation.path)
 
         def pose_for(timestamp_ns: int) -> EgoPose:
             existing = poses.get(timestamp_ns)
@@ -179,18 +183,28 @@ class RecordingExtractor:
                     del payload
                     consume(outputs)
                 consume(decoders.finish())
-        except Exception:
-            with suppress(StructuralExtractionError):
+            ordered_samples = tuple(
+                sample for _, sample in sorted(samples, key=lambda item: item[0])
+            )
+            return RecordingExtractionResult(
+                path.resolve(),
+                invocation.path,
+                recording.camera_batches,
+                tuple(recording.gnss_samples),
+                selection,
+                ordered_samples,
+                poses,
+                recording.timestamp_observations,
+            )
+        except Exception as extraction_error:
+            try:
                 rollback_staging_invocation(invocation)
+            except Exception as rollback_error:
+                cleanup_error = OwnedDirectoryCleanupError(
+                    (working_authority.cleanup_failure(),)
+                )
+                cleanup_error.add_note(
+                    f"rollback failed with {type(rollback_error).__name__}"
+                )
+                raise cleanup_error from extraction_error
             raise
-        ordered_samples = tuple(sample for _, sample in sorted(samples, key=lambda item: item[0]))
-        return RecordingExtractionResult(
-            path.resolve(),
-            invocation.path,
-            recording.camera_batches,
-            tuple(recording.gnss_samples),
-            selection,
-            ordered_samples,
-            poses,
-            recording.timestamp_observations,
-        )

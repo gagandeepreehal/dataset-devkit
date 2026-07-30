@@ -30,6 +30,7 @@ from dataset_devkit.config import (
 from dataset_devkit.dataset import Dataset
 from dataset_devkit.export import export_dataset, preflight_recording_export
 from dataset_devkit.extraction.cache import CacheStoreResult, ExtractionResultCache
+from dataset_devkit.extraction.camera import DecoderOutput
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import RecordingExtractionResult
 from dataset_devkit.extraction.service import RecordingExtractor
@@ -1451,6 +1452,85 @@ def test_partial_pipeline_never_publishes_after_owned_cleanup_failure(
     assert payload["deterministic_details"]["owned_working_trees"][0]["path"] == str(
         failed_working
     )
+
+
+def test_partial_pipeline_blocks_fresh_extraction_rollback_failure(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailSecondDecode(DeterministicDecoder):
+        def decode(
+            self, payload: bytes, pts: int, time_base: Fraction
+        ) -> list[DecoderOutput]:
+            if self.calls == 1:
+                raise StructuralExtractionError("injected fresh extraction failure")
+            return super().decode(payload, pts, time_base)
+
+    good_recording = tmp_path / "good-fresh.mcap"
+    bad_recording = tmp_path / "bad-fresh.mcap"
+    payloads = tuple(
+        camera_message(
+            timestamp,
+            (timestamp + 10, timestamp + 20),
+            camera_names=("front", "rear"),
+        )
+        for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
+    )
+    write_mcap(good_recording, camera_payloads=payloads)
+    write_mcap(bad_recording, camera_payloads=payloads)
+    good_blob = "mcap-h265/good-fresh.mcap"
+    bad_blob = "mcap-h265/bad-fresh.mcap"
+    config = _pipeline_config(
+        config_factory(), tmp_path, (good_blob, bad_blob), partial=True
+    )
+    acquirer = _FakeAcquirer(
+        {good_blob: good_recording, bad_blob: bad_recording}
+    )
+    original_extract = RecordingExtractor.extract
+
+    def extract_with_bad_decoder(
+        extractor: RecordingExtractor, path: Path
+    ) -> RecordingExtractionResult:
+        if path == bad_recording:
+            failing = RecordingExtractor(
+                camera_topic=extractor.camera_topic,
+                gnss_topic=extractor.gnss_topic,
+                target_fps=extractor.target_fps,
+                tolerance_ns=extractor.tolerance_ns,
+                staging_root=extractor.staging_root,
+                decoder_factory=FailSecondDecode,
+            )
+            return original_extract(failing, path)
+        return original_extract(extractor, path)
+
+    def fail_rollback(_invocation: object) -> None:
+        raise StructuralExtractionError("injected fresh rollback failure")
+
+    monkeypatch.setattr(RecordingExtractor, "extract", extract_with_bad_decoder)
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.service.rollback_staging_invocation",
+        fail_rollback,
+    )
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: acquirer,
+        decoder_factory=DeterministicDecoder,
+        official_smoke=False,
+    )
+
+    with pytest.raises(BuildOperationalError, match="zero recordings are authorized"):
+        build_dataset(config, runtime=runtime)
+
+    assert not (config.paths.output_dir / config.publication.version).exists()
+    reports = tuple(config.quarantine.directory.glob("*.quarantine.json"))
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["artifact_handling"] == "preserved_in_place"
+    details = payload["deterministic_details"]
+    assert details["owned_working_trees"][0]["expected_parent_chain"]
+    assert details["cleanup_original_cause"] == {
+        "exception_type": "StructuralExtractionError",
+        "exception_message": "injected fresh extraction failure",
+    }
 
 
 def test_post_export_working_cleanup_failure_blocks_publication(

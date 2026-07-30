@@ -128,10 +128,11 @@ original type and receives a deterministic unprintable-message marker without ab
 After all recordings finish, any failure with `allow_partial_export=false` raises
 `PublicationBlockedError`. The exception carries every success/failure but explicitly authorizes
 zero recording identities. With `allow_partial_export=true`, the returned result authorizes only
-successful recording identities when every failure report persisted; failed recordings remain
-quarantined and unauthorized. An incomplete quarantine persistence forces the blocked exception
-and zero authorization regardless of that flag. With no failures, every successful input is
-authorized. Task 5 scene construction consumes only the successful recording's
+successful recording identities when every failure report persisted and `cleanup_complete` is
+`true`; failed recordings remain quarantined and unauthorized. Incomplete quarantine persistence
+or any cleanup debt forces the blocked exception and zero authorization regardless of that flag.
+With no failures and `cleanup_complete=true`, every successful input is authorized. Task 5 scene
+construction consumes only the successful recording's
 `final_candidates`; tag/split construction and nuScenes export or publication remain outside this
 boundary. The production boundary immediately validates that every enabled observation
 was enforced: invalid logical samples and grid misses cannot enter final candidates, enabled

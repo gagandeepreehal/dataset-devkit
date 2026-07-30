@@ -17,6 +17,7 @@ from dataset_devkit.extraction.camera import (
 )
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.service import RecordingExtractor
+from dataset_devkit.publication import OwnedDirectoryCleanupError
 from mcap_fixture import HEVC_AU, camera_message, write_mcap
 
 
@@ -428,3 +429,71 @@ def test_real_reader_service_rolls_back_staged_files_after_undecodable_hevc(
             staging_root=staging_root,
         ).extract(path)
     assert not list(staging_root.rglob("*.jpg"))
+
+
+def test_fresh_extraction_rollback_failure_preserves_original_and_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailSecondDecode:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def decode(
+            self, _payload: bytes, pts: int, _time_base: Fraction
+        ) -> list[DecoderOutput]:
+            self.calls += 1
+            if self.calls == 2:
+                raise StructuralExtractionError("injected original decode failure")
+            return [DecoderOutput(pts, Image.new("RGB", (4, 3), (1, 2, 3)))]
+
+        def flush(self) -> list[DecoderOutput]:
+            return []
+
+        def close(self) -> None:
+            pass
+
+    path = tmp_path / "fresh-failure.mcap"
+    write_mcap(
+        path,
+        camera_payloads=(
+                camera_message(
+                    1_000_000_000,
+                    (1_000_000_010, 1_000_000_020),
+                    camera_names=("front", "rear"),
+                ),
+                camera_message(
+                    1_500_000_000,
+                    (1_500_000_010, 1_500_000_020),
+                    camera_names=("front", "rear"),
+                ),
+        ),
+    )
+
+    def fail_rollback(_invocation: object) -> None:
+        raise StructuralExtractionError("injected rollback failure")
+
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.service.rollback_staging_invocation",
+        fail_rollback,
+    )
+
+    with pytest.raises(OwnedDirectoryCleanupError) as captured:
+        RecordingExtractor(
+            camera_topic="rec_cameras",
+            gnss_topic="gnss",
+            target_fps=Fraction(2, 1),
+            tolerance_ns=0,
+            staging_root=tmp_path / "working",
+            decoder_factory=FailSecondDecode,
+        ).extract(path)
+
+    assert isinstance(captured.value.__cause__, StructuralExtractionError)
+    assert str(captured.value.__cause__) == "injected original decode failure"
+    assert captured.value.__notes__ == [
+        "rollback failed with StructuralExtractionError"
+    ]
+    failure = captured.value.failures[0]
+    assert failure.path.parent == tmp_path / "working"
+    assert failure.expected_inode > 0
+    assert failure.expected_parent_chain
+    assert failure.path.is_dir()

@@ -42,8 +42,10 @@ traceback. A successful build publishes at `paths.output_dir/v1.0-trainval`; the
 contains the `v1.0-trainval/`, `samples/`, `maps/`, and `mz_extensions/` children.
 If identity-safe working-tree cleanup fails, the CLI emits only
 `dataset-devkit: error: owned working-tree cleanup failed; manual cleanup required`; local paths
-and identity evidence remain available through the structured Python exception and quarantine
-report, but are not printed at the command boundary.
+and identity evidence remain available through the structured Python exception, but are not
+printed at the command boundary. Per-recording failures also retain that evidence in their
+quarantine reports; post-export or global cleanup failures may have no per-recording quarantine
+report.
 
 Builds run in a uniquely named sibling `.v1.0-trainval.staging-*` directory. Tables, assets,
 extensions, official-SDK smoke loading, and the final manifest are validated before one atomic
@@ -110,8 +112,10 @@ All recordings are attempted independently through acquisition, extraction, vali
 scene construction, feature computation, and per-recording export preflight. Any attributable
 failure at those stages is quarantined and blocks publication by default. Setting
 `execution.allow_partial_export` to `true` permits successful recordings only when every failure
-report was durably quarantined; the resulting build JSON explicitly reports `partial: true` and
-the failed blob names. Managed identity is always supplied by `DefaultAzureCredential`; secrets,
+report was durably quarantined and `cleanup_complete` is `true`. Cleanup debt blocks publication
+and authorizes zero recordings regardless of the partial-export setting. An authorized partial
+build explicitly reports `partial: true` and the failed blob names. Managed identity is always
+supplied by `DefaultAzureCredential`; secrets,
 SAS URLs, account keys, and connection strings are prohibited in configuration. The optional
 one-blob Azure smoke procedure is documented in
 [configuration.md](docs/configuration.md#managed-identity-smoke-check).
