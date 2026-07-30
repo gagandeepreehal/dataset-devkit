@@ -117,7 +117,7 @@ def _select_observations(
     return tuple(selected), fallback_count
 
 
-def _tags(
+def derive_computed_tags(
     config: TagsConfig,
     distance: float,
     segment_stationary: tuple[bool, ...],
@@ -137,21 +137,12 @@ def _tags(
     if starting:
         tags.add("starting")
     degrees = math.degrees(abs(heading_change))
-    at_straight = math.isclose(
-        degrees, config.straight_max_heading_change_deg, rel_tol=0.0, abs_tol=1e-12
-    )
-    at_curvature = math.isclose(
-        degrees, config.curvature_min_heading_change_deg, rel_tol=0.0, abs_tol=1e-12
-    )
-    at_turn = math.isclose(
-        degrees, config.turn_min_heading_change_deg, rel_tol=0.0, abs_tol=1e-12
-    )
     direction = "left" if heading_change > 0 else "right"
-    if degrees < config.straight_max_heading_change_deg or at_straight:
+    if degrees <= config.straight_max_heading_change_deg:
         tags.add("straight")
-    elif degrees > config.turn_min_heading_change_deg or at_turn:
+    elif degrees >= config.turn_min_heading_change_deg:
         tags.add(f"{direction}_turn")
-    elif degrees > config.curvature_min_heading_change_deg or at_curvature:
+    elif degrees >= config.curvature_min_heading_change_deg:
         tags.add(f"{direction}_curvature")
     if gnss_ratio == 1.0:
         tags.add("gnss_valid")
@@ -274,7 +265,7 @@ def _compute_scene(
         result.source,
         scene.source_blob_path,
         tuple(scene.labels),
-        _tags(
+        derive_computed_tags(
             config,
             distance,
             segment_stationary,

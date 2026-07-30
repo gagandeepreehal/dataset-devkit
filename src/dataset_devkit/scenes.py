@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path, PurePosixPath
 from uuid import UUID, uuid5
 
@@ -36,6 +36,22 @@ def _token(namespace: UUID, kind: str, identity: object) -> str:
     return str(uuid5(namespace, f"dataset-devkit/{kind}/{canonical_json(identity)}"))
 
 
+def _evidence_jsonable(value: object) -> object:
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _evidence_jsonable(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _evidence_jsonable(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_evidence_jsonable(item) for item in value]
+    return value
+
+
 def _feature_evidence_token(
     namespace: UUID,
     source: SourceFingerprint,
@@ -61,9 +77,11 @@ def _feature_evidence_token(
             [
                 [
                     item.token,
+                    item.timestamp_ns,
                     item.grid_signed_sync_error_ns,
                     item.camera_signed_sync_error_ns,
                     item.gnss_source_validity,
+                    _evidence_jsonable(item.ego_pose),
                 ]
                 for item in sample_data
             ],

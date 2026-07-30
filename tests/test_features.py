@@ -8,9 +8,9 @@ from typing import Any
 
 import pytest
 
-from dataset_devkit.config import GlobalConfig
+from dataset_devkit.config import GlobalConfig, TagsConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
-from dataset_devkit.features import compute_recording_features
+from dataset_devkit.features import compute_recording_features, derive_computed_tags
 from dataset_devkit.scene_models import RecordingSceneResult
 from dataset_devkit.scenes import build_recording_scenes, validate_scene_graph
 from test_scenes import SOURCE, _annotation_config, _annotations, _camera, _config, _report
@@ -183,6 +183,46 @@ def test_task5_feature_evidence_is_sealed_against_mutation(
         validate_scene_graph(mutated)
 
 
+@pytest.mark.parametrize("field", ["translation_xyz_m", "rotation_wxyz"])
+def test_graph_feature_evidence_seals_finite_pose_mutations(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    field: str,
+) -> None:
+    config = _config(config_factory())
+    graph = build_recording_scenes(_report(tmp_path, (0, 1)), SOURCE, config)
+    original = graph.sample_data[0]
+    pose = (
+        replace(original.ego_pose, translation_xyz_m=(9.0, 8.0, 7.0))
+        if field == "translation_xyz_m"
+        else replace(original.ego_pose, rotation_wxyz=(0.0, 1.0, 0.0, 0.0))
+    )
+    changed = replace(original, ego_pose=pose)
+    forged = replace(graph, sample_data=(changed, *graph.sample_data[1:]))
+
+    with pytest.raises(StructuralExtractionError, match="feature evidence seal"):
+        validate_scene_graph(forged)
+    with pytest.raises(StructuralExtractionError, match="feature evidence seal"):
+        compute_recording_features(forged, config.tags)
+
+
+def test_graph_validator_rejects_finite_pose_timestamp_mutation_before_features(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _config(config_factory())
+    graph = build_recording_scenes(_report(tmp_path, (0, 1)), SOURCE, config)
+    original = graph.sample_data[0]
+    changed = replace(
+        original,
+        ego_pose=replace(original.ego_pose, timestamp_ns=original.ego_pose.timestamp_ns + 1),
+    )
+    forged = replace(graph, sample_data=(changed, *graph.sample_data[1:]))
+    with pytest.raises(StructuralExtractionError):
+        validate_scene_graph(forged)
+    with pytest.raises(StructuralExtractionError):
+        compute_recording_features(forged, config.tags)
+
+
 def test_yaw_unwrap_and_enu_direction_tags(
     tmp_path: Path, config_factory: Callable[[], GlobalConfig]
 ) -> None:
@@ -205,11 +245,8 @@ def test_yaw_unwrap_and_enu_direction_tags(
 def test_mixed_roll_pitch_quaternion_uses_wxyz_yaw_convention(
     tmp_path: Path, config_factory: Callable[[], GlobalConfig]
 ) -> None:
-    graph, config = _motion_graph(tmp_path, config_factory(), (0.0, 1.0), (0, 0))
-    second = graph.sample_data[1]
+    _, config = _motion_graph(tmp_path, config_factory(), (0.0, 1.0), (0, 0))
     quaternion = _quaternion_from_rpy(math.radians(20), math.radians(-15), math.radians(30))
-    mutated_data = replace(second, ego_pose=replace(second.ego_pose, rotation_wxyz=quaternion))
-    # Rebuilding through Task 5 is required because direct graph mutation is sealed.
     report = _report(tmp_path / "rebuilt", (0, 1_000_000_000))
     audits = []
     for index, audit in enumerate(report.final_candidates):
@@ -227,14 +264,51 @@ def test_mixed_roll_pitch_quaternion_uses_wxyz_yaw_convention(
     rebuilt = build_recording_scenes(report, SOURCE, config)
     feature = compute_recording_features(rebuilt, config.tags).scenes[0]
     assert math.degrees(feature.headings_rad[-1]) == pytest.approx(30.0)
-    assert mutated_data.ego_pose.rotation_wxyz == quaternion
+
+
+def test_sub_picosecond_heading_thresholds_have_exact_boundaries() -> None:
+    config = TagsConfig(
+        stationary_speed_mps=0.2,
+        minimum_movement_m=0.1,
+        straight_max_heading_change_deg=1.0,
+        curvature_min_heading_change_deg=1.0000000000004,
+        turn_min_heading_change_deg=1.0000000000008,
+    )
+
+    def directional(value: float) -> set[str]:
+        return set(
+            derive_computed_tags(
+                config,
+                distance=1.0,
+                segment_stationary=(False,),
+                heading_change=math.radians(value),
+                stopping=0,
+                starting=0,
+                gnss_ratio=1.0,
+                coverage_ratio=1.0,
+            )
+        ) & {"straight", "left_curvature", "right_curvature", "left_turn", "right_turn"}
+
+    assert directional(1.0) == {"straight"}
+    assert directional(0.9999999999999) == {"straight"}
+    assert directional(1.0000000000001) == set()
+    assert directional(1.0000000000004) == {"left_curvature"}
+    assert directional(1.0000000000007) == {"left_curvature"}
+    assert directional(1.0000000000008) == {"left_turn"}
+    assert directional(1.0000000000009) == {"left_turn"}
+    assert directional(-1.0) == {"straight"}
+    assert directional(-1.0000000000001) == set()
+    assert directional(-1.0000000000004) == {"right_curvature"}
+    assert directional(-1.0000000000007) == {"right_curvature"}
+    assert directional(-1.0000000000008) == {"right_turn"}
+    assert directional(-1.0000000000009) == {"right_turn"}
 
 
 @pytest.mark.parametrize(
     ("heading_deg", "expected"),
-    [(5.0, "straight"), (10.0, "left_curvature"), (45.0, "left_turn")],
+    [(5.0, "straight"), (10.1, "left_curvature"), (45.1, "left_turn")],
 )
-def test_direction_tag_threshold_equalities_are_exclusive(
+def test_feature_direction_tag_regions_are_exclusive(
     tmp_path: Path,
     config_factory: Callable[[], GlobalConfig],
     heading_deg: float,

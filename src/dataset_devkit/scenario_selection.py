@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 from dataset_devkit.config import ScenarioRuleConfig, ScenariosConfig
@@ -58,6 +58,9 @@ class ScenarioSelectionResult:
     unselected: tuple[UnselectedSceneAudit, ...]
     seed: int
     config_fingerprint: str
+    rules_fingerprint: str
+    candidate_fingerprint: str
+    strict_quotas: bool
 
 
 class ScenarioQuotaError(ValueError):
@@ -87,100 +90,107 @@ def validate_scenario_selection(
     features: tuple[SceneFeatures, ...] | list[SceneFeatures],
     config: ScenariosConfig,
 ) -> None:
-    """Validate the immutable assignment/audit partition against its accepted inputs."""
+    """Recompute and validate the complete immutable selection contract."""
     accepted = {_identity(feature): feature for feature in features}
     if len(accepted) != len(features):
         raise ValueError("scenario input contains duplicate scene/source identities")
     expected_fingerprint = canonical_hash(config.model_dump(mode="json"))
-    if result.seed != config.seed or result.config_fingerprint != expected_fingerprint:
-        raise ValueError("scenario selection seed or config fingerprint is inconsistent")
-    assignment_keys = tuple(
-        (item.scene_token, item.source_digest) for item in result.assignments
-    )
-    selected_keys = tuple(_identity(item) for item in result.selected_scenes)
-    unselected_keys = tuple(
-        (item.scene_token, item.source_digest) for item in result.unselected
-    )
-    if len(set(assignment_keys)) != len(assignment_keys):
-        raise ValueError("scenario assignment partition contains a duplicate")
-    if assignment_keys != selected_keys:
-        raise ValueError("scenario assignment and selected-scene ordering differ")
-    if any(feature != accepted[_identity(feature)] for feature in result.selected_scenes):
-        raise ValueError("scenario selected scene payload differs from accepted input")
     if (
-        len(set(unselected_keys)) != len(unselected_keys)
-        or set(assignment_keys) & set(unselected_keys)
-        or set(assignment_keys) | set(unselected_keys) != set(accepted)
+        result.seed != config.seed
+        or result.config_fingerprint != expected_fingerprint
+        or result.rules_fingerprint != _rules_fingerprint(config)
+        or result.candidate_fingerprint != _candidate_fingerprint(features)
+        or result.strict_quotas != config.strict_quotas
     ):
-        raise ValueError("scenario selected/unselected partition is incomplete or duplicated")
-    if len(result.rule_audits) != len(config.rules):
-        raise ValueError("scenario rule audit coverage is incomplete")
-    for assignment in result.assignments:
-        if assignment.rule_index >= len(config.rules):
-            raise ValueError("scenario assignment references a missing rule")
-        rule = config.rules[assignment.rule_index]
-        feature = accepted[(assignment.scene_token, assignment.source_digest)]
-        if (
-            assignment.primary_scenario != rule.name
-            or assignment.rank
-            != _rank(config.seed, assignment.rule_index, rule.name, feature)
-        ):
-            raise ValueError("scenario assignment identity or rank is inconsistent")
-    prior_assigned: set[tuple[str, str]] = set()
-    for rule_index, (audit, rule) in enumerate(
-        zip(result.rule_audits, config.rules, strict=True)
-    ):
-        candidate_keys = tuple(
-            (item.scene_token, item.source_digest) for item in audit.candidates
+        raise ValueError(
+            "scenario seed, strict mode, rules, candidate, or config fingerprint differs"
         )
-        expected_matched = {
-            key for key, feature in accepted.items() if _matches(feature, rule)
-        }
-        rule_assignments = {
-            (item.scene_token, item.source_digest)
-            for item in result.assignments
-            if item.rule_index == rule_index
-        }
-        selected_candidate_keys = {
-            key
-            for key, candidate in zip(candidate_keys, audit.candidates, strict=True)
-            if candidate.selected
-        }
-        if (
-            audit.rule_index != rule_index
-            or audit.rule_name != rule.name
-            or audit.quota != rule.quota
-            or audit.matched_candidates != len(audit.candidates)
-            or audit.selected != sum(item.selected for item in audit.candidates)
-            or audit.deficit != max(0, rule.quota - audit.selected)
-            or len(set(candidate_keys)) != len(candidate_keys)
-            or set(candidate_keys) != expected_matched
-            or audit.eligible_unassigned
-            != sum(not item.excluded_by_prior_rule for item in audit.candidates)
-            or selected_candidate_keys != rule_assignments
-        ):
-            raise ValueError("scenario rule audit counts or identity are inconsistent")
-        for key, item in zip(candidate_keys, audit.candidates, strict=True):
-            expected_candidate_reason = (
-                "selected"
-                if item.selected
-                else "claimed_by_prior_rule"
-                if item.excluded_by_prior_rule
-                else "quota_filled"
+
+    ordered_features = tuple(accepted[key] for key in sorted(accepted))
+    prior_assigned: set[tuple[str, str]] = set()
+    expected_assignments: list[ScenarioAssignment] = []
+    expected_selected: list[SceneFeatures] = []
+    expected_audits: list[RuleAudit] = []
+    matching_names: dict[tuple[str, str], list[str]] = {key: [] for key in accepted}
+    for rule_index, rule in enumerate(config.rules):
+        matched = tuple(feature for feature in ordered_features if _matches(feature, rule))
+        for feature in matched:
+            matching_names[_identity(feature)].append(rule.name)
+        all_ranked = tuple(
+            sorted(
+                (
+                    (_rank(config.seed, rule_index, rule.name, feature), feature)
+                    for feature in matched
+                ),
+                key=lambda item: (item[0], *_identity(item[1])),
             )
-            if (
-                item.excluded_by_prior_rule != (key in prior_assigned)
-                or item.rank != _rank(config.seed, rule_index, rule.name, accepted[key])
-                or item.reason != expected_candidate_reason
-            ):
-                raise ValueError("scenario candidate audit rank or prior claim is inconsistent")
-        prior_assigned.update(rule_assignments)
-    for unselected in result.unselected:
-        key = (unselected.scene_token, unselected.source_digest)
-        matching = tuple(rule.name for rule in config.rules if _matches(accepted[key], rule))
-        expected_reason = "no_rule_match" if not matching else "quota_filled"
-        if unselected.matching_rules != matching or unselected.reason != expected_reason:
-            raise ValueError("scenario unselected audit reason is inconsistent")
+        )
+        eligible = tuple(item for item in all_ranked if _identity(item[1]) not in prior_assigned)
+        chosen = eligible[: rule.quota]
+        chosen_keys = {_identity(feature) for _, feature in chosen}
+        deficit = max(0, rule.quota - len(chosen))
+        if config.strict_quotas and deficit:
+            raise ValueError("strict scenario result contains a quota deficit")
+        candidates = tuple(
+            RankedCandidate(
+                feature.scene_token,
+                feature.source.digest,
+                rank,
+                _identity(feature) in prior_assigned,
+                _identity(feature) in chosen_keys,
+                (
+                    "selected"
+                    if _identity(feature) in chosen_keys
+                    else "claimed_by_prior_rule"
+                    if _identity(feature) in prior_assigned
+                    else "quota_filled"
+                ),
+            )
+            for rank, feature in all_ranked
+        )
+        expected_audits.append(
+            RuleAudit(
+                rule.name,
+                rule_index,
+                rule.quota,
+                len(matched),
+                len(eligible),
+                len(chosen),
+                deficit,
+                candidates,
+            )
+        )
+        for rank, feature in chosen:
+            expected_assignments.append(
+                ScenarioAssignment(
+                    feature.scene_token,
+                    feature.source.digest,
+                    rule.name,
+                    rule_index,
+                    rank,
+                )
+            )
+            expected_selected.append(feature)
+            prior_assigned.add(_identity(feature))
+    expected_unselected = tuple(
+        UnselectedSceneAudit(
+            feature.scene_token,
+            feature.source.digest,
+            "no_rule_match" if not matching_names[_identity(feature)] else "quota_filled",
+            tuple(matching_names[_identity(feature)]),
+        )
+        for feature in ordered_features
+        if _identity(feature) not in prior_assigned
+    )
+    if result.rule_audits != tuple(expected_audits):
+        raise ValueError("scenario candidate audit canonical rank order or selection differs")
+    if (
+        result.assignments != tuple(expected_assignments)
+        or result.selected_scenes != tuple(expected_selected)
+    ):
+        raise ValueError("scenario assignment rule/rank order differs from canonical selection")
+    if result.unselected != expected_unselected:
+        raise ValueError("scenario unselected quota/no-match partition differs")
 
 
 def _matches(feature: SceneFeatures, rule: ScenarioRuleConfig) -> bool:
@@ -199,6 +209,21 @@ def _matches(feature: SceneFeatures, rule: ScenarioRuleConfig) -> bool:
 
 def _identity(feature: SceneFeatures) -> tuple[str, str]:
     return feature.scene_token, feature.source.digest
+
+
+def _rules_fingerprint(config: ScenariosConfig) -> str:
+    return canonical_hash([rule.model_dump(mode="json") for rule in config.rules])
+
+
+def _candidate_fingerprint(
+    features: tuple[SceneFeatures, ...] | list[SceneFeatures],
+) -> str:
+    return canonical_hash(
+        [
+            asdict(feature)
+            for feature in sorted(features, key=lambda item: _identity(item))
+        ]
+    )
 
 
 def _rank(
@@ -308,6 +333,9 @@ def select_scenarios(
         unselected,
         config.seed,
         canonical_hash(config.model_dump(mode="json")),
+        _rules_fingerprint(config),
+        _candidate_fingerprint(features),
+        config.strict_quotas,
     )
     validate_scenario_selection(result, features, config)
     return result

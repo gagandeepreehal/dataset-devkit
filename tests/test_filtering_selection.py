@@ -8,8 +8,10 @@ from conftest import FeatureFactory
 from dataset_devkit.config import FiltersConfig, ScenarioRuleConfig, ScenariosConfig
 from dataset_devkit.features import ChannelCoverage
 from dataset_devkit.filtering import filter_scenes
+from dataset_devkit.provenance import canonical_hash
 from dataset_devkit.scenario_selection import (
     ScenarioQuotaError,
+    UnselectedSceneAudit,
     select_scenarios,
     validate_scenario_selection,
 )
@@ -119,7 +121,7 @@ def test_selection_validator_rejects_mutation_and_fingerprint_changes(
     )
     result = select_scenarios((feature,), config)
 
-    with pytest.raises(ValueError, match="partition|duplicate"):
+    with pytest.raises(ValueError, match="partition|duplicate|order"):
         validate_scenario_selection(
             replace(result, assignments=(result.assignments[0], result.assignments[0])),
             (feature,),
@@ -128,6 +130,9 @@ def test_selection_validator_rejects_mutation_and_fingerprint_changes(
     changed = config.model_copy(update={"seed": 2})
     with pytest.raises(ValueError, match="fingerprint|seed"):
         validate_scenario_selection(result, (feature,), changed)
+    changed_feature = replace(feature, total_distance_m=feature.total_distance_m + 1.0)
+    with pytest.raises(ValueError, match="candidate|fingerprint"):
+        validate_scenario_selection(result, (changed_feature,), config)
 
 
 def test_unselected_no_match_and_quota_filled_reasons(
@@ -259,3 +264,126 @@ def test_selection_repeat_shuffle_prior_rule_audit_and_duplicate_prevention(
     }
     with pytest.raises(ValueError, match="duplicate"):
         select_scenarios((features[0], features[0]), config)
+
+
+def test_validator_rejects_coherent_lower_rank_selection_forgery(
+    feature_factory: FeatureFactory,
+) -> None:
+    features = tuple(
+        feature_factory(scene_token=token, computed_tags=("straight",))
+        for token in ("a", "b", "c")
+    )
+    config = ScenariosConfig(
+        seed=18,
+        rules=[ScenarioRuleConfig(name="Rule", quota=1, required_all_tags=["straight"])],
+    )
+    result = select_scenarios(features, config)
+    audit = result.rule_audits[0]
+    best = next(item for item in audit.candidates if item.selected)
+    lower = next(item for item in audit.candidates if not item.selected)
+    candidates = tuple(
+        replace(item, selected=False, reason="quota_filled")
+        if item.scene_token == best.scene_token
+        else replace(item, selected=True, reason="selected")
+        if item.scene_token == lower.scene_token
+        else item
+        for item in audit.candidates
+    )
+    lower_feature = next(item for item in features if item.scene_token == lower.scene_token)
+    forged_assignment = replace(
+        result.assignments[0],
+        scene_token=lower.scene_token,
+        source_digest=lower.source_digest,
+        rank=lower.rank,
+    )
+    retained_unselected = tuple(
+        item for item in result.unselected if item.scene_token != lower.scene_token
+    )
+    forged = replace(
+        result,
+        assignments=(forged_assignment,),
+        selected_scenes=(lower_feature,),
+        rule_audits=(replace(audit, candidates=candidates),),
+        unselected=(
+            *retained_unselected,
+            UnselectedSceneAudit(best.scene_token, best.source_digest, "quota_filled", ("Rule",)),
+        ),
+    )
+    with pytest.raises(ValueError, match="rank|order|audit"):
+        validate_scenario_selection(forged, features, config)
+
+
+def test_validator_rejects_candidate_reordering_rank_and_prior_claim_forgery(
+    feature_factory: FeatureFactory,
+) -> None:
+    features = tuple(
+        feature_factory(scene_token=token, computed_tags=("moving", "straight"))
+        for token in ("a", "b", "c")
+    )
+    config = ScenariosConfig(
+        seed=6,
+        rules=[
+            ScenarioRuleConfig(name="First", quota=1, required_all_tags=["straight"]),
+            ScenarioRuleConfig(name="Second", quota=1, required_all_tags=["moving"]),
+        ],
+    )
+    result = select_scenarios(features, config)
+    first = result.rule_audits[0]
+    reordered = replace(first, candidates=tuple(reversed(first.candidates)))
+    with pytest.raises(ValueError):
+        validate_scenario_selection(
+            replace(result, rule_audits=(reordered, result.rule_audits[1])),
+            features,
+            config,
+        )
+    altered = replace(first.candidates[0], rank="0" * 64)
+    altered_audit = replace(first, candidates=(altered, *first.candidates[1:]))
+    with pytest.raises(ValueError, match="rank"):
+        validate_scenario_selection(
+            replace(result, rule_audits=(altered_audit, result.rule_audits[1])),
+            features,
+            config,
+        )
+    second = result.rule_audits[1]
+    claimed_index = next(
+        index
+        for index, item in enumerate(second.candidates)
+        if item.excluded_by_prior_rule
+    )
+    changed_candidates = list(second.candidates)
+    changed_candidates[claimed_index] = replace(
+        changed_candidates[claimed_index],
+        excluded_by_prior_rule=False,
+        reason="quota_filled",
+    )
+    changed_second = replace(
+        second,
+        candidates=tuple(changed_candidates),
+        eligible_unassigned=second.eligible_unassigned + 1,
+    )
+    with pytest.raises(ValueError, match="prior|audit"):
+        validate_scenario_selection(
+            replace(result, rule_audits=(first, changed_second)),
+            features,
+            config,
+        )
+
+
+def test_validator_rejects_forged_strict_quota_deficit(
+    feature_factory: FeatureFactory,
+) -> None:
+    feature = feature_factory(scene_token="a", computed_tags=("straight",))
+    loose = ScenariosConfig(
+        seed=5,
+        strict_quotas=False,
+        rules=[ScenarioRuleConfig(name="Rule", quota=2, required_all_tags=["straight"])],
+    )
+    result = select_scenarios((feature,), loose)
+    strict = loose.model_copy(update={"strict_quotas": True})
+    forged = replace(
+        result,
+        config_fingerprint=canonical_hash(strict.model_dump(mode="json")),
+        strict_quotas=True,
+    )
+    with pytest.raises(ValueError, match="strict|deficit"):
+        validate_scenario_selection(forged, (feature,), strict)

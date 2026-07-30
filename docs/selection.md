@@ -33,9 +33,15 @@ configured middle band. Straight, turn, and curvature tags are mutually exclusiv
 are `camera_coverage_complete`/`camera_coverage_partial`; GNSS state tags are `gnss_valid`,
 `gnss_partial`, or `gnss_invalid`.
 
+Threshold comparisons are direct: straight is `<=` its maximum, turn is `>=` its minimum, and
+curvature is `>=` its minimum only after the straight and turn checks. No hidden tolerance widens
+these boundaries.
+
 Source-GNSS ratio, expected/present camera coverage, and synchronization error are computed from
 the sealed Task 5 evidence. The sync population contains one grid error per source sample plus one
 camera error per present camera record; it is independent of the trajectory reference channel.
+The seal also covers real pose timestamps, final translation/quaternion values, and complete GNSS
+interpolation/source identity and validity evidence consumed by feature derivation.
 Task 6 raises `StructuralExtractionError` for missing,
 nonfinite, inconsistent, or non-increasing reference evidence; such failures are not filter
 rejections.
@@ -62,6 +68,9 @@ Each rule selects exactly `quota`. Under the default `strict_quotas: true`, a de
 quota selects nothing. The result contains selected assignments in rule-order then rank-order,
 candidate/rank/prior-rule audits, and an audit reason for every accepted scene not selected.
 Reordering identical inputs produces the same canonical result.
+The immutable result persists seed, strict-mode, canonical rule/config fingerprints, and a
+fingerprint of the complete accepted feature candidates. Validation recomputes canonical candidate
+rank order and first-quota selection for every rule; coherent lower-rank substitutions are invalid.
 
 Copy [`examples/scenario_templates.json`](../examples/scenario_templates.json) for the canonical
 Straight, Stopping, Left Turn, Right Turn, Left Curvature, Right Curvature, and annotation-label
