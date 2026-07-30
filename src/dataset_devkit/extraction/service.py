@@ -20,6 +20,7 @@ from dataset_devkit.extraction.gnss import interpolate_gnss
 from dataset_devkit.extraction.grid import select_camera_grid
 from dataset_devkit.extraction.mcap_source import iter_camera_access_units, read_recording
 from dataset_devkit.extraction.models import (
+    CameraCalibration,
     EgoPose,
     ExtractedCameraSample,
     RecordingExtractionResult,
@@ -45,6 +46,7 @@ class _SubmissionMetadata:
     camera_name: str
     width: int
     height: int
+    calibration: CameraCalibration
     selected_target_ns: int | None
 
 
@@ -151,6 +153,7 @@ class RecordingExtractor:
                             metadata.camera_name,
                             staged,
                             pose_for(metadata.camera_timestamp_ns),
+                            metadata.calibration,
                         ),
                     )
                 )
@@ -166,6 +169,7 @@ class RecordingExtractor:
                         access.frame.camera_name,
                         access.batch.width,
                         access.batch.height,
+                        access.frame.calibration,
                         target_by_batch.get(access.batch.rec_timestamp_ns),
                     )
                     camera_index = access.frame.camera_index

@@ -1,0 +1,559 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from dataclasses import replace
+from fractions import Fraction
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+from PIL import Image
+
+from dataset_devkit.config import GlobalConfig, InvalidationRulesConfig
+from dataset_devkit.extraction.camera import DecoderOutput
+from dataset_devkit.extraction.errors import StructuralExtractionError
+from dataset_devkit.extraction.models import (
+    CameraCalibration,
+    CameraExtrinsic,
+    CameraIntrinsic,
+    EgoPose,
+    ExtractedCameraSample,
+    GnssInterpolation,
+    StagedImage,
+)
+from dataset_devkit.extraction.service import RecordingExtractor
+from dataset_devkit.provenance import SourceFingerprint, canonical_json
+from dataset_devkit.scenes import build_recording_scenes, validate_scene_graph
+from dataset_devkit.validity import (
+    INVALIDITY_CODES,
+    LogicalSampleAudit,
+    ValidityReport,
+    evaluate_validity,
+)
+from mcap_fixture import camera_message, write_mcap
+
+SOURCE = SourceFingerprint(
+    "https://example.blob.core.windows.net",
+    "recordings",
+    "mcap-h265/day/a.mcap",
+    '"etag"',
+    123,
+)
+
+
+class _DeterministicDecoder:
+    def decode(self, payload: bytes, pts: int, time_base: Fraction) -> list[DecoderOutput]:
+        return [DecoderOutput(pts, Image.new("RGB", (4, 3), (1, 2, 3)))]
+
+    def flush(self) -> list[DecoderOutput]:
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+def _camera(tmp_path: Path, logical: int, channel: str, real: int) -> ExtractedCameraSample:
+    image = tmp_path / f"{logical}-{channel}.jpg"
+    image.write_bytes(b"jpeg")
+    stat = image.stat()
+    interpolation = GnssInterpolation(real, True, None, None, 0.0, 0, 0)
+    pose = EgoPose(real, True, (1.0, 2.0, 3.0), (1.0, 0.0, 0.0, 0.0), interpolation)
+    calibration = CameraCalibration(
+        CameraIntrinsic(1.0, 1.0, 1.0, 1.0, 0.0, 0.0, (), 4.0, 3.0),
+        CameraExtrinsic((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+    )
+    del calibration  # calibration is preserved through the corresponding extracted frame in Task 4.
+    return ExtractedCameraSample(
+        logical,
+        logical,
+        real,
+        0 if channel == "front" else 1,
+        channel,
+        StagedImage(
+            0 if channel == "front" else 1, channel, real, image, 4, 3, stat.st_dev, stat.st_ino
+        ),
+        pose,
+    )
+
+
+def _report(tmp_path: Path, timestamps: tuple[int, ...]) -> ValidityReport:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    audits = tuple(
+        LogicalSampleAudit(
+            timestamp,
+            timestamp,
+            (("front", timestamp + 10), ("rear", timestamp + 20)),
+            (
+                _camera(tmp_path, timestamp, "front", timestamp + 10),
+                _camera(tmp_path, timestamp, "rear", timestamp + 20),
+            ),
+            (),
+            True,
+        )
+        for timestamp in timestamps
+    )
+    return ValidityReport(
+        tmp_path / "local.mcap", (), (), audits, audits, (), True, "retain_for_audit"
+    )
+
+
+def _config(base: GlobalConfig, **scene_changes: object) -> GlobalConfig:
+    return base.model_copy(
+        update={
+            "scenes": base.scenes.model_copy(
+                update={
+                    "mode": "automatic",
+                    "dataset_namespace": UUID("8d55f58b-4a7b-5a9a-a95a-a3989610795b"),
+                    "min_duration_s": 0.0,
+                    "max_duration_s": 2.0,
+                    "min_samples": 1,
+                    "max_sample_gap_ms": 1000.0,
+                    "skip_between_scenes_s": 0.0,
+                    **scene_changes,
+                }
+            )
+        }
+    )
+
+
+def _annotations(path: Path, records: list[dict[str, object]]) -> Path:
+    path.write_text("\n".join(json.dumps(item) for item in records), encoding="utf-8")
+    return path
+
+
+def _annotation_config(
+    base: GlobalConfig, *, mode: str, tolerance_ms: float, before_s: float, after_s: float
+) -> GlobalConfig:
+    configured = _config(base, mode=mode)
+    return configured.model_copy(
+        update={
+            "annotations": base.annotations.model_copy(
+                update={
+                    "match_tolerance_ms": tolerance_ms,
+                    "before_s": before_s,
+                    "after_s": after_s,
+                }
+            )
+        }
+    )
+
+
+def test_gap_and_max_duration_equalities_stay_while_exceeding_values_split(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _config(config_factory())
+    report = _report(tmp_path, (0, 1_000_000_000, 2_000_000_000, 3_000_000_001))
+
+    result = build_recording_scenes(report, SOURCE, config)
+
+    assert [(scene.first_timestamp_ns, scene.last_timestamp_ns) for scene in result.scenes] == [
+        (0, 2_000_000_000),
+        (3_000_000_001, 3_000_000_001),
+    ]
+
+
+def test_minimum_duration_count_skip_and_leftover_reasons(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _config(
+        config_factory(),
+        min_duration_s=1.0,
+        max_duration_s=1.0,
+        min_samples=2,
+        skip_between_scenes_s=1.0,
+    )
+    report = _report(
+        tmp_path, (0, 1_000_000_000, 1_500_000_000, 2_000_000_000, 3_000_000_000, 4_500_000_000)
+    )
+
+    result = build_recording_scenes(report, SOURCE, config)
+
+    assert [(scene.first_timestamp_ns, scene.last_timestamp_ns) for scene in result.scenes] == [
+        (0, 1_000_000_000),
+        (2_000_000_000, 3_000_000_000),
+    ]
+    assert [(item.timestamp_ns, item.reason) for item in result.unassigned] == [
+        (1_500_000_000, "inter_scene_skip"),
+        (4_500_000_000, "candidate_too_short"),
+    ]
+
+
+def test_multicamera_tokens_real_timestamps_chains_and_determinism(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _config(config_factory())
+    report = _report(tmp_path, (0, 1_000_000_000))
+    first = build_recording_scenes(report, SOURCE, config)
+    second = build_recording_scenes(report, SOURCE, config)
+
+    assert canonical_json(first.to_dict()) == canonical_json(second.to_dict())
+    assert len(first.samples) == 2
+    assert [item.timestamp_ns for item in first.sample_data if item.channel == "front"] == [
+        10,
+        1_000_000_010,
+    ]
+    assert [item.timestamp_ns for item in first.sample_data if item.channel == "rear"] == [
+        20,
+        1_000_000_020,
+    ]
+    assert first.samples[0].prev == "" and first.samples[-1].next == ""
+    for channel in ("front", "rear"):
+        chain = [item for item in first.sample_data if item.channel == channel]
+        assert chain[0].prev == "" and chain[-1].next == ""
+        assert chain[0].next == chain[1].token and chain[1].prev == chain[0].token
+
+
+def test_duplicate_final_logical_timestamp_structural_fails(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    report = _report(tmp_path, (0, 1))
+    report = replace(report, final_candidates=(report.final_candidates[0],) * 2)
+    with pytest.raises(StructuralExtractionError, match="duplicate logical timestamp"):
+        build_recording_scenes(report, SOURCE, _config(config_factory()))
+
+
+def test_validator_rejects_broken_or_cyclic_links(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1_000_000_000)),
+        SOURCE,
+        _config(config_factory()),
+    )
+    broken = replace(
+        result,
+        samples=(replace(result.samples[0], next=result.samples[0].token), result.samples[1]),
+    )
+    with pytest.raises(StructuralExtractionError, match="sample chain"):
+        validate_scene_graph(broken)
+
+
+def test_validator_rejects_symmetric_sample_chain_crossing_scenes(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1_000_000_000, 3_000_000_000, 4_000_000_000)),
+        SOURCE,
+        _config(config_factory()),
+    )
+    assert len(result.scenes) == 2
+    samples = list(result.samples)
+    first_end = next(
+        i for i, item in enumerate(samples) if item.token == result.scenes[0].last_sample_token
+    )
+    second_start = next(
+        i for i, item in enumerate(samples) if item.token == result.scenes[1].first_sample_token
+    )
+    samples[first_end] = replace(samples[first_end], next=samples[second_start].token)
+    samples[second_start] = replace(samples[second_start], prev=samples[first_end].token)
+
+    with pytest.raises(StructuralExtractionError, match="cross-scene|endpoints"):
+        validate_scene_graph(replace(result, samples=tuple(samples)))
+
+
+def test_nearest_annotation_match_uses_earlier_tie_and_exact_tolerance(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    annotation_path = _annotations(
+        tmp_path / "annotations.jsonl",
+        [
+            {"blob_path": SOURCE.blob_path, "timestamp_ns": 1_000_000_000, "labels": ["tie"]},
+            {"blob_path": SOURCE.blob_path, "timestamp_ns": 3_000_000_001, "labels": ["late"]},
+            {"blob_path": "mcap-h265/day/other.mcap", "timestamp_ns": 0, "labels": ["other"]},
+        ],
+    )
+    config = _annotation_config(
+        config_factory(),
+        mode="annotation_only",
+        tolerance_ms=1000.0,
+        before_s=0.0,
+        after_s=0.0,
+    )
+
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 2_000_000_000)),
+        SOURCE,
+        config,
+        annotations_path=annotation_path,
+    )
+
+    assert [
+        (
+            item.line_number,
+            item.matched,
+            item.sample_timestamp_ns,
+            item.signed_error_ns,
+            item.reason,
+        )
+        for item in result.annotation_matches
+    ] == [
+        (1, True, 0, -1_000_000_000, "matched"),
+        (2, False, 2_000_000_000, -1_000_000_001, "outside_tolerance"),
+        (3, False, None, None, "different_recording"),
+    ]
+    assert len(result.scenes) == 1 and result.scenes[0].labels == ("tie",)
+
+
+def test_annotation_windows_clip_to_runs_and_merge_overlap_with_lineage(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    annotation_path = _annotations(
+        tmp_path / "annotations.jsonl",
+        [
+            {
+                "blob_path": SOURCE.blob_path,
+                "timestamp_ns": 1_000_000_000,
+                "labels": ["turn", "rain"],
+            },
+            {
+                "blob_path": SOURCE.blob_path,
+                "timestamp_ns": 2_000_000_000,
+                "labels": ["rain", "pedestrian"],
+            },
+            {"blob_path": SOURCE.blob_path, "timestamp_ns": 5_000_000_000, "labels": ["later"]},
+        ],
+    )
+    config = _annotation_config(
+        config_factory(),
+        mode="annotation_only",
+        tolerance_ms=0.0,
+        before_s=2.0,
+        after_s=2.0,
+    )
+    report = _report(tmp_path, (0, 1_000_000_000, 2_000_000_000, 5_000_000_000, 6_000_000_000))
+
+    result = build_recording_scenes(report, SOURCE, config, annotations_path=annotation_path)
+
+    assert len(result.annotation_windows) == 2
+    first = result.annotation_windows[0]
+    assert (first.first_sample_timestamp_ns, first.last_sample_timestamp_ns) == (0, 2_000_000_000)
+    assert first.labels == ("turn", "rain", "pedestrian")
+    assert len(first.annotation_tokens) == 2
+    assert result.scenes[0].annotation_window_ref == first.token
+    second = result.annotation_windows[1]
+    assert (second.first_sample_timestamp_ns, second.last_sample_timestamp_ns) == (
+        5_000_000_000,
+        6_000_000_000,
+    )
+    assert all(scene.nbr_samples >= 1 for scene in result.scenes)
+
+
+def test_hybrid_annotation_range_splits_automatic_runs_without_sample_reuse(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    annotation_path = _annotations(
+        tmp_path / "annotations.jsonl",
+        [{"blob_path": SOURCE.blob_path, "timestamp_ns": 2_000_000_000, "labels": ["event"]}],
+    )
+    config = _annotation_config(
+        config_factory(),
+        mode="hybrid",
+        tolerance_ms=0.0,
+        before_s=0.0,
+        after_s=0.0,
+    )
+    config = config.model_copy(
+        update={
+            "scenes": config.scenes.model_copy(
+                update={
+                    "min_duration_s": 1.0,
+                    "max_duration_s": 10.0,
+                    "min_samples": 2,
+                    "max_sample_gap_ms": 2000.0,
+                }
+            )
+        }
+    )
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000)),
+        SOURCE,
+        config,
+        annotations_path=annotation_path,
+    )
+
+    observed = [
+        (scene.kind, scene.first_timestamp_ns, scene.last_timestamp_ns) for scene in result.scenes
+    ]
+    assert observed == [
+        ("automatic", 0, 1_000_000_000),
+        ("annotation", 2_000_000_000, 2_000_000_000),
+        ("automatic", 3_000_000_000, 4_000_000_000),
+    ]
+    assert len({sample.timestamp_ns for sample in result.samples}) == 5
+
+
+def test_annotation_only_and_automatic_have_explicit_opposite_coverage(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    annotation_path = _annotations(
+        tmp_path / "annotations.jsonl",
+        [{"blob_path": SOURCE.blob_path, "timestamp_ns": 1_000_000_000, "labels": ["human"]}],
+    )
+    report = _report(tmp_path, (0, 1_000_000_000, 2_000_000_000))
+    annotation_only = _annotation_config(
+        config_factory(),
+        mode="annotation_only",
+        tolerance_ms=0.0,
+        before_s=0.0,
+        after_s=0.0,
+    )
+    automatic = _annotation_config(
+        config_factory(),
+        mode="automatic",
+        tolerance_ms=0.0,
+        before_s=0.0,
+        after_s=0.0,
+    )
+    automatic = automatic.model_copy(
+        update={
+            "scenes": automatic.scenes.model_copy(
+                update={
+                    "min_duration_s": 0.0,
+                    "min_samples": 1,
+                    "max_duration_s": 10.0,
+                    "max_sample_gap_ms": 1000.0,
+                }
+            )
+        }
+    )
+
+    only = build_recording_scenes(report, SOURCE, annotation_only, annotations_path=annotation_path)
+    auto = build_recording_scenes(report, SOURCE, automatic, annotations_path=annotation_path)
+
+    assert [sample.timestamp_ns for sample in only.samples] == [1_000_000_000]
+    assert [item.timestamp_ns for item in only.unassigned] == [0, 2_000_000_000]
+    assert len(auto.scenes) == 1 and auto.scenes[0].kind == "automatic"
+    assert auto.scenes[0].labels == () and auto.scenes[0].annotation_refs == ()
+
+
+def test_uuid_tokens_change_for_namespace_source_and_scene_config_not_local_staging(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _config(config_factory())
+    report = _report(tmp_path / "one", (0, 1_000_000_000))
+    base = build_recording_scenes(report, SOURCE, config)
+    moved = _report(tmp_path / "two", (0, 1_000_000_000))
+    same = build_recording_scenes(moved, SOURCE, config)
+    changed_namespace = config.model_copy(
+        update={
+            "scenes": config.scenes.model_copy(
+                update={"dataset_namespace": UUID("11111111-1111-5111-8111-111111111111")}
+            )
+        }
+    )
+    changed_config = config.model_copy(
+        update={"scenes": config.scenes.model_copy(update={"max_duration_s": 3.0})}
+    )
+    changed_source = replace(SOURCE, etag='"other"')
+
+    assert [scene.token for scene in base.scenes] == [scene.token for scene in same.scenes]
+    assert (
+        base.scenes[0].token
+        != build_recording_scenes(report, SOURCE, changed_namespace).scenes[0].token
+    )
+    assert (
+        base.scenes[0].token
+        != build_recording_scenes(report, SOURCE, changed_config).scenes[0].token
+    )
+    assert (
+        base.scenes[0].token
+        != build_recording_scenes(report, changed_source, config).scenes[0].token
+    )
+
+
+def test_actual_synthetic_extraction_to_validity_to_scene_graph_boundary(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    mcap_path = tmp_path / "actual.mcap"
+    write_mcap(
+        mcap_path,
+        camera_payloads=(
+            camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
+            camera_message(1_500_000_000, (1_500_000_010, 1_500_000_020)),
+        ),
+    )
+    extraction = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=Fraction(2, 1),
+        tolerance_ns=0,
+        staging_root=tmp_path / "staging",
+        decoder_factory=_DeterministicDecoder,
+    ).extract(mcap_path)
+    base = config_factory()
+    validity_config = base.model_copy(
+        update={
+            "frame_validity": base.frame_validity.model_copy(
+                update={
+                    "required_cameras": ["front", "rear"],
+                    "invalidate_on": InvalidationRulesConfig.model_validate(
+                        {code: False for code in INVALIDITY_CODES}
+                    ),
+                }
+            )
+        }
+    )
+    report = evaluate_validity(extraction, validity_config)
+    scene_config = _config(
+        base, min_duration_s=0.1, max_duration_s=1.0, min_samples=2, max_sample_gap_ms=500.0
+    )
+
+    result = build_recording_scenes(report, SOURCE, scene_config)
+
+    assert len(report.final_candidates) == 2
+    assert len(result.scenes) == 1 and result.scenes[0].nbr_samples == 2
+    assert len(result.sample_data) == 4
+    assert all(item.calibration is not None for item in result.sample_data)
+    assert {item.timestamp_ns for item in result.sample_data} == {
+        1_000_000_010,
+        1_000_000_020,
+        1_500_000_010,
+        1_500_000_020,
+    }
+
+
+def test_actual_task4_invalid_audit_and_grid_miss_never_enter_scenes(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    mcap_path = tmp_path / "invalid.mcap"
+    write_mcap(
+        mcap_path,
+        camera_payloads=(
+            camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
+            camera_message(2_000_000_000, (2_000_000_010, 2_000_000_020)),
+        ),
+    )
+    extraction = RecordingExtractor(
+        camera_topic="rec_cameras",
+        gnss_topic="gnss",
+        target_fps=Fraction(2, 1),
+        tolerance_ns=0,
+        staging_root=tmp_path / "staging-invalid",
+        decoder_factory=_DeterministicDecoder,
+    ).extract(mcap_path)
+    base = config_factory()
+    validity_config = base.model_copy(
+        update={
+            "frame_validity": base.frame_validity.model_copy(
+                update={
+                    "required_cameras": ["front", "rear", "missing-camera"],
+                    "invalidate_on": InvalidationRulesConfig.model_validate(
+                        {
+                            code: code in {"missing_required_camera", "grid_miss"}
+                            for code in INVALIDITY_CODES
+                        }
+                    ),
+                }
+            )
+        }
+    )
+    report = evaluate_validity(extraction, validity_config)
+
+    result = build_recording_scenes(report, SOURCE, _config(base))
+
+    assert report.audit_only_samples and not report.final_candidates
+    assert any(item.batch_timestamp_ns is None for item in report.grid_audits)
+    assert result.scenes == ()
+    assert result.samples == ()
+    assert result.sample_data == ()

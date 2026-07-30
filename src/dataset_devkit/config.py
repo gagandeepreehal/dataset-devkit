@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 from urllib.parse import parse_qsl, urlsplit
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -266,8 +268,16 @@ class SanityChecksConfig(StrictModel):
     zero_required_camera_coverage: Literal["error", "warn", "off"] = "error"
 
 
+def _exact_nanoseconds(value: float, multiplier: int, field_name: str) -> int:
+    converted = Decimal(str(value)) * multiplier
+    if converted != converted.to_integral_value():
+        raise ValueError(f"{field_name} must resolve to an exact integer number of nanoseconds")
+    return int(converted)
+
+
 class ScenesConfig(StrictModel):
-    mode: Literal["hybrid", "fixed", "annotation"]
+    mode: Literal["automatic", "annotation_only", "hybrid"] = "hybrid"
+    dataset_namespace: UUID
     min_duration_s: float = Field(gt=0)
     max_duration_s: float = Field(gt=0)
     min_samples: int = Field(ge=1)
@@ -280,12 +290,71 @@ class ScenesConfig(StrictModel):
             raise ValueError("max_duration_s must be greater than or equal to min_duration_s")
         return self
 
+    @field_validator("dataset_namespace", mode="before")
+    @classmethod
+    def validate_namespace(cls, value: object) -> UUID:
+        if isinstance(value, UUID):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("dataset_namespace must be a UUID string")
+        try:
+            return UUID(value)
+        except ValueError as error:
+            raise ValueError("dataset_namespace must be a valid UUID") from error
+
+    @property
+    def min_duration_ns(self) -> int:
+        return _exact_nanoseconds(self.min_duration_s, 1_000_000_000, "min_duration_s")
+
+    @property
+    def max_duration_ns(self) -> int:
+        return _exact_nanoseconds(self.max_duration_s, 1_000_000_000, "max_duration_s")
+
+    @property
+    def max_sample_gap_ns(self) -> int:
+        return _exact_nanoseconds(self.max_sample_gap_ms, 1_000_000, "max_sample_gap_ms")
+
+    @property
+    def skip_between_scenes_ns(self) -> int:
+        return _exact_nanoseconds(
+            self.skip_between_scenes_s, 1_000_000_000, "skip_between_scenes_s"
+        )
+
+    @model_validator(mode="after")
+    def validate_exact_nanoseconds(self) -> ScenesConfig:
+        _ = (
+            self.min_duration_ns,
+            self.max_duration_ns,
+            self.max_sample_gap_ns,
+            self.skip_between_scenes_ns,
+        )
+        return self
+
 
 class AnnotationsConfig(StrictModel):
     path: Path
     match_tolerance_ms: float = Field(ge=0)
     before_s: float = Field(ge=0)
     after_s: float = Field(ge=0)
+
+    @property
+    def match_tolerance_ns(self) -> int:
+        return _exact_nanoseconds(
+            self.match_tolerance_ms, 1_000_000, "match_tolerance_ms"
+        )
+
+    @property
+    def before_ns(self) -> int:
+        return _exact_nanoseconds(self.before_s, 1_000_000_000, "before_s")
+
+    @property
+    def after_ns(self) -> int:
+        return _exact_nanoseconds(self.after_s, 1_000_000_000, "after_s")
+
+    @model_validator(mode="after")
+    def validate_exact_nanoseconds(self) -> AnnotationsConfig:
+        _ = self.match_tolerance_ns, self.before_ns, self.after_ns
+        return self
 
 
 class TagsConfig(StrictModel):

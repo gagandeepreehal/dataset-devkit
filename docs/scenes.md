@@ -1,0 +1,94 @@
+# Deterministic scenes and annotation windows
+
+Task 5 consumes one successful recording policy result at a time. Its only sample input is
+`ValidityReport.final_candidates`. Invalid retained audit samples, dropped invalid samples, and
+grid misses remain in the Task 4 report and can never become scenes. The builder also takes the
+exact Azure `SourceFingerprint`; local MCAP and staging paths are preserved as references but are
+never token inputs.
+
+## Configuration and integer time
+
+`scenes.mode` is exactly `automatic`, `annotation_only`, or `hybrid` (the default). The scene
+section also requires a stable `dataset_namespace` UUID, positive minimum/maximum durations,
+positive minimum sample count, nonnegative maximum sample gap, and nonnegative inter-scene skip.
+`min_duration_s` cannot exceed `max_duration_s`. The annotation section contains the safely
+resolved JSONL `path`, nonnegative nearest-match tolerance, and nonnegative before/after windows.
+All configured seconds/milliseconds are converted through their decimal text to exact integer
+nanoseconds. A value containing a fraction smaller than one nanosecond is rejected rather than
+rounded or truncated.
+
+## Valid runs and automatic segmentation
+
+Final valid logical samples must already be strictly ordered and unique by grid timestamp. A
+consecutive gap strictly greater than `max_sample_gap_ms` starts a new valid run; equality remains
+inside the run. Within each run the automatic algorithm is deliberately greedy:
+
+1. Start at the first eligible sample.
+2. Append samples while `timestamp - start <= max_duration`; equality is included.
+3. Finalize immediately before the first sample that would exceed the maximum.
+4. Keep the candidate only when both its duration and sample count meet their inclusive minima.
+   Every sample in a rejected candidate is audited as `candidate_too_short`; it is consumed and
+   never rebalanced into a neighbor.
+5. After a kept scene, consume samples as `inter_scene_skip` until
+   `next_timestamp - kept_end >= skip`; equality is eligible. Then repeat.
+
+This also defines leftover behavior: a final short candidate is rejected intact. No balancing,
+overlap, or sample reuse occurs.
+
+## Annotation JSONL
+
+The file is UTF-8 JSONL. Blank lines and lines whose first non-whitespace character is `#` are
+ignored. Every other line is one object with exactly these keys:
+
+```json
+{"blob_path":"mcap-h265/fleet/run.mcap","timestamp_ns":1720000000000000000,"labels":["turn","rain"]}
+```
+
+`blob_path` must be an exact validated `mcap-h265/...mcap` container-relative path; basename and
+prefix matching are never used. `timestamp_ns` is a nonnegative JSON integer (not a boolean,
+float, or string). `labels` is a nonempty array of unique, trimmed, nonblank strings. Unknown or
+duplicate JSON keys and duplicate `(blob_path, timestamp_ns, labels)` records are line-numbered
+errors.
+
+Every parsed record receives an audit. Records for another exact blob are
+`different_recording`. For the current blob, matching uses the nearest final valid logical
+sample. An exact distance tie chooses the earlier sample. Tolerance equality matches; a larger
+distance is `outside_tolerance`. Audits preserve the nearest sample timestamp, signed
+`sample - annotation` error, and absolute error even when tolerance prevents a match.
+
+A matched logical sample is the stable window anchor. The requested before/after interval is
+clipped to that sample's valid run, so it cannot cross a Task 4 invalid span, grid gap, configured
+maximum gap, or recording boundary. Windows whose time boundaries overlap or touch are merged.
+The merged window retains every source annotation token in line order and unions labels in first
+appearance order. Annotation scenes may be shorter than automatic duration/sample minima.
+
+## Modes
+
+- `annotation_only` emits only merged annotation windows. Other final valid samples are
+  `annotation_mode_excluded`.
+- `automatic` parses and audits configured annotations, but annotation windows do not construct
+  scenes and human labels are not attached to automatic scenes.
+- `hybrid` constructs annotation scenes first. Their complete sample ranges are hard boundaries;
+  automatic segmentation runs separately on each remaining range. Automatic scenes cannot
+  overlap or bridge an annotation range.
+
+## UUIDv5 graph and validation
+
+Scene, sample, per-camera sample-data, source annotation, and merged-window tokens use UUIDv5
+under `scenes.dataset_namespace`. Canonical identities include the exact source fingerprint/blob
+path and the relevant kind, configuration, timestamps, annotation/window identity, camera
+channel, and real camera timestamp/ordinal. They never include wall time, Python `hash()`, random
+UUIDs, local directories, or mapping iteration order.
+
+Each scene records endpoints/count, timestamps, source, kind, human labels, annotation references,
+and (for annotation scenes) its merged-window reference. Logical samples have symmetric
+`prev`/`next` links within their one scene. Each
+camera channel has a separate within-scene sample-data chain; its timestamp is the camera's real
+timestamp, not the logical grid time. Sample data preserves the deterministic export filename,
+staged image, calibration, and ego-pose reference. Chains never cross scenes. Human labels remain
+separate; Task 6 computed tags are not present.
+
+`validate_scene_graph` checks globally unique tokens, foreign references, endpoint/count/order
+consistency, symmetric acyclic chains, within-scene channel chains and real pose timestamps,
+single assignment, complete assigned/unassigned coverage, and annotation/window references. The
+builder runs it before returning and raises `StructuralExtractionError` on any malformed graph.

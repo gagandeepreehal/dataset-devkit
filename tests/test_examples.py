@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from dataset_devkit.annotations import parse_annotations
 from dataset_devkit.blob_list import parse_blob_list
 from dataset_devkit.config import load_config
 
@@ -20,3 +21,9 @@ def test_shipped_blob_list_has_only_relative_mcap_blob_names() -> None:
 
     assert lines
     assert all(line.startswith("mcap-h265/") for line in lines)
+
+
+def test_shipped_annotation_jsonl_is_strict_and_parseable() -> None:
+    records = parse_annotations(ROOT / "examples" / "annotations.jsonl")
+
+    assert records and records[0].blob_path.startswith("mcap-h265/")

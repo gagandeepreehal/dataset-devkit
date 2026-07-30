@@ -163,6 +163,29 @@ def _assert_sample_reference(
         or frame_reference not in indexes.frames_by_batch[sample.batch_timestamp_ns]
     ):
         raise StructuralExtractionError("sample camera reference is inconsistent")
+    matching_frame = next(
+        frame
+        for frame in matching_batch.frames
+        if (frame.camera_index, frame.camera_name, frame.camera_timestamp_ns) == frame_reference
+    )
+    if sample.calibration is not None and sample.calibration != matching_frame.calibration:
+        raise StructuralExtractionError("sample calibration reference is inconsistent")
+    calibration = matching_frame.calibration if sample.calibration is None else sample.calibration
+    calibration_numbers = (
+        calibration.intrinsic.focal_length_x,
+        calibration.intrinsic.focal_length_y,
+        calibration.intrinsic.optical_center_x,
+        calibration.intrinsic.optical_center_y,
+        calibration.intrinsic.rmse,
+        calibration.intrinsic.skew,
+        calibration.intrinsic.width,
+        calibration.intrinsic.height,
+        *calibration.intrinsic.distortion_coeffs,
+        *calibration.extrinsic.rotation_vector,
+        *calibration.extrinsic.translation_vector,
+    )
+    if not all(math.isfinite(number) for number in calibration_numbers):
+        raise StructuralExtractionError("sample calibration contains non-finite values")
     staged = sample.staged_image
     if (
         staged.camera_index != sample.camera_index

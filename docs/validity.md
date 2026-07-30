@@ -129,5 +129,6 @@ zero recording identities. With `allow_partial_export=true`, the returned result
 successful recording identities when every failure report persisted; failed recordings remain
 quarantined and unauthorized. An incomplete quarantine persistence forces the blocked exception
 and zero authorization regardless of that flag. With no failures, every successful input is
-authorized. Scene/tag/split construction and nuScenes export or publication are outside this
+authorized. Task 5 scene construction consumes only the successful recording's
+`final_candidates`; tag/split construction and nuScenes export or publication remain outside this
 boundary.

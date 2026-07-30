@@ -5,8 +5,9 @@ from MCAP recordings in Azure Blob Storage. This foundation release defines the 
 configuration, CLI, and Python API boundaries. Azure acquisition is implemented as a focused,
 injectable service. Native MCAP/protobuf extraction, persistent HEVC decode, deterministic camera
 selection, GNSS interpolation, and verified JPEG staging are a separate focused service. Typed
-validity/sanity policy, safe quarantine reports, and independent-recording partial-export gating
-are implemented. Scene construction, export, and publication remain later stages.
+validity/sanity policy, safe quarantine reports, independent-recording partial-export gating,
+and deterministic automatic/annotation/hybrid scene graphs are implemented. Tags, split, export,
+and publication remain later stages.
 
 ## Install for development
 
@@ -21,6 +22,7 @@ Copy the example files, then validate their paths and policies in code:
 ```bash
 cp examples/dataset_config.json dataset_config.json
 cp examples/mcap_blobs.txt mcap_blobs.txt
+cp examples/annotations.jsonl annotations.jsonl
 python -c 'from pathlib import Path; from dataset_devkit.config import load_config; print(load_config(Path("dataset_config.json")))'
 ```
 
@@ -63,6 +65,9 @@ staging, and structural-failure contract.
 
 See [validity.md](docs/validity.md) for invalidity codes and thresholds, audit/drop behavior,
 sanity modes, quarantine reports, and the partial-export authorization gate.
+
+See [scenes.md](docs/scenes.md) for exact greedy segmentation, strict annotation JSONL matching,
+hybrid exclusion, UUIDv5 identities, per-camera chains, and structural graph validation.
 
 The stable Python import is:
 

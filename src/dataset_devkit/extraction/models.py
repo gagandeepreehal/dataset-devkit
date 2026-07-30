@@ -203,6 +203,7 @@ class ExtractedCameraSample:
     camera_name: str
     staged_image: StagedImage
     ego_pose: EgoPose
+    calibration: CameraCalibration | None = None
 
 
 @dataclass(frozen=True)

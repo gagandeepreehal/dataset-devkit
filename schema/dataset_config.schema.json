@@ -458,6 +458,11 @@
     "ScenesConfig": {
       "additionalProperties": false,
       "properties": {
+        "dataset_namespace": {
+          "format": "uuid",
+          "title": "Dataset Namespace",
+          "type": "string"
+        },
         "max_duration_s": {
           "exclusiveMinimum": 0,
           "title": "Max Duration S",
@@ -479,10 +484,11 @@
           "type": "integer"
         },
         "mode": {
+          "default": "hybrid",
           "enum": [
-            "hybrid",
-            "fixed",
-            "annotation"
+            "automatic",
+            "annotation_only",
+            "hybrid"
           ],
           "title": "Mode",
           "type": "string"
@@ -494,7 +500,7 @@
         }
       },
       "required": [
-        "mode",
+        "dataset_namespace",
         "min_duration_s",
         "max_duration_s",
         "min_samples",

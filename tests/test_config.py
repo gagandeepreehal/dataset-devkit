@@ -40,6 +40,7 @@ def minimal_config() -> dict[str, object]:
         "sanity_checks": {},
         "scenes": {
             "mode": "hybrid",
+            "dataset_namespace": "8d55f58b-4a7b-5a9a-a95a-a3989610795b",
             "min_duration_s": 10.0,
             "max_duration_s": 40.0,
             "min_samples": 20,

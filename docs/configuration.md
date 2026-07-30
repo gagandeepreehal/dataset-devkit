@@ -51,8 +51,11 @@ are not treated as credentials merely because their text contains words such as 
 - `sanity_checks`: an explicit `error`, `warn`, or `off` policy for each of
   `empty_selected_grid`, `empty_final_candidates`, `all_gnss_sources_invalid`, and
   `zero_required_camera_coverage`. Unknown check names and other policy words are rejected.
-- `scenes`: segmentation mode, duration bounds, sample minimum, gap limit, and scene spacing.
-- `annotations`: relative JSONL path, match tolerance, and before/after windows.
+- `scenes`: exact `automatic`, `annotation_only`, or default `hybrid` mode; stable dataset UUID
+  namespace; duration bounds; sample minimum; gap limit; and scene spacing. Decimal time values
+  must resolve exactly to integer nanoseconds.
+- `annotations`: safely resolved relative JSONL path, nearest-match tolerance, and before/after
+  windows. See [scenes.md](scenes.md) for the strict line format and matching algorithm.
 - `tags`: stationary-speed and turn-angle thresholds.
 - `filters`: valid-sample fraction and tags required for export.
 - `scenarios`: deterministic seed and uniquely named typed rules. Tag lists contain nonblank,
