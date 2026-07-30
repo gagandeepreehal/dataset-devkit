@@ -36,19 +36,6 @@ def _token(namespace: UUID, kind: str, identity: object) -> str:
     return str(uuid5(namespace, f"dataset-devkit/{kind}/{canonical_json(identity)}"))
 
 
-def _partition_runs(
-    samples: Sequence[LogicalSampleAudit], max_gap_ns: int
-) -> tuple[tuple[LogicalSampleAudit, ...], ...]:
-    if not samples:
-        return ()
-    runs: list[list[LogicalSampleAudit]] = [[samples[0]]]
-    for sample in samples[1:]:
-        if sample.grid_target_timestamp_ns - runs[-1][-1].grid_target_timestamp_ns > max_gap_ns:
-            runs.append([])
-        runs[-1].append(sample)
-    return tuple(tuple(run) for run in runs)
-
-
 def _validate_input(
     report: ValidityReport, source: SourceFingerprint
 ) -> tuple[LogicalSampleAudit, ...]:
@@ -150,9 +137,11 @@ def _validate_input(
 @dataclass(frozen=True)
 class _WindowCandidate:
     annotation: AnnotationRecord
+    run_id: int
+    start_index: int
+    end_index: int
     first_ns: int
     last_ns: int
-    samples: tuple[LogicalSampleAudit, ...]
 
 
 @dataclass(frozen=True)
@@ -190,13 +179,17 @@ class _SampleIndex:
         right_error = self.timestamps[right] - timestamp_ns
         return left if left_error <= right_error else right
 
-    def window(
-        self, anchor_position: int, first_ns: int, last_ns: int
+    def run_timestamps(self, run_id: int) -> tuple[int, ...]:
+        start, end = self.runs[run_id]
+        return self.timestamps[start:end]
+
+    def materialize_run_range(
+        self, run_id: int, start_index: int, end_index: int
     ) -> tuple[LogicalSampleAudit, ...]:
-        run_start, run_end = self.runs[self.run_id_by_position[anchor_position]]
-        start = bisect_left(self.timestamps, first_ns, run_start, run_end)
-        end = bisect_right(self.timestamps, last_ns, start, run_end)
-        return self.samples[start:end]
+        run_start, run_end = self.runs[run_id]
+        if not (0 <= start_index < end_index <= run_end - run_start):
+            raise StructuralExtractionError("annotation window index range is invalid")
+        return self.samples[run_start + start_index : run_start + end_index]
 
 
 def _annotation_state(
@@ -266,34 +259,58 @@ def _annotation_state(
                 record.token, record.line_number, True, anchor, signed, absolute, "matched"
             )
         )
-        run_start, run_end = index.runs[index.run_id_by_position[nearest_position]]
+        run_id = index.run_id_by_position[nearest_position]
+        run_start, run_end = index.runs[run_id]
         requested_first = anchor - config.annotations.before_ns
         requested_last = anchor + config.annotations.after_ns
         first_ns = max(requested_first, index.timestamps[run_start])
         last_ns = min(requested_last, index.timestamps[run_end - 1])
-        window_samples = index.window(nearest_position, first_ns, last_ns)
-        candidates.append(_WindowCandidate(record, first_ns, last_ns, window_samples))
+        start_index = bisect_left(index.timestamps, first_ns, run_start, run_end) - run_start
+        end_index = bisect_right(index.timestamps, last_ns, run_start, run_end) - run_start
+        candidates.append(
+            _WindowCandidate(
+                record,
+                run_id,
+                start_index,
+                end_index,
+                first_ns,
+                last_ns,
+            )
+        )
 
-    candidates.sort(key=lambda item: (item.first_ns, item.last_ns, item.annotation.line_number))
+    candidates.sort(
+        key=lambda item: (
+            item.run_id,
+            item.start_index,
+            item.end_index,
+            item.annotation.line_number,
+        )
+    )
     merged: list[list[_WindowCandidate]] = []
-    merged_end: list[int] = []
+    merged_end_index: list[int] = []
+    merged_last_ns: list[int] = []
     for candidate in candidates:
-        if not merged or candidate.first_ns > merged_end[-1]:
+        if (
+            not merged
+            or candidate.run_id != merged[-1][0].run_id
+            or candidate.first_ns > merged_last_ns[-1]
+        ):
             merged.append([candidate])
-            merged_end.append(candidate.last_ns)
+            merged_end_index.append(candidate.end_index)
+            merged_last_ns.append(candidate.last_ns)
         else:
             merged[-1].append(candidate)
-            merged_end[-1] = max(merged_end[-1], candidate.last_ns)
+            merged_end_index[-1] = max(merged_end_index[-1], candidate.end_index)
+            merged_last_ns[-1] = max(merged_last_ns[-1], candidate.last_ns)
     windows: list[AnnotationWindow] = []
     samples_by_window: dict[str, tuple[LogicalSampleAudit, ...]] = {}
-    for group in merged:
+    for group_index, group in enumerate(merged):
         lineage = sorted(group, key=lambda item: item.annotation.line_number)
         first_ns = min(item.first_ns for item in group)
         last_ns = max(item.last_ns for item in group)
-        grouped_samples = {
-            sample.grid_target_timestamp_ns: sample for item in group for sample in item.samples
-        }
-        ordered_samples = tuple(grouped_samples[key] for key in sorted(grouped_samples))
+        start_index = group[0].start_index
+        end_index = merged_end_index[group_index]
+        ordered_samples = index.materialize_run_range(group[0].run_id, start_index, end_index)
         annotation_tokens = tuple(item.annotation.token for item in lineage)
         labels = tuple(dict.fromkeys(label for item in lineage for label in item.annotation.labels))
         window_token = _token(
@@ -332,10 +349,81 @@ class _SceneCandidate:
     window_token: str = ""
 
 
-def _automatic_candidates(
-    runs: Iterable[Sequence[LogicalSampleAudit]], config: GlobalConfig
-) -> tuple[tuple[_SceneCandidate, ...], tuple[UnassignedSample, ...]]:
-    kept: list[_SceneCandidate] = []
+@dataclass(frozen=True)
+class _BuildSettings:
+    mode: str
+    min_duration_ns: int
+    max_duration_ns: int
+    min_samples: int
+    max_sample_gap_ns: int
+    skip_between_scenes_ns: int
+    annotation_match_tolerance_ns: int
+    annotation_before_ns: int
+    annotation_after_ns: int
+    annotation_window_merge_semantics: str = "same_run_overlap_or_touch_v1"
+
+    @classmethod
+    def from_config(cls, config: GlobalConfig) -> _BuildSettings:
+        return cls(
+            config.scenes.mode,
+            config.scenes.min_duration_ns,
+            config.scenes.max_duration_ns,
+            config.scenes.min_samples,
+            config.scenes.max_sample_gap_ns,
+            config.scenes.skip_between_scenes_ns,
+            config.annotations.match_tolerance_ns,
+            config.annotations.before_ns,
+            config.annotations.after_ns,
+        )
+
+    @classmethod
+    def from_result(cls, result: RecordingSceneResult) -> _BuildSettings:
+        return cls(
+            result.build_mode,
+            result.min_scene_duration_ns,
+            result.max_scene_duration_ns,
+            result.min_scene_samples,
+            result.max_sample_gap_ns,
+            result.inter_scene_skip_ns,
+            result.annotation_match_tolerance_ns,
+            result.annotation_before_ns,
+            result.annotation_after_ns,
+            result.annotation_window_merge_semantics,
+        )
+
+    def identity(self) -> list[object]:
+        return [
+            self.mode,
+            self.min_duration_ns,
+            self.max_duration_ns,
+            self.min_samples,
+            self.max_sample_gap_ns,
+            self.skip_between_scenes_ns,
+            self.annotation_match_tolerance_ns,
+            self.annotation_before_ns,
+            self.annotation_after_ns,
+            self.annotation_window_merge_semantics,
+        ]
+
+
+@dataclass(frozen=True)
+class _AutomaticPartition:
+    timestamps: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ExpectedScenePartition:
+    kind: str
+    timestamps: tuple[int, ...]
+    labels: tuple[str, ...] = ()
+    annotation_refs: tuple[str, ...] = ()
+    window_token: str = ""
+
+
+def _automatic_partition(
+    runs: Iterable[Sequence[int]], settings: _BuildSettings
+) -> tuple[tuple[_AutomaticPartition, ...], tuple[UnassignedSample, ...]]:
+    kept: list[_AutomaticPartition] = []
     unassigned: list[UnassignedSample] = []
     for run in runs:
         index = 0
@@ -344,12 +432,11 @@ def _automatic_candidates(
             if previous_kept_end is not None:
                 while (
                     index < len(run)
-                    and run[index].grid_target_timestamp_ns - previous_kept_end
-                    < config.scenes.skip_between_scenes_ns
+                    and run[index] - previous_kept_end < settings.skip_between_scenes_ns
                 ):
                     unassigned.append(
                         UnassignedSample(
-                            run[index].grid_target_timestamp_ns,
+                            run[index],
                             "inter_scene_skip",
                             "sample falls before the inclusive next-start boundary",
                         )
@@ -358,27 +445,20 @@ def _automatic_candidates(
                 if index == len(run):
                     break
             start = index
-            start_timestamp = run[start].grid_target_timestamp_ns
+            start_timestamp = run[start]
             index += 1
-            while (
-                index < len(run)
-                and run[index].grid_target_timestamp_ns - start_timestamp
-                <= config.scenes.max_duration_ns
-            ):
+            while index < len(run) and run[index] - start_timestamp <= settings.max_duration_ns:
                 index += 1
             candidate = tuple(run[start:index])
-            duration = candidate[-1].grid_target_timestamp_ns - start_timestamp
-            if (
-                duration >= config.scenes.min_duration_ns
-                and len(candidate) >= config.scenes.min_samples
-            ):
-                kept.append(_SceneCandidate("automatic", candidate))
-                previous_kept_end = candidate[-1].grid_target_timestamp_ns
+            duration = candidate[-1] - start_timestamp
+            if duration >= settings.min_duration_ns and len(candidate) >= settings.min_samples:
+                kept.append(_AutomaticPartition(candidate))
+                previous_kept_end = candidate[-1]
             else:
-                for sample in candidate:
+                for timestamp in candidate:
                     unassigned.append(
                         UnassignedSample(
-                            sample.grid_target_timestamp_ns,
+                            timestamp,
                             "candidate_too_short",
                             f"duration_ns={duration}, sample_count={len(candidate)}",
                         )
@@ -387,19 +467,19 @@ def _automatic_candidates(
 
 
 def _exclude_annotation_ranges(
-    runs: Sequence[Sequence[LogicalSampleAudit]], excluded: set[int]
-) -> tuple[tuple[LogicalSampleAudit, ...], ...]:
+    runs: Sequence[Sequence[int]], excluded: set[int]
+) -> tuple[tuple[int, ...], ...]:
     """Remove annotation samples while preserving each excluded range as a hard boundary."""
-    output: list[tuple[LogicalSampleAudit, ...]] = []
+    output: list[tuple[int, ...]] = []
     for run in runs:
-        current: list[LogicalSampleAudit] = []
-        for sample in run:
-            if sample.grid_target_timestamp_ns in excluded:
+        current: list[int] = []
+        for timestamp in run:
+            if timestamp in excluded:
                 if current:
                     output.append(tuple(current))
                     current = []
             else:
-                current.append(sample)
+                current.append(timestamp)
         if current:
             output.append(tuple(current))
     return tuple(output)
@@ -408,30 +488,29 @@ def _exclude_annotation_ranges(
 def _materialize(
     candidates: Sequence[_SceneCandidate],
     source: SourceFingerprint,
-    config: GlobalConfig,
+    settings: _BuildSettings,
+    namespace: UUID,
 ) -> tuple[tuple[SceneRecord, ...], tuple[SampleRecord, ...], tuple[SampleDataRecord, ...]]:
     scenes: list[SceneRecord] = []
     samples: list[SampleRecord] = []
     sample_data: list[SampleDataRecord] = []
     source_identity = source.to_dict()
-    settings = {
-        "min_duration_ns": config.scenes.min_duration_ns,
-        "max_duration_ns": config.scenes.max_duration_ns,
-        "min_samples": config.scenes.min_samples,
-        "max_sample_gap_ns": config.scenes.max_sample_gap_ns,
-        "skip_between_scenes_ns": config.scenes.skip_between_scenes_ns,
-    }
+    settings_identity = settings.identity()
     for ordinal, candidate in enumerate(candidates):
         logical_timestamps = tuple(item.grid_target_timestamp_ns for item in candidate.samples)
         scene_token = _token(
-            config.scenes.dataset_namespace,
+            namespace,
             "scene",
-            [source_identity, candidate.kind, candidate.window_token, logical_timestamps, settings],
+            [
+                source_identity,
+                candidate.kind,
+                candidate.window_token,
+                logical_timestamps,
+                settings_identity,
+            ],
         )
         scene_sample_tokens = tuple(
-            _token(
-                config.scenes.dataset_namespace, "sample", [source_identity, scene_token, timestamp]
-            )
+            _token(namespace, "sample", [source_identity, scene_token, timestamp])
             for timestamp in logical_timestamps
         )
         for index, (audit, sample_token) in enumerate(
@@ -456,7 +535,7 @@ def _materialize(
             channel_items = by_channel[channel]
             data_tokens = tuple(
                 _token(
-                    config.scenes.dataset_namespace,
+                    namespace,
                     "sample-data",
                     [
                         source_identity,
@@ -473,10 +552,7 @@ def _materialize(
             for data_index, ((sample_index, camera), data_token) in enumerate(
                 zip(channel_items, data_tokens, strict=True)
             ):
-                suffix = camera.staged_image.path.suffix.lower() or ".jpg"
-                relative = (
-                    PurePosixPath("samples") / source.digest / channel / f"{data_token}{suffix}"
-                )
+                relative = PurePosixPath("samples") / source.digest / channel / f"{data_token}.jpg"
                 if relative.is_absolute() or ".." in relative.parts:
                     raise StructuralExtractionError("sample_data filename is unsafe")
                 sample_data.append(
@@ -485,6 +561,8 @@ def _materialize(
                         scene_sample_tokens[sample_index],
                         scene_token,
                         channel,
+                        camera.camera_index,
+                        data_index,
                         camera.camera_timestamp_ns,
                         relative.as_posix(),
                         camera.staged_image,
@@ -523,8 +601,9 @@ def build_recording_scenes(
 ) -> RecordingSceneResult:
     """Build and validate one deterministic scene graph from final valid candidates only."""
     final_samples = _validate_input(report, source)
-    index = _SampleIndex.build(final_samples, config.scenes.max_sample_gap_ns)
-    runs = tuple(index.samples[start:end] for start, end in index.runs)
+    settings = _BuildSettings.from_config(config)
+    index = _SampleIndex.build(final_samples, settings.max_sample_gap_ns)
+    timestamp_runs = tuple(index.timestamps[start:end] for start, end in index.runs)
     path = config.annotations.path if annotations_path is None else annotations_path
     if not path.is_file():
         raise StructuralExtractionError(f"annotation JSONL is not a file: {path}")
@@ -562,11 +641,19 @@ def build_recording_scenes(
         )
     else:
         automatic_runs = (
-            runs
+            timestamp_runs
             if config.scenes.mode == "automatic"
-            else _exclude_annotation_ranges(runs, annotation_timestamps)
+            else _exclude_annotation_ranges(timestamp_runs, annotation_timestamps)
         )
-        automatic, automatic_unassigned = _automatic_candidates(automatic_runs, config)
+        automatic_partitions, automatic_unassigned = _automatic_partition(automatic_runs, settings)
+        audits_by_timestamp = {item.grid_target_timestamp_ns: item for item in final_samples}
+        automatic = tuple(
+            _SceneCandidate(
+                "automatic",
+                tuple(audits_by_timestamp[timestamp] for timestamp in partition.timestamps),
+            )
+            for partition in automatic_partitions
+        )
         unassigned.extend(automatic_unassigned)
         if config.scenes.mode == "hybrid":
             candidates = (*annotation_candidates, *automatic)
@@ -582,7 +669,9 @@ def build_recording_scenes(
             ),
         )
     )
-    scenes, samples, sample_data = _materialize(ordered_candidates, source, config)
+    scenes, samples, sample_data = _materialize(
+        ordered_candidates, source, settings, config.scenes.dataset_namespace
+    )
     source_samples = tuple(
         SourceSampleRecord(
             item.grid_target_timestamp_ns,
@@ -602,21 +691,20 @@ def build_recording_scenes(
         windows,
         tuple(sorted(unassigned, key=lambda item: item.timestamp_ns)),
         config.scenes.mode,
+        config.scenes.min_duration_ns,
+        config.scenes.max_duration_ns,
+        config.scenes.min_samples,
         config.annotations.match_tolerance_ns,
         config.annotations.before_ns,
         config.annotations.after_ns,
         config.scenes.max_sample_gap_ns,
+        config.scenes.skip_between_scenes_ns,
+        "same_run_overlap_or_touch_v1",
         config.scenes.dataset_namespace,
         _token(
             config.scenes.dataset_namespace,
             "scene-build-config",
-            [
-                config.scenes.mode,
-                config.annotations.match_tolerance_ns,
-                config.annotations.before_ns,
-                config.annotations.after_ns,
-                config.scenes.max_sample_gap_ns,
-            ],
+            settings.identity(),
         ),
     )
     validate_scene_graph(result)
@@ -680,12 +768,29 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
     ):
         raise StructuralExtractionError("source coverage timestamps are not strictly ordered")
     for source_record in result.source_samples:
-        if not source_record.expected_channels or len(source_record.expected_channels) != len(
-            set(source_record.expected_channels)
+        if not source_record.expected_channels or source_record.expected_channels != tuple(
+            sorted(set(source_record.expected_channels))
         ):
             raise StructuralExtractionError(
-                "source sample expected channel coverage is empty or duplicated"
+                "source sample expected channel coverage is empty, duplicated, or noncanonical"
             )
+    settings = _BuildSettings.from_result(result)
+    if (
+        settings.mode not in {"automatic", "annotation_only", "hybrid"}
+        or settings.min_duration_ns <= 0
+        or settings.max_duration_ns < settings.min_duration_ns
+        or settings.min_samples < 1
+        or min(
+            settings.max_sample_gap_ns,
+            settings.skip_between_scenes_ns,
+            settings.annotation_match_tolerance_ns,
+            settings.annotation_before_ns,
+            settings.annotation_after_ns,
+        )
+        < 0
+        or settings.annotation_window_merge_semantics != "same_run_overlap_or_touch_v1"
+    ):
+        raise StructuralExtractionError("scene graph build configuration is invalid")
     expected_run_id = 0
     for previous, current in zip(result.source_samples, result.source_samples[1:], strict=False):
         if current.timestamp_ns - previous.timestamp_ns > result.max_sample_gap_ns:
@@ -694,18 +799,22 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             raise StructuralExtractionError("source valid-run identity is inconsistent")
     if result.source_samples and result.source_samples[0].valid_run_id != 0:
         raise StructuralExtractionError("source valid-run identity is inconsistent")
+    source_run_lists: dict[int, list[int]] = defaultdict(list)
+    source_positions: dict[int, tuple[int, int]] = {}
+    for source_record in result.source_samples:
+        run_values = source_run_lists[source_record.valid_run_id]
+        source_positions[source_record.timestamp_ns] = (
+            source_record.valid_run_id,
+            len(run_values),
+        )
+        run_values.append(source_record.timestamp_ns)
+    source_runs = {run_id: tuple(values) for run_id, values in source_run_lists.items()}
     annotations = {item.token: item for item in result.annotations}
     windows = {item.token: item for item in result.annotation_windows}
     expected_config_token = _token(
         result.dataset_namespace,
         "scene-build-config",
-        [
-            result.build_mode,
-            result.annotation_match_tolerance_ns,
-            result.annotation_before_ns,
-            result.annotation_after_ns,
-            result.max_sample_gap_ns,
-        ],
+        settings.identity(),
     )
     if result.build_config_token != expected_config_token:
         raise StructuralExtractionError("scene graph build configuration is inconsistent")
@@ -757,17 +866,14 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         if actual_match != expected_match:
             raise StructuralExtractionError("annotation match decision is inconsistent")
 
-    expected_window_candidates: list[tuple[int, int, AnnotationRecord, tuple[int, ...]]] = []
+    expected_window_candidates: list[_WindowCandidate] = []
     for annotation in result.annotations:
         match = matches_by_annotation[annotation.token]
         if not match.matched:
             continue
         assert match.sample_timestamp_ns is not None
-        anchor_record = source_by_timestamp[match.sample_timestamp_ns]
-        run_id = anchor_record.valid_run_id
-        run_timestamps = tuple(
-            item.timestamp_ns for item in result.source_samples if item.valid_run_id == run_id
-        )
+        run_id, anchor_index = source_positions[match.sample_timestamp_ns]
+        run_timestamps = source_runs[run_id]
         requested_first = match.sample_timestamp_ns - result.annotation_before_ns
         requested_last = match.sample_timestamp_ns + result.annotation_after_ns
         first_ns = max(requested_first, run_timestamps[0])
@@ -775,30 +881,57 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         first_position = bisect_left(run_timestamps, first_ns)
         last_position = bisect_right(run_timestamps, last_ns)
         expected_window_candidates.append(
-            (first_ns, last_ns, annotation, run_timestamps[first_position:last_position])
+            _WindowCandidate(
+                annotation,
+                run_id,
+                first_position,
+                last_position,
+                first_ns,
+                last_ns,
+            )
         )
-    expected_window_candidates.sort(key=lambda item: (item[0], item[1], item[2].line_number))
-    expected_groups: list[list[tuple[int, int, AnnotationRecord, tuple[int, ...]]]] = []
-    expected_group_end: list[int] = []
+        if not (first_position <= anchor_index < last_position):
+            raise StructuralExtractionError("annotation match anchor is outside its window")
+    expected_window_candidates.sort(
+        key=lambda item: (
+            item.run_id,
+            item.start_index,
+            item.end_index,
+            item.annotation.line_number,
+        )
+    )
+    expected_groups: list[list[_WindowCandidate]] = []
+    expected_group_end_index: list[int] = []
+    expected_group_last_ns: list[int] = []
     for candidate in expected_window_candidates:
-        if not expected_groups or candidate[0] > expected_group_end[-1]:
+        if (
+            not expected_groups
+            or candidate.run_id != expected_groups[-1][0].run_id
+            or candidate.first_ns > expected_group_last_ns[-1]
+        ):
             expected_groups.append([candidate])
-            expected_group_end.append(candidate[1])
+            expected_group_end_index.append(candidate.end_index)
+            expected_group_last_ns.append(candidate.last_ns)
         else:
             expected_groups[-1].append(candidate)
-            expected_group_end[-1] = max(expected_group_end[-1], candidate[1])
+            expected_group_end_index[-1] = max(expected_group_end_index[-1], candidate.end_index)
+            expected_group_last_ns[-1] = max(expected_group_last_ns[-1], candidate.last_ns)
     if len(expected_groups) != len(result.annotation_windows):
         raise StructuralExtractionError("annotation window coverage is inconsistent")
     expected_samples_by_window: dict[str, tuple[int, ...]] = {}
-    for window, group in zip(result.annotation_windows, expected_groups, strict=True):
-        lineage = sorted(group, key=lambda item: item[2].line_number)
-        expected_tokens = tuple(item[2].token for item in lineage)
+    for group_index, (window, group) in enumerate(
+        zip(result.annotation_windows, expected_groups, strict=True)
+    ):
+        lineage = sorted(group, key=lambda item: item.annotation.line_number)
+        expected_tokens = tuple(item.annotation.token for item in lineage)
         expected_labels = tuple(
-            dict.fromkeys(label for item in lineage for label in item[2].labels)
+            dict.fromkeys(label for item in lineage for label in item.annotation.labels)
         )
-        sample_timestamps = tuple(sorted({timestamp for item in group for timestamp in item[3]}))
-        expected_first = min(item[0] for item in group)
-        expected_last = max(item[1] for item in group)
+        sample_timestamps = source_runs[group[0].run_id][
+            group[0].start_index : expected_group_end_index[group_index]
+        ]
+        expected_first = group[0].first_ns
+        expected_last = expected_group_last_ns[group_index]
         expected_window_token = _token(
             result.dataset_namespace,
             "annotation-window",
@@ -822,16 +955,95 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         ):
             raise StructuralExtractionError("annotation window derivation is inconsistent")
         expected_samples_by_window[window.token] = sample_timestamps
+
+    annotation_partitions = tuple(
+        _ExpectedScenePartition(
+            "annotation",
+            expected_samples_by_window[window.token],
+            window.labels,
+            window.annotation_tokens,
+            window.token,
+        )
+        for window in result.annotation_windows
+    )
+    annotation_timestamps = {
+        timestamp for partition in annotation_partitions for timestamp in partition.timestamps
+    }
+    timestamp_runs = tuple(source_runs[run_id] for run_id in sorted(source_runs))
+    if settings.mode == "annotation_only":
+        expected_partitions = annotation_partitions
+        expected_unassigned = tuple(
+            UnassignedSample(
+                timestamp,
+                "annotation_mode_excluded",
+                "valid sample is outside all matched annotation windows",
+            )
+            for timestamp in source_timestamps
+            if timestamp not in annotation_timestamps
+        )
+    else:
+        automatic_runs = (
+            timestamp_runs
+            if settings.mode == "automatic"
+            else _exclude_annotation_ranges(timestamp_runs, annotation_timestamps)
+        )
+        automatic_partitions, automatic_unassigned = _automatic_partition(automatic_runs, settings)
+        expected_automatic = tuple(
+            _ExpectedScenePartition("automatic", item.timestamps) for item in automatic_partitions
+        )
+        expected_partitions = (
+            (*annotation_partitions, *expected_automatic)
+            if settings.mode == "hybrid"
+            else expected_automatic
+        )
+        expected_unassigned = automatic_unassigned
+    expected_partitions = tuple(
+        sorted(
+            expected_partitions,
+            key=lambda item: (
+                item.timestamps[0],
+                0 if item.kind == "annotation" else 1,
+                item.window_token,
+            ),
+        )
+    )
+    if tuple(result.unassigned) != tuple(
+        sorted(expected_unassigned, key=lambda item: item.timestamp_ns)
+    ):
+        raise StructuralExtractionError("scene graph unassigned derivation is inconsistent")
+    if len(result.scenes) != len(expected_partitions):
+        raise StructuralExtractionError("scene graph partition count is inconsistent")
     samples_by_scene: dict[str, list[SampleRecord]] = defaultdict(list)
     for sample in result.samples:
         samples_by_scene[sample.scene_token].append(sample)
     for members in samples_by_scene.values():
         members.sort(key=lambda item: item.timestamp_ns)
-    for scene in result.scenes:
+    for expected_ordinal, (scene, expected_partition) in enumerate(
+        zip(result.scenes, expected_partitions, strict=True)
+    ):
         members = samples_by_scene.get(scene.token, [])
+        expected_scene_token = _token(
+            result.dataset_namespace,
+            "scene",
+            [
+                result.source.to_dict(),
+                expected_partition.kind,
+                expected_partition.window_token,
+                expected_partition.timestamps,
+                settings.identity(),
+            ],
+        )
         if (
-            len(members) != scene.nbr_samples
+            scene.token != expected_scene_token
+            or scene.name != f"{result.source.digest[:12]}-{expected_ordinal:06d}"
+            or scene.ordinal != expected_ordinal
+            or scene.kind != expected_partition.kind
+            or scene.labels != expected_partition.labels
+            or scene.annotation_refs != expected_partition.annotation_refs
+            or scene.annotation_window_ref != expected_partition.window_token
+            or len(members) != scene.nbr_samples
             or not members
+            or tuple(item.timestamp_ns for item in members) != expected_partition.timestamps
             or members[0].token != scene.first_sample_token
             or members[-1].token != scene.last_sample_token
             or members[0].timestamp_ns != scene.first_timestamp_ns
@@ -843,9 +1055,19 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         ):
             raise StructuralExtractionError("scene sample endpoints/count/order are inconsistent")
         for index, member in enumerate(members):
+            expected_sample_token = _token(
+                result.dataset_namespace,
+                "sample",
+                [result.source.to_dict(), scene.token, member.timestamp_ns],
+            )
             expected_prev = "" if index == 0 else members[index - 1].token
             expected_next = "" if index == len(members) - 1 else members[index + 1].token
-            if member.prev != expected_prev or member.next != expected_next:
+            if (
+                member.token != expected_sample_token
+                or member.grid_timestamp_ns != member.timestamp_ns
+                or member.prev != expected_prev
+                or member.next != expected_next
+            ):
                 raise StructuralExtractionError("sample chain has cross-scene or endpoint links")
         if any(reference not in annotations for reference in scene.annotation_refs):
             raise StructuralExtractionError("scene has a foreign annotation reference")
@@ -868,19 +1090,51 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
     _validate_chain(result.samples, "sample")
     data_groups: dict[tuple[str, str], list[SampleDataRecord]] = defaultdict(list)
     data_by_sample: dict[str, list[SampleDataRecord]] = defaultdict(list)
+    filenames: set[str] = set()
     for item in result.sample_data:
         try:
             validate_safe_segment(item.channel)
         except ValueError as error:
             raise StructuralExtractionError("sample_data channel is unsafe") from error
+        expected_data_token = _token(
+            result.dataset_namespace,
+            "sample-data",
+            [
+                result.source.to_dict(),
+                item.scene_token,
+                item.sample_token,
+                item.channel,
+                item.timestamp_ns,
+                item.camera_index,
+                item.channel_ordinal,
+            ],
+        )
+        expected_filename = (
+            PurePosixPath("samples")
+            / result.source.digest
+            / item.channel
+            / f"{expected_data_token}.jpg"
+        ).as_posix()
         filename = PurePosixPath(item.filename)
         if (
-            filename.is_absolute()
+            item.token != expected_data_token
+            or item.filename != expected_filename
+            or filename.is_absolute()
             or ".." in filename.parts
             or len(filename.parts) != 4
             or filename.parts[:3] != ("samples", result.source.digest, item.channel)
         ):
             raise StructuralExtractionError("sample_data filename is unsafe or inconsistent")
+        if item.filename in filenames:
+            raise StructuralExtractionError("sample_data filename is duplicated")
+        filenames.add(item.filename)
+        if (
+            item.staged_image.camera_name != item.channel
+            or item.staged_image.camera_index != item.camera_index
+            or item.staged_image.timestamp_ns != item.timestamp_ns
+            or item.staged_image.path.suffix.lower() != ".jpg"
+        ):
+            raise StructuralExtractionError("sample_data staged camera evidence is inconsistent")
         verify_staged_image_identity(item.staged_image)
         selected_sample = samples.get(item.sample_token)
         if selected_sample is None or selected_sample.scene_token != item.scene_token:
@@ -912,6 +1166,8 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
                 raise StructuralExtractionError(
                     "sample_data chain has cross-scene, cross-channel, or endpoint links"
                 )
+            if item.channel_ordinal != index:
+                raise StructuralExtractionError("sample_data channel ordinal is inconsistent")
         _validate_chain(data_group, "sample_data")
     for window in result.annotation_windows:
         if any(reference not in annotations for reference in window.annotation_tokens):

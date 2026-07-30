@@ -109,7 +109,7 @@ def parse_annotations(
     total_bytes = 0
     with path.open("rb") as stream:
         for line_number, raw_line in enumerate(
-            iter(lambda: stream.readline(budgets.max_line_bytes + 1), b""), 1
+            iter(lambda: stream.readline(budgets.max_line_bytes + 2), b""), 1
         ):
             total_bytes += len(raw_line)
             if total_bytes > budgets.max_total_bytes:
@@ -119,9 +119,7 @@ def parse_annotations(
             content = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
             if content.endswith(b"\r"):
                 content = content[:-1]
-            if len(content) > budgets.max_line_bytes or (
-                len(raw_line) > budgets.max_line_bytes and not raw_line.endswith(b"\n")
-            ):
+            if len(content) > budgets.max_line_bytes:
                 raise AnnotationFormatError(
                     f"annotation line bytes exceed budget at line {line_number}"
                 )

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
-from dataclasses import replace
+from collections.abc import Callable, Iterator
+from dataclasses import fields, replace
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -27,6 +27,7 @@ from dataset_devkit.extraction.models import (
 from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.extraction.staging import stage_jpeg
 from dataset_devkit.provenance import SourceFingerprint, canonical_json
+from dataset_devkit.scene_models import SourceSampleRecord
 from dataset_devkit.scenes import build_recording_scenes, validate_scene_graph
 from dataset_devkit.validity import (
     INVALIDITY_CODES,
@@ -124,7 +125,7 @@ def _config(base: GlobalConfig, **scene_changes: object) -> GlobalConfig:
                 update={
                     "mode": "automatic",
                     "dataset_namespace": UUID("8d55f58b-4a7b-5a9a-a95a-a3989610795b"),
-                    "min_duration_s": Decimal("0"),
+                    "min_duration_s": Decimal("0.000000001"),
                     "max_duration_s": Decimal("2"),
                     "min_samples": 1,
                     "max_sample_gap_ms": Decimal("1000"),
@@ -162,13 +163,16 @@ def test_gap_and_max_duration_equalities_stay_while_exceeding_values_split(
     tmp_path: Path, config_factory: Callable[[], GlobalConfig]
 ) -> None:
     config = _config(config_factory())
-    report = _report(tmp_path, (0, 1_000_000_000, 2_000_000_000, 3_000_000_001))
+    report = _report(
+        tmp_path,
+        (0, 1_000_000_000, 2_000_000_000, 3_000_000_001, 3_000_000_002),
+    )
 
     result = build_recording_scenes(report, SOURCE, config)
 
     assert [(scene.first_timestamp_ns, scene.last_timestamp_ns) for scene in result.scenes] == [
         (0, 2_000_000_000),
-        (3_000_000_001, 3_000_000_001),
+        (3_000_000_001, 3_000_000_002),
     ]
 
 
@@ -308,11 +312,13 @@ def test_ego_pose_interpolation_identity_is_verified_at_scene_boundary(
 def test_valid_multicamera_staged_identity_reaches_sample_data(
     tmp_path: Path, config_factory: Callable[[], GlobalConfig]
 ) -> None:
-    result = build_recording_scenes(_report(tmp_path, (0,)), SOURCE, _config(config_factory()))
+    result = build_recording_scenes(_report(tmp_path, (0, 1)), SOURCE, _config(config_factory()))
 
     assert [(item.channel, item.staged_image.path.name) for item in result.sample_data] == [
         ("front", "000000000-000-front-10.jpg"),
+        ("front", "000000001-000-front-11.jpg"),
         ("rear", "000000000-001-rear-20.jpg"),
+        ("rear", "000000001-001-rear-21.jpg"),
     ]
     assert all(item.calibration is not None for item in result.sample_data)
 
@@ -551,7 +557,7 @@ def test_annotation_only_and_automatic_have_explicit_opposite_coverage(
         update={
             "scenes": automatic.scenes.model_copy(
                 update={
-                    "min_duration_s": Decimal("0"),
+                    "min_duration_s": Decimal("0.000000001"),
                     "min_samples": 1,
                     "max_duration_s": Decimal("10"),
                     "max_sample_gap_ms": Decimal("1000"),
@@ -719,7 +725,7 @@ def test_graph_validator_seals_source_coverage_and_expected_camera_channels(
 
     original = result.sample_data[0]
     duplicate_channel = replace(original, token="00000000-0000-5000-8000-000000000001")
-    with pytest.raises(StructuralExtractionError, match="duplicate.*channel|coverage"):
+    with pytest.raises(StructuralExtractionError, match="duplicate.*channel|coverage|filename"):
         validate_scene_graph(replace(result, sample_data=(*result.sample_data, duplicate_channel)))
 
     extra_channel = replace(
@@ -735,7 +741,7 @@ def test_graph_validator_seals_source_coverage_and_expected_camera_channels(
     with pytest.raises(StructuralExtractionError, match="token collision"):
         validate_scene_graph(replace(result, sample_data=(*result.sample_data, original)))
 
-    with pytest.raises(StructuralExtractionError, match="coverage"):
+    with pytest.raises(StructuralExtractionError, match="coverage|unassigned derivation"):
         validate_scene_graph(replace(result, source_samples=result.source_samples[:-1]))
 
 
@@ -746,14 +752,16 @@ def test_graph_validator_rejects_duplicate_unassigned_timestamps(
     result = build_recording_scenes(_report(tmp_path, (0,)), SOURCE, config)
     assert len(result.unassigned) == 1
 
-    with pytest.raises(StructuralExtractionError, match="duplicate unassigned"):
+    with pytest.raises(
+        StructuralExtractionError, match="duplicate unassigned|unassigned derivation"
+    ):
         validate_scene_graph(replace(result, unassigned=(*result.unassigned, result.unassigned[0])))
 
 
 def test_scene_boundary_rejects_forged_unsafe_channel_and_filename(
     tmp_path: Path, config_factory: Callable[[], GlobalConfig]
 ) -> None:
-    result = build_recording_scenes(_report(tmp_path, (0,)), SOURCE, _config(config_factory()))
+    result = build_recording_scenes(_report(tmp_path, (0, 1)), SOURCE, _config(config_factory()))
     original = result.sample_data[0]
     with pytest.raises(StructuralExtractionError, match="channel"):
         validate_scene_graph(
@@ -830,3 +838,179 @@ def test_annotation_index_is_precomputed_and_large_matching_is_stable(
         parsed, SOURCE, index, config
     )
     assert len(records) == len(matches) == len(windows) == len(samples_by_window) == count
+
+
+def test_fully_overlapping_broad_windows_materialize_one_sample_tuple(
+    config_factory: Callable[[], GlobalConfig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    count = 4_000
+    audits = tuple(
+        LogicalSampleAudit(index * 10, index * 10, (), (), (), True) for index in range(count)
+    )
+    sample_index = scenes_module._SampleIndex.build(audits, 10)
+    parsed = tuple(
+        ParsedAnnotation(
+            line_number + 1,
+            SOURCE.blob_path,
+            line_number * 10,
+            (f"event-{line_number}",),
+        )
+        for line_number in range(count)
+    )
+    config = _annotation_config(
+        config_factory(),
+        mode="annotation_only",
+        tolerance_ms=0,
+        before_s=1,
+        after_s=1,
+    )
+    materializations = 0
+    original = scenes_module._SampleIndex.materialize_run_range
+
+    def counted(
+        index: scenes_module._SampleIndex,
+        run_id: int,
+        start_index: int,
+        end_index: int,
+    ) -> tuple[LogicalSampleAudit, ...]:
+        nonlocal materializations
+        materializations += 1
+        return original(index, run_id, start_index, end_index)
+
+    monkeypatch.setattr(scenes_module._SampleIndex, "materialize_run_range", counted)
+    _, matches, windows, samples_by_window = scenes_module._annotation_state(
+        parsed, SOURCE, sample_index, config
+    )
+
+    assert "samples" not in {field.name for field in fields(scenes_module._WindowCandidate)}
+    assert len(matches) == count
+    assert len(windows) == 1
+    assert len(samples_by_window[windows[0].token]) == count
+    assert materializations == 1
+
+
+def test_validator_preindexes_source_runs_once_for_thousands_of_annotations(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    annotation_count = 2_000
+    annotation_path = _annotations(
+        tmp_path / "many-overlapping.jsonl",
+        [
+            {
+                "blob_path": SOURCE.blob_path,
+                "timestamp_ns": 0,
+                "labels": [f"event-{index}"],
+            }
+            for index in range(annotation_count)
+        ],
+    )
+    config = _annotation_config(
+        config_factory(),
+        mode="annotation_only",
+        tolerance_ms=0,
+        before_s=1,
+        after_s=1,
+    )
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1)),
+        SOURCE,
+        config,
+        annotations_path=annotation_path,
+    )
+
+    class CountingSourceSamples(tuple[SourceSampleRecord, ...]):
+        yielded = 0
+
+        def __iter__(self) -> Iterator[SourceSampleRecord]:
+            for item in super().__iter__():
+                self.yielded += 1
+                yield item
+
+    counted = CountingSourceSamples(result.source_samples)
+    validate_scene_graph(replace(result, source_samples=counted))
+
+    assert len(result.annotations) == annotation_count
+    assert counted.yielded < 100
+
+
+def test_validator_seals_every_scene_build_setting(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+) -> None:
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1_000_000_000)), SOURCE, _config(config_factory())
+    )
+    mutations = (
+        replace(result, min_scene_duration_ns=2),
+        replace(result, max_scene_duration_ns=3_000_000_001),
+        replace(result, min_scene_samples=2),
+        replace(result, max_sample_gap_ns=2_000_000_000),
+        replace(result, inter_scene_skip_ns=1),
+        replace(result, build_mode="annotation_only"),
+        replace(result, annotation_window_merge_semantics="forged"),  # type: ignore[arg-type]
+        replace(result, build_config_token="forged"),
+    )
+    for mutation in mutations:
+        with pytest.raises(StructuralExtractionError, match="build configuration"):
+            validate_scene_graph(mutation)
+
+
+def test_validator_rejects_partition_order_kind_unassigned_and_graph_tokens(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _config(config_factory(), max_duration_s=1, max_sample_gap_ms=1000)
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1_000_000_000, 3_000_000_000, 4_000_000_000)),
+        SOURCE,
+        config,
+    )
+    assert len(result.scenes) == 2
+    mutations = (
+        replace(result, scenes=tuple(reversed(result.scenes))),
+        replace(result, scenes=(replace(result.scenes[0], kind="annotation"), *result.scenes[1:])),
+        replace(result, scenes=result.scenes[:-1]),
+        replace(result, samples=(replace(result.samples[0], token="forged"), *result.samples[1:])),
+    )
+    for mutation in mutations:
+        with pytest.raises(StructuralExtractionError):
+            validate_scene_graph(mutation)
+
+    short_config = _config(config_factory(), min_duration_s=1, min_samples=2)
+    short = build_recording_scenes(_report(tmp_path / "short", (0,)), SOURCE, short_config)
+    with pytest.raises(StructuralExtractionError, match="unassigned"):
+        validate_scene_graph(
+            replace(
+                short,
+                unassigned=(replace(short.unassigned[0], reason="inter_scene_skip"),),
+            )
+        )
+
+
+def test_sample_data_binds_channel_camera_timestamp_ordinal_token_and_filename(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    result = build_recording_scenes(_report(tmp_path, (0, 1)), SOURCE, _config(config_factory()))
+    front = result.sample_data[0]
+    rear = next(item for item in result.sample_data if item.channel == "rear")
+    mutations = (
+        replace(front, staged_image=rear.staged_image),
+        replace(front, staged_image=replace(front.staged_image, width=5)),
+        replace(
+            front,
+            staged_image=replace(front.staged_image, inode=(front.staged_image.inode or 0) + 1),
+        ),
+        replace(front, timestamp_ns=front.timestamp_ns + 1),
+        replace(front, camera_index=rear.camera_index),
+        replace(front, channel_ordinal=99),
+        replace(front, token="forged"),
+        replace(front, filename=rear.filename),
+    )
+    for mutated in mutations:
+        with pytest.raises(StructuralExtractionError):
+            validate_scene_graph(replace(result, sample_data=(mutated, *result.sample_data[1:])))
+
+    noncanonical = replace(result.source_samples[0], expected_channels=("rear", "front"))
+    with pytest.raises(StructuralExtractionError, match="noncanonical"):
+        validate_scene_graph(
+            replace(result, source_samples=(noncanonical, *result.source_samples[1:]))
+        )

@@ -125,6 +125,28 @@ def test_annotation_stream_total_line_and_record_budgets_are_inclusive(
             parse_annotations(path, budgets=budgets)
 
 
+@pytest.mark.parametrize("terminator", [b"\n", b"\r\n"])
+def test_annotation_line_budget_excludes_lf_or_crlf_terminator_consistently(
+    tmp_path: Path, terminator: bytes
+) -> None:
+    payload = b'{"blob_path":"mcap-h265/a.mcap","timestamp_ns":1,"labels":["x"]}'
+    path = tmp_path / "annotations.jsonl"
+    path.write_bytes(payload + terminator)
+
+    assert parse_annotations(
+        path,
+        budgets=AnnotationBudgets(
+            max_total_bytes=len(payload) + len(terminator),
+            max_line_bytes=len(payload),
+        ),
+    )
+    with pytest.raises(AnnotationFormatError, match="line bytes"):
+        parse_annotations(
+            path,
+            budgets=AnnotationBudgets(max_line_bytes=len(payload) - 1),
+        )
+
+
 def test_annotation_label_and_string_budgets_enforce_bytes_and_characters(
     tmp_path: Path,
 ) -> None:

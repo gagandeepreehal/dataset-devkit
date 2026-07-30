@@ -91,6 +91,8 @@ class SampleDataRecord:
     sample_token: str
     scene_token: str
     channel: str
+    camera_index: int
+    channel_ordinal: int
     timestamp_ns: int
     filename: str
     staged_image: StagedImage
@@ -131,10 +133,15 @@ class RecordingSceneResult:
     annotation_windows: tuple[AnnotationWindow, ...]
     unassigned: tuple[UnassignedSample, ...]
     build_mode: Literal["automatic", "annotation_only", "hybrid"]
+    min_scene_duration_ns: int
+    max_scene_duration_ns: int
+    min_scene_samples: int
     annotation_match_tolerance_ns: int
     annotation_before_ns: int
     annotation_after_ns: int
     max_sample_gap_ns: int
+    inter_scene_skip_ns: int
+    annotation_window_merge_semantics: Literal["same_run_overlap_or_touch_v1"]
     dataset_namespace: UUID
     build_config_token: str
 

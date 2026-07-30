@@ -53,10 +53,12 @@ float, or string). `labels` is a nonempty array of unique, trimmed, nonblank str
 duplicate JSON keys and duplicate `(blob_path, timestamp_ns, labels)` records are line-numbered
 errors.
 
-Parsing is binary streaming and never loads the complete file. Stable inclusive defaults bound the
-file to 64 MiB, each physical line to 256 KiB, records to 250,000, labels per record to 256, each
-label to 256 Unicode characters/1,024 UTF-8 bytes, and each blob path to 2,048 characters/4,096
-bytes. Exceeding any bound is a line-numbered format error.
+Parsing is binary streaming and never loads the complete file. Stable inclusive defaults bound
+the file to 64 MiB, each physical line payload to 256 KiB, records to 250,000, labels per record
+to 256, each label to 256 Unicode characters/1,024 UTF-8 bytes, and each blob path to 2,048
+characters/4,096 bytes. The line limit excludes either an LF or CRLF terminator consistently; the
+total-file limit includes every terminator byte. Exceeding any bound is a line-numbered format
+error.
 
 Every parsed record receives an audit. Records for another exact blob are
 `different_recording`. For the current blob, matching uses the nearest final valid logical
@@ -89,12 +91,22 @@ path and the relevant kind, configuration, timestamps, annotation/window identit
 channel, and real camera timestamp/ordinal. They never include wall time, Python `hash()`, random
 UUIDs, local directories, or mapping iteration order.
 
+The result persists the complete immutable build contract: mode, minimum/maximum duration in
+nanoseconds, minimum samples, valid-run gap, inter-scene skip, annotation tolerance/before/after,
+namespace, and the versioned same-run overlap-or-touch merge rule. The build-config UUID and every
+scene UUID bind all of those values. Validation re-runs the shared pure automatic partitioner over
+the source timestamps (and hybrid annotation exclusions), then requires the exact scene order,
+kind, partition, skip/short leftovers, and annotation-only exclusions.
+
 Each scene records endpoints/count, timestamps, source, kind, human labels, annotation references,
 and (for annotation scenes) its merged-window reference. Logical samples have symmetric
 `prev`/`next` links within their one scene. Each
 camera channel has a separate within-scene sample-data chain; its timestamp is the camera's real
 timestamp, not the logical grid time. Sample data preserves the deterministic export filename,
-staged image, calibration, and ego-pose reference. Chains never cross scenes. Human labels remain
+staged image, calibration, and ego-pose reference. Each record also carries its camera index and
+within-channel ordinal. Its UUID and exact `samples/<source-digest>/<channel>/<uuid>.jpg` POSIX
+filename are recomputed during validation, and the staged camera name/index/timestamp must match
+the record exactly. Filenames are globally unique. Chains never cross scenes. Human labels remain
 separate; Task 6 computed tags are not present.
 
 Every graph embeds immutable `source_samples` records derived from Task 4 final candidates. Each
