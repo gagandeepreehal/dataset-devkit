@@ -75,7 +75,8 @@ See [selection.md](docs/selection.md) for real-timestamp trajectory features, co
 filtering, and deterministic exact-quota scenario rules.
 
 See [export.md](docs/export.md) for the official nuScenes table layout, exact timestamp and image
-copy rules, extension tables, exporter evidence boundary, and Dataset SDK methods.
+copy rules, loader-required non-semantic map compatibility scaffold, extension tables, exporter
+evidence boundary, and Dataset SDK methods.
 
 ## Scene-level train/test split
 

@@ -47,7 +47,7 @@ OFFICIAL_TABLES = (
     "map",
 )
 _EMPTY_TABLES = frozenset(
-    {"category", "attribute", "visibility", "instance", "sample_annotation", "map"}
+    {"category", "attribute", "visibility", "instance", "sample_annotation"}
 )
 
 
@@ -230,6 +230,11 @@ def _read_verified_jpeg(staged: StagedImage) -> tuple[bytes, str]:
 
 def _write_json(path: Path, value: object) -> bytes:
     content = (canonical_json(value) + "\n").encode("utf-8")
+    _write_bytes(path, content)
+    return content
+
+
+def _write_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -242,7 +247,12 @@ def _write_json(path: Path, value: object) -> bytes:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    return content
+
+
+def _compatibility_mask() -> bytes:
+    stream = BytesIO()
+    Image.new("L", (1, 1), 0).save(stream, format="PNG", optimize=False)
+    return stream.getvalue()
 
 
 def _copy_image(root: Path, relative: str, staged: StagedImage) -> str:
@@ -623,6 +633,17 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
     annotation_scene_refs.sort(key=lambda item: str(item["scene_token"]))
 
     tables: dict[str, object] = {name: [] for name in _EMPTY_TABLES}
+    compatibility_mask_filename = "maps/dataset-devkit-loader-compatibility.png"
+    compatibility_map = {
+        "token": _token(
+            namespace,
+            "loader-compatibility-map",
+            sorted(log_by_source.values()),
+        ),
+        "log_tokens": sorted(log_by_source.values()),
+        "category": "compatibility_scaffold",
+        "filename": compatibility_mask_filename,
+    }
     tables.update(
         sensor=sensors,
         calibrated_sensor=calibrations,
@@ -631,7 +652,9 @@ def export_dataset(staging_dataroot: str | Path, evidence: ExportEvidence) -> Ex
         scene=official_scenes,
         sample=official_samples,
         sample_data=official_data,
+        map=[compatibility_map],
     )
+    _write_bytes(root / compatibility_mask_filename, _compatibility_mask())
     version_dir = root / NUSCENES_VERSION
     for name in OFFICIAL_TABLES:
         _write_json(version_dir / f"{name}.json", tables[name])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -27,17 +28,23 @@ def _load_json(path: Path) -> object:
         raise DatasetFormatError(f"malformed or missing JSON file: {path}") from error
 
 
-def _safe_filename(value: object) -> str:
+def _safe_asset_filename(
+    value: object, *, directory: str, part_count: int, label: str
+) -> str:
     if not isinstance(value, str):
-        raise DatasetFormatError("sample_data filename must be a string")
+        raise DatasetFormatError(f"{label} filename must be a string")
     path = PurePosixPath(value)
-    if path.is_absolute() or len(path.parts) != 3 or path.parts[0] != "samples":
-        raise DatasetFormatError("unsafe sample_data filename")
+    if (
+        path.is_absolute()
+        or len(path.parts) != part_count
+        or path.parts[0] != directory
+    ):
+        raise DatasetFormatError(f"unsafe {label} filename")
     try:
         for part in path.parts:
             validate_safe_segment(part)
     except ValueError as error:
-        raise DatasetFormatError("unsafe sample_data filename") from error
+        raise DatasetFormatError(f"unsafe {label} filename") from error
     return value
 
 
@@ -80,7 +87,21 @@ class Dataset:
                     raise DatasetFormatError(f"table {name} contains duplicate token {token}")
                 index[token] = record
                 if name == "sample_data":
-                    _safe_filename(record.get("filename"))
+                    _safe_asset_filename(
+                        record.get("filename"),
+                        directory="samples",
+                        part_count=3,
+                        label="sample_data",
+                    )
+                elif name == "map":
+                    filename = _safe_asset_filename(
+                        record.get("filename"),
+                        directory="maps",
+                        part_count=2,
+                        label="map",
+                    )
+                    if not (root / filename).is_file():
+                        raise DatasetFormatError("map compatibility mask is missing")
             tables[name] = records
             indexes[name] = MappingProxyType(index)
         extensions: dict[str, object] = {}
@@ -103,7 +124,7 @@ class Dataset:
     def table(self, table_name: str) -> tuple[JsonRecord, ...]:
         """Return one official table in deterministic file order."""
         try:
-            return self._tables[table_name]
+            return deepcopy(self._tables[table_name])
         except KeyError as error:
             raise DatasetFormatError(f"unknown table {table_name!r}") from error
 
@@ -114,7 +135,7 @@ class Dataset:
         except KeyError as error:
             raise DatasetFormatError(f"unknown table {table_name!r}") from error
         try:
-            return table[token]
+            return deepcopy(table[token])
         except KeyError as error:
             raise DatasetFormatError(f"missing token {token!r} in table {table_name}") from error
 
@@ -195,7 +216,7 @@ class Dataset:
         ]
         if len(matches) != 1:
             raise DatasetFormatError(f"extension {name} has missing or duplicate scene entry")
-        return cast(JsonRecord, matches[0])
+        return deepcopy(cast(JsonRecord, matches[0]))
 
     def validity(self, scene_token: str) -> JsonRecord:
         """Return validity and source-audit evidence for one scene."""
@@ -217,7 +238,103 @@ class Dataset:
         ]
         if len(matches) != 1:
             raise DatasetFormatError("annotations extension has missing or duplicate scene entry")
-        return cast(JsonRecord, matches[0])
+        return deepcopy(cast(JsonRecord, matches[0]))
+
+    def _annotation_collection(self, name: str, token_field: str) -> tuple[JsonRecord, ...]:
+        value = self._extensions["annotations"]
+        if not isinstance(value, dict) or not isinstance(value.get(name), list):
+            raise DatasetFormatError(f"annotations {name} collection is malformed")
+        records = value[name]
+        if any(not isinstance(item, dict) for item in records):
+            raise DatasetFormatError(f"annotations {name} collection is malformed")
+        typed = cast(list[JsonRecord], records)
+        tokens = [item.get(token_field) for item in typed]
+        if any(not isinstance(token, str) or not token for token in tokens):
+            raise DatasetFormatError(f"annotations {name} contains an invalid reference token")
+        if len(tokens) != len(set(tokens)):
+            raise DatasetFormatError(f"annotations {name} contains duplicate reference tokens")
+        return deepcopy(tuple(typed))
+
+    def annotation_records(self) -> tuple[JsonRecord, ...]:
+        """Return all selected human annotation records."""
+        return self._annotation_collection("records", "token")
+
+    def annotation_matches(self) -> tuple[JsonRecord, ...]:
+        """Return all selected annotation-to-sample match decisions."""
+        return self._annotation_collection("matches", "annotation_token")
+
+    def annotation_windows(self) -> tuple[JsonRecord, ...]:
+        """Return all selected annotation windows."""
+        return self._annotation_collection("windows", "token")
+
+    def annotation_scene_references(self) -> tuple[JsonRecord, ...]:
+        """Return scene summaries that keep human labels separate from computed tags."""
+        value = self._extensions["annotations"]
+        if not isinstance(value, dict) or not isinstance(value.get("scenes"), list):
+            raise DatasetFormatError("annotation scene references are malformed")
+        records = value["scenes"]
+        if any(not isinstance(item, dict) for item in records):
+            raise DatasetFormatError("annotation scene references are malformed")
+        return deepcopy(cast(tuple[JsonRecord, ...], tuple(records)))
+
+    @staticmethod
+    def _one_annotation(
+        records: tuple[JsonRecord, ...], field_name: str, token: str, label: str
+    ) -> JsonRecord:
+        matches = [item for item in records if item.get(field_name) == token]
+        if not matches:
+            raise DatasetFormatError(f"missing {label} {token!r}")
+        if len(matches) > 1:
+            raise DatasetFormatError(f"duplicate {label} {token!r}")
+        return deepcopy(matches[0])
+
+    def annotation_record(self, token: str) -> JsonRecord:
+        """Resolve one annotation record token."""
+        return self._one_annotation(self.annotation_records(), "token", token, "annotation record")
+
+    def annotation_match(self, annotation_token: str) -> JsonRecord:
+        """Resolve the match decision for one annotation token."""
+        return self._one_annotation(
+            self.annotation_matches(),
+            "annotation_token",
+            annotation_token,
+            "annotation match",
+        )
+
+    def annotation_window(self, token: str) -> JsonRecord:
+        """Resolve one annotation window token."""
+        return self._one_annotation(self.annotation_windows(), "token", token, "annotation window")
+
+    def scene_annotation_evidence(self, scene_token: str) -> JsonRecord:
+        """Resolve a scene summary to its records, matches, and optional window."""
+        summary = self.annotations(scene_token)
+        references = summary.get("annotation_refs")
+        window_reference = summary.get("annotation_window_ref")
+        if not isinstance(references, list) or any(
+            not isinstance(token, str) for token in references
+        ):
+            raise DatasetFormatError("scene annotation record references are malformed")
+        if not isinstance(window_reference, str):
+            raise DatasetFormatError("scene annotation window reference is malformed")
+        records = [self.annotation_record(token) for token in references]
+        matches = [self.annotation_match(token) for token in references]
+        windows = [self.annotation_window(window_reference)] if window_reference else []
+        if windows:
+            window_tokens = windows[0].get("annotation_tokens")
+            if not isinstance(window_tokens, list) or any(
+                not isinstance(token, str) for token in window_tokens
+            ):
+                raise DatasetFormatError("annotation window record references are malformed")
+            for token in window_tokens:
+                self.annotation_record(token)
+        return deepcopy(
+            {
+                "scene": summary,
+                "records": records,
+                "matches": matches,
+                "windows": windows,
+            }
+        )
 
     def _split_records(self) -> list[JsonRecord]:
         value = self._extensions["split"]
@@ -251,11 +368,11 @@ class Dataset:
         value = self._extensions["recordings"]
         if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
             raise DatasetFormatError("recordings extension is malformed")
-        return cast(tuple[JsonRecord, ...], tuple(value))
+        return deepcopy(cast(tuple[JsonRecord, ...], tuple(value)))
 
     def validation_report(self) -> JsonRecord:
         """Return the truthful validation state/report extension."""
         value = self._extensions["validation"]
         if not isinstance(value, dict):
             raise DatasetFormatError("validation extension is malformed")
-        return cast(JsonRecord, value)
+        return deepcopy(cast(JsonRecord, value))

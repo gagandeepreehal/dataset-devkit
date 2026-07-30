@@ -12,8 +12,14 @@ The exporter writes all tables expected by the official nuScenes loader under
 `v1.0-trainval`: `category`, `attribute`, `visibility`, `instance`, `sensor`,
 `calibrated_sensor`, `ego_pose`, `log`, `scene`, `sample`, `sample_data`,
 `sample_annotation`, and `map`. Camera-backed tables contain real selected evidence. Unsupported
-object, lidar, radar, and map tables are valid empty JSON arrays; human labels are never converted
-into fabricated object annotations.
+object, lidar, and radar tables are valid empty JSON arrays; human labels are never converted into
+fabricated object annotations.
+
+nuScenes-devkit 1.2.0 unconditionally dereferences `map[0]` while constructing its reverse index,
+even for camera-only datasets. The exporter therefore writes exactly one prominently identified
+`compatibility_scaffold` map record, associates every real log token with it, and writes a
+deterministic 1-by-1 black grayscale PNG under `maps/`. This is only an upstream-loader
+compatibility scaffold: it contains and claims no semantic map, object, lidar, or radar data.
 
 Source camera names are normalized to safe deterministic `CAM_*` channels. Distinct source names
 that normalize to the same channel are rejected, and the original-to-normalized mapping is kept
@@ -44,8 +50,12 @@ duplicate tokens. Its stable methods are:
 - `scene_samples(scene_token)` with cycle, endpoint, scene, and count checks;
 - `camera(sample_token, "CAM_*")` and `ego_pose(sample_data_token)`;
 - `validity(scene_token)`, `tags(scene_token)`, and `annotations(scene_token)`;
+- `annotation_records()`, `annotation_matches()`, `annotation_windows()`,
+  `annotation_scene_references()`, individual annotation resolvers, and
+  `scene_annotation_evidence(scene_token)`;
 - `split(scene_token)` and `scenes_in_split("train" | "test")`;
 - `recordings()` and `validation_report()`.
 
 Camera lookup requires exactly one row for the requested sample/channel and rejects missing or
-ambiguous evidence.
+ambiguous evidence. Every returned table, record, traversal, or extension value is a defensive
+deep copy, so caller mutation cannot alter cached indexes or subsequent queries.
