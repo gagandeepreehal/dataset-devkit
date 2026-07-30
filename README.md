@@ -57,10 +57,15 @@ exact guarantees and deployment requirements for untrusted writers.
 The secure cache backend is supported on POSIX platforms only. It requires POSIX file locks and
 descriptor-relative, no-follow filesystem operations; Windows is not a supported runtime.
 Verified extraction generations are immutable cache evidence, never mutable build staging. Every
-reuse copies JPEGs into a fresh per-build directory below `paths.work_dir`; concurrent builds
-therefore receive independent inodes. Owned working trees are removed after export has copied the
-images, and on safe failure paths, while artifacts explicitly reported as preserved quarantine
-evidence remain in place.
+reuse verifies and streams JPEGs one at a time into a fresh per-build directory below
+`paths.work_dir`; concurrent builds therefore receive independent inodes without retaining the
+generation's aggregate image payload in memory. The cache's status/store APIs expose only
+non-executable metadata; only explicit materialization returns extraction evidence, and all paths
+in that result belong to the fresh working invocation. Owned working trees are removed after
+export has copied the images, and on safe failure paths. Cleanup uses closed identity records, so
+the registry does not retain descriptors per recording; a cleanup that cannot revalidate the
+recorded path/device/inode blocks publication and leaves evidence for operator recovery. Artifacts
+explicitly reported as preserved quarantine evidence also remain in place.
 
 ## Azure acquisition
 

@@ -14,7 +14,6 @@ from contextlib import contextmanager, suppress
 from ctypes import CDLL, c_char_p, c_int, get_errno
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
-from typing import Any, cast
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -35,6 +34,31 @@ _Identity = tuple[int, int]
 
 def _identity(value: os.stat_result) -> _Identity:
     return value.st_dev, value.st_ino
+
+
+@dataclass(frozen=True)
+class CacheStoreResult:
+    """Non-executable metadata describing a completed cache store."""
+
+    path: Path
+    created: bool
+    refreshed: bool
+    image_count: int
+
+
+@dataclass(frozen=True)
+class _CachedImage:
+    path: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _CachedGeneration:
+    result: RecordingExtractionResult
+    images: tuple[_CachedImage, ...]
+    generation_identity: _Identity
+    images_identity: _Identity
 
 
 @dataclass
@@ -276,6 +300,137 @@ def _read_owned_at(directory_fd: int, relative: str) -> tuple[bytes, os.stat_res
         os.close(current_fd)
 
 
+def _open_owned_at(directory_fd: int, relative: str) -> tuple[int, os.stat_result]:
+    """Open a pinned, single-link regular cache artifact below ``directory_fd``."""
+    parts = relative.split("/")
+    if not parts or any(not part or part in {".", ".."} for part in parts):
+        raise ValueError("cache artifact path is unsafe")
+    current_fd = os.dup(directory_fd)
+    try:
+        for component in parts[:-1]:
+            child_fd, _ = _open_child_directory(current_fd, component, create=False)
+            os.close(current_fd)
+            current_fd = child_fd
+        descriptor = os.open(parts[-1], os.O_RDONLY | _NOFOLLOW, dir_fd=current_fd)
+        try:
+            opened = os.fstat(descriptor)
+            listed = os.stat(parts[-1], dir_fd=current_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or _identity(opened) != _identity(listed)
+            ):
+                raise ValueError(
+                    "cache artifact must be an owned single-link regular file"
+                )
+        except Exception:
+            os.close(descriptor)
+            raise
+        return descriptor, opened
+    finally:
+        os.close(current_fd)
+
+
+def _verify_streamed_source(
+    descriptor: int,
+    before: os.stat_result,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    destination_fd: int | None = None,
+) -> tuple[os.stat_result, str]:
+    """Verify one source artifact while optionally streaming it to a destination FD."""
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
+        if destination_fd is not None:
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_fd, chunk[offset:])
+                if written <= 0:
+                    raise OSError("short cache materialization write")
+                offset += written
+    after = os.fstat(descriptor)
+    if (
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        _identity(before),
+    ) != (
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        _identity(after),
+    ):
+        raise ValueError("cache artifact changed while streaming")
+    actual_sha256 = digest.hexdigest()
+    if size != expected_size or actual_sha256 != expected_sha256:
+        raise ValueError("cache image differs from its manifest")
+    return after, actual_sha256
+
+
+def _verify_image_at(
+    generation_fd: int, image: _CachedImage
+) -> os.stat_result:
+    descriptor, before = _open_owned_at(generation_fd, image.path)
+    try:
+        current, _ = _verify_streamed_source(
+            descriptor,
+            before,
+            expected_size=image.size,
+            expected_sha256=image.sha256,
+        )
+        return current
+    finally:
+        os.close(descriptor)
+
+
+def _copy_verified_image_at(
+    generation_fd: int,
+    image: _CachedImage,
+    destination_directory_fd: int,
+    destination_name: str,
+) -> os.stat_result:
+    """Stream one verified cache image into a new, exclusively owned file."""
+    source_fd, before = _open_owned_at(generation_fd, image.path)
+    destination_fd = -1
+    destination_identity: _Identity | None = None
+    try:
+        destination_fd = os.open(
+            destination_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+            0o600,
+            dir_fd=destination_directory_fd,
+        )
+        destination_identity = _identity(os.fstat(destination_fd))
+        _verify_streamed_source(
+            source_fd,
+            before,
+            expected_size=image.size,
+            expected_sha256=image.sha256,
+            destination_fd=destination_fd,
+        )
+        os.fsync(destination_fd)
+        return os.fstat(destination_fd)
+    except Exception:
+        if destination_identity is not None:
+            with suppress(OSError):
+                listed = os.stat(
+                    destination_name,
+                    dir_fd=destination_directory_fd,
+                    follow_symlinks=False,
+                )
+                if _identity(listed) == destination_identity:
+                    os.unlink(destination_name, dir_fd=destination_directory_fd)
+        raise
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        os.close(source_fd)
+
+
 def _regular_names_fd(directory_fd: int, prefix: str = "") -> list[str]:
     names: list[str] = []
     for name in sorted(os.listdir(directory_fd)):
@@ -378,15 +533,16 @@ class ExtractionResultCache:
     ) -> tuple[int, _Identity]:
         return _open_child_directory(lease.root_fd, source.digest, create=create)
 
-    def _load_pinned(
+    def _inspect_pinned(
         self,
         lease: _CacheRootLease,
         source_fd: int,
         source_identity: _Identity,
         source: SourceFingerprint,
         config_hash: str,
-        source_path: Path,
-    ) -> RecordingExtractionResult | None:
+        *,
+        verify_images: bool,
+    ) -> _CachedGeneration | None:
         generation_fd = -1
         try:
             generation_fd, generation_identity = _open_child_directory(
@@ -408,7 +564,7 @@ class ExtractionResultCache:
             ):
                 return None
             expected_names = ["manifest.json", "result.json"]
-            image_stats: list[os.stat_result] = []
+            cached_images: list[_CachedImage] = []
             for index, item in enumerate(images):
                 if not isinstance(item, dict):
                     return None
@@ -416,14 +572,18 @@ class ExtractionResultCache:
                 expected_relative = f"images/{index:08d}.jpg"
                 if relative != expected_relative:
                     return None
-                content, current = _read_owned_at(generation_fd, expected_relative)
+                size = item.get("size")
+                digest = item.get("sha256")
                 if (
-                    item.get("size") != len(content)
-                    or item.get("sha256") != hashlib.sha256(content).hexdigest()
+                    not isinstance(size, int)
+                    or size < 0
+                    or not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
                 ):
                     return None
                 expected_names.append(expected_relative)
-                image_stats.append(current)
+                cached_images.append(_CachedImage(expected_relative, size, digest))
             if names != sorted(expected_names):
                 return None
             result = _ADAPTER.validate_python(json.loads(result_bytes))
@@ -433,45 +593,17 @@ class ExtractionResultCache:
                 generation_fd, "images", create=False
             )
             os.close(images_fd)
-            image_root = self.path_for(source, config_hash) / "images"
-            directory_chain = (
-                *lease.identities,
-                source_identity,
-                generation_identity,
-                images_identity,
-            )
-            samples = []
-            for index, (sample, current) in enumerate(
-                zip(result.samples, image_stats, strict=True)
-            ):
-                filename = f"{index:08d}.jpg"
-                item = cast(dict[str, Any], images[index])
-                samples.append(
-                    replace(
-                        sample,
-                        staged_image=replace(
-                            sample.staged_image,
-                            path=image_root / filename,
-                            device=current.st_dev,
-                            inode=current.st_ino,
-                            size=current.st_size,
-                            sha256=cast(str, item["sha256"]),
-                            invocation_root=image_root,
-                            root_relative_path=filename,
-                            directory_device=images_identity[0],
-                            directory_inode=images_identity[1],
-                            directory_chain_identities=directory_chain,
-                        ),
-                    )
-                )
+            if verify_images:
+                for image in cached_images:
+                    _verify_image_at(generation_fd, image)
             lease.assert_bound()
             _assert_child_bound(lease.root_fd, source.digest, source_identity)
             _assert_child_bound(source_fd, config_hash, generation_identity)
-            return replace(
-                result,
-                source_path=source_path.absolute(),
-                staging_root=image_root,
-                samples=tuple(samples),
+            return _CachedGeneration(
+                result=result,
+                images=tuple(cached_images),
+                generation_identity=generation_identity,
+                images_identity=images_identity,
             )
         except (
             OSError,
@@ -487,27 +619,31 @@ class ExtractionResultCache:
             if generation_fd >= 0:
                 os.close(generation_fd)
 
-    def load(
-        self,
-        source: SourceFingerprint,
-        config_hash: str,
-        source_path: Path,
-    ) -> RecordingExtractionResult | None:
+    def contains(self, source: SourceFingerprint, config_hash: str) -> bool:
+        """Return whether a complete generation verifies without exposing its evidence."""
         self.path_for(source, config_hash)
         try:
             lease = _CacheRootLease.open(self.cache_dir, create=False)
             try:
                 source_fd, source_identity = self._open_source(lease, source, create=False)
                 try:
-                    return self._load_pinned(
-                        lease, source_fd, source_identity, source, config_hash, source_path
+                    return (
+                        self._inspect_pinned(
+                            lease,
+                            source_fd,
+                            source_identity,
+                            source,
+                            config_hash,
+                            verify_images=True,
+                        )
+                        is not None
                     )
                 finally:
                     os.close(source_fd)
             finally:
                 lease.close()
         except (OSError, ValueError):
-            return None
+            return False
 
     def materialize(
         self,
@@ -519,18 +655,19 @@ class ExtractionResultCache:
     ) -> RecordingExtractionResult | None:
         """Copy a verified immutable generation into a unique caller-owned invocation."""
         self.path_for(source, config_hash)
+        invocation = None
         try:
             lease = _CacheRootLease.open(self.cache_dir, create=False)
             try:
                 source_fd, source_identity = self._open_source(lease, source, create=False)
                 try:
-                    cached = self._load_pinned(
+                    cached = self._inspect_pinned(
                         lease,
                         source_fd,
                         source_identity,
                         source,
                         config_hash,
-                        source_path,
+                        verify_images=False,
                     )
                     if cached is None:
                         return None
@@ -538,17 +675,22 @@ class ExtractionResultCache:
                         source_fd, config_hash, create=False
                     )
                     try:
-                        contents: list[bytes] = []
-                        for index, sample in enumerate(cached.samples):
-                            content, _ = _read_owned_at(
-                                generation_fd, f"images/{index:08d}.jpg"
-                            )
-                            if (
-                                sample.staged_image.sha256
-                                != hashlib.sha256(content).hexdigest()
-                            ):
-                                raise ValueError("cache image changed before materialization")
-                            contents.append(content)
+                        if generation_identity != cached.generation_identity:
+                            raise ValueError("cache generation changed before materialization")
+                        invocation = create_staging_invocation(working_root, recording_id)
+                        destination_fd = os.open(invocation.path, _DIRECTORY_FLAGS)
+                        try:
+                            for index, image in enumerate(cached.images):
+                                filename = f"{index:08d}.jpg"
+                                current = _copy_verified_image_at(
+                                    generation_fd,
+                                    image,
+                                    destination_fd,
+                                    filename,
+                                )
+                                invocation.owned_files[filename] = _identity(current)
+                        finally:
+                            os.close(destination_fd)
                         lease.assert_bound()
                         _assert_child_bound(lease.root_fd, source.digest, source_identity)
                         _assert_child_bound(source_fd, config_hash, generation_identity)
@@ -559,20 +701,17 @@ class ExtractionResultCache:
             finally:
                 lease.close()
         except (OSError, ValueError):
+            if invocation is not None:
+                rollback_staging_invocation(invocation)
             return None
-        invocation = create_staging_invocation(working_root, recording_id)
         try:
-            for index, content in enumerate(contents):
-                filename = f"{index:08d}.jpg"
-                directory_fd = os.open(invocation.path, _DIRECTORY_FLAGS)
-                try:
-                    current = _write_owned_at(directory_fd, filename, content)
-                finally:
-                    os.close(directory_fd)
-                invocation.owned_files[filename] = _identity(current)
+            if invocation is None:
+                raise RuntimeError("cache materialization invocation was not created")
             directory_device, directory_inode, chain = staged_directory_metadata(invocation.path)
             samples = []
-            for index, sample in enumerate(cached.samples):
+            for index, (sample, image) in enumerate(
+                zip(cached.result.samples, cached.images, strict=True)
+            ):
                 filename = f"{index:08d}.jpg"
                 path = invocation.path / filename
                 current = path.stat()
@@ -584,6 +723,8 @@ class ExtractionResultCache:
                             path=path,
                             device=current.st_dev,
                             inode=current.st_ino,
+                            size=image.size,
+                            sha256=image.sha256,
                             invocation_root=invocation.path,
                             root_relative_path=filename,
                             directory_device=directory_device,
@@ -592,7 +733,12 @@ class ExtractionResultCache:
                         ),
                     )
                 )
-            return replace(cached, staging_root=invocation.path, samples=tuple(samples))
+            return replace(
+                cached.result,
+                source_path=source_path.absolute(),
+                staging_root=invocation.path,
+                samples=tuple(samples),
+            )
         except Exception:
             rollback_staging_invocation(invocation)
             raise
@@ -604,7 +750,7 @@ class ExtractionResultCache:
         result: RecordingExtractionResult,
         *,
         force_refresh: bool = False,
-    ) -> RecordingExtractionResult:
+    ) -> CacheStoreResult:
         self.path_for(source, config_hash)
         lease = _CacheRootLease.open(self.cache_dir, create=True)
         try:
@@ -613,16 +759,21 @@ class ExtractionResultCache:
                 with _cache_lock(source_fd, f".{config_hash}.lock"):
                     lease.assert_bound()
                     _assert_child_bound(lease.root_fd, source.digest, source_identity)
-                    cached = self._load_pinned(
+                    cached = self._inspect_pinned(
                         lease,
                         source_fd,
                         source_identity,
                         source,
                         config_hash,
-                        result.source_path,
+                        verify_images=True,
                     )
                     if cached is not None and not force_refresh:
-                        return cached
+                        return CacheStoreResult(
+                            path=self.path_for(source, config_hash),
+                            created=False,
+                            refreshed=False,
+                            image_count=len(cached.images),
+                        )
                     return self._store_locked(
                         lease, source_fd, source_identity, source, config_hash, result
                     )
@@ -639,7 +790,7 @@ class ExtractionResultCache:
         source: SourceFingerprint,
         config_hash: str,
         result: RecordingExtractionResult,
-    ) -> RecordingExtractionResult:
+    ) -> CacheStoreResult:
         try:
             existing = os.stat(config_hash, dir_fd=source_fd, follow_symlinks=False)
             if not stat.S_ISDIR(existing.st_mode):
@@ -718,17 +869,22 @@ class ExtractionResultCache:
                 )
             published = True
             lease.assert_bound()
-            loaded = self._load_pinned(
+            loaded = self._inspect_pinned(
                 lease,
                 source_fd,
                 source_identity,
                 source,
                 config_hash,
-                result.source_path,
+                verify_images=True,
             )
             if loaded is None:
                 raise ValueError("stored extraction result did not revalidate")
-            return loaded
+            return CacheStoreResult(
+                path=self.path_for(source, config_hash),
+                created=existing_identity is None,
+                refreshed=existing_identity is not None,
+                image_count=len(loaded.images),
+            )
         finally:
             try:
                 if not published:

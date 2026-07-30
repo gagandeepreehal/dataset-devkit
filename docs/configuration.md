@@ -158,14 +158,22 @@ generation are opened through retained directory descriptors with no-follow chec
 revalidation. A symbolic-link component or directory-replacement race fails closed; cache writes
 cannot be redirected outside `paths.cache_dir`.
 
-Published extraction generations are immutable evidence. A cache hit verifies the generation and
-copies each JPEG into a unique invocation below `paths.work_dir`, with fresh ownership metadata;
-it never returns a cache path to validity or scene processing. A cache miss likewise keeps the
-extractor's invocation as the build-owned working result while storing a separate cache copy.
-After dataset export has copied all selected images, the pipeline removes its exact pinned working
-trees. It also performs bounded cleanup after cache-store, completion-marker, staging, export, or
-validation failures. Same-name replacements are never removed. Only working artifacts whose
-durable quarantine report says `preserved_in_place` intentionally survive cleanup.
+Published extraction generations are immutable evidence. `ExtractionResultCache.contains()`
+fully verifies a generation but returns status only, and `store()` returns only `CacheStoreResult`
+metadata; neither API exposes a cache-backed `RecordingExtractionResult`. A cache hit through
+`materialize()` verifies and streams one JPEG at a time into a unique invocation below
+`paths.work_dir`, with fresh ownership metadata and memory bounded independently of the aggregate
+generation size. It never returns a cache path to validity or scene processing, and a partial
+stream is rolled back. A cache miss likewise keeps the extractor's invocation as the build-owned
+working result while storing a separate cache copy.
+After dataset export has copied all selected images, the pipeline reopens and removes its exact
+identity-recorded working trees. The registry stores closed path, ancestor, device, and inode
+authority rather than retaining descriptors per recording. It also performs bounded cleanup after
+cache-store, completion-marker, staging, export, or validation failures. Same-name replacements
+are never removed. Any cleanup that cannot revalidate and remove an owned tree raises a structured
+error and blocks publication; per-recording quarantine records report the tree as
+`preserved_in_place` with its expected path/device/inode and original failure cause. Only such
+preserved evidence intentionally survives cleanup.
 
 ## Managed-identity smoke check
 

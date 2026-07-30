@@ -37,7 +37,13 @@ from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.features import SceneFeatures, compute_recording_features
 from dataset_devkit.filtering import filter_scenes
 from dataset_devkit.provenance import SourceFingerprint, canonical_hash, extraction_config_hash
-from dataset_devkit.publication import PinnedDirectoryLease, StagingLease, publish_staging
+from dataset_devkit.publication import (
+    OwnedDirectoryAuthority,
+    OwnedDirectoryCleanupError,
+    OwnedDirectoryCleanupFailure,
+    StagingLease,
+    publish_staging,
+)
 from dataset_devkit.quarantine import write_rejection_manifest
 from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scenes import build_recording_scenes
@@ -120,42 +126,54 @@ class _WorkingExtractionRegistry:
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._leases: dict[str, PinnedDirectoryLease] = {}
+        self._authorities: dict[str, OwnedDirectoryAuthority] = {}
 
     def register(self, recording_id: str, result: RecordingExtractionResult) -> None:
-        lease = PinnedDirectoryLease.capture(result.staging_root)
+        authority = OwnedDirectoryAuthority.capture(result.staging_root)
         with self._lock:
-            previous = self._leases.get(recording_id)
+            previous = self._authorities.get(recording_id)
             if previous is not None:
-                lease.close()
                 raise ValueError(f"duplicate working extraction: {recording_id}")
-            self._leases[recording_id] = lease
+            self._authorities[recording_id] = authority
+
+    @staticmethod
+    def _failure(authority: OwnedDirectoryAuthority) -> OwnedDirectoryCleanupFailure:
+        return OwnedDirectoryCleanupFailure(
+            authority.root,
+            authority.root_identity[0],
+            authority.root_identity[1],
+        )
 
     def cleanup(self, recording_id: str) -> None:
         with self._lock:
-            lease = self._leases.pop(recording_id, None)
-        if lease is not None:
-            try:
-                lease.cleanup()
-            finally:
-                lease.close()
+            authority = self._authorities.get(recording_id)
+        if authority is None:
+            return
+        if not authority.cleanup():
+            raise OwnedDirectoryCleanupError((self._failure(authority),))
+        with self._lock:
+            self._authorities.pop(recording_id, None)
 
     def preserve(self, recording_id: str) -> None:
         """Release cleanup authority for an intentionally quarantined tree."""
         with self._lock:
-            lease = self._leases.pop(recording_id, None)
-        if lease is not None:
-            lease.close()
+            self._authorities.pop(recording_id, None)
 
     def cleanup_all(self) -> None:
         with self._lock:
-            leases = tuple(self._leases.values())
-            self._leases.clear()
-        for lease in leases:
-            try:
-                lease.cleanup()
-            finally:
-                lease.close()
+            authorities = tuple(self._authorities.items())
+        failures: list[OwnedDirectoryCleanupFailure] = []
+        cleaned: list[str] = []
+        for recording_id, authority in authorities:
+            if authority.cleanup():
+                cleaned.append(recording_id)
+            else:
+                failures.append(self._failure(authority))
+        with self._lock:
+            for recording_id in cleaned:
+                self._authorities.pop(recording_id, None)
+        if failures:
+            raise OwnedDirectoryCleanupError(tuple(failures))
 
 
 def _build_evidence(
@@ -164,8 +182,11 @@ def _build_evidence(
     working = _WorkingExtractionRegistry()
     try:
         evidence, failures = _build_evidence_owned(config, runtime, working)
-    except Exception:
-        working.cleanup_all()
+    except Exception as error:
+        try:
+            working.cleanup_all()
+        except OwnedDirectoryCleanupError as staging_cleanup_error:
+            raise staging_cleanup_error from error
         raise
     return evidence, failures, working
 
@@ -241,8 +262,11 @@ def _build_evidence_owned(
                 force_refresh=True,
             )
             acquirer.record_extraction_complete(source, extraction_hash)
-        except Exception:
-            working.cleanup(recording_id)
+        except Exception as error:
+            try:
+                working.cleanup(recording_id)
+            except OwnedDirectoryCleanupError as cleanup_error:
+                raise cleanup_error from error
             raise
         return extracted
 
@@ -495,8 +519,11 @@ def build_dataset(config: GlobalConfig, *, runtime: BuildRuntime | None = None) 
     evidence, failures, working = _build_evidence(config, selected_runtime)
     try:
         lease = StagingLease.create(output, f".{config.publication.version}.staging-")
-    except Exception:
-        working.cleanup_all()
+    except Exception as error:
+        try:
+            working.cleanup_all()
+        except OwnedDirectoryCleanupError as cleanup_error:
+            raise cleanup_error from error
         raise
     staging = lease.root
     try:
@@ -515,9 +542,16 @@ def build_dataset(config: GlobalConfig, *, runtime: BuildRuntime | None = None) 
             final,
             expected_content_hash=report.content_hash,
         )
-    except Exception:
-        working.cleanup_all()
+    except Exception as error:
+        working_cleanup_failure: OwnedDirectoryCleanupError | None = None
+        if not isinstance(error, OwnedDirectoryCleanupError):
+            try:
+                working.cleanup_all()
+            except OwnedDirectoryCleanupError as caught_cleanup_error:
+                working_cleanup_failure = caught_cleanup_error
         lease.cleanup()
+        if working_cleanup_failure is not None:
+            raise working_cleanup_failure from error
         raise
     finally:
         lease.close()

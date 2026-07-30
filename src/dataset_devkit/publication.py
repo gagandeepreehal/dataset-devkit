@@ -166,63 +166,108 @@ class StagingLease:
             self._closed = True
 
 
-@dataclass
-class PinnedDirectoryLease:
-    """Retained inode authority for bounded cleanup of an existing owned directory."""
+@dataclass(frozen=True)
+class OwnedDirectoryAuthority:
+    """Closed identity authority used to reopen one owned directory for cleanup."""
 
     root: Path
+    parent: Path
     name: str
-    _parent_fd: int
-    _root_fd: int
+    parent_chain: tuple[tuple[int, int], ...]
+    parent_identity: tuple[int, int]
     root_identity: tuple[int, int]
-    _closed: bool = False
 
     @classmethod
-    def capture(cls, root: str | Path) -> PinnedDirectoryLease:
+    def capture(cls, root: str | Path) -> OwnedDirectoryAuthority:
         absolute = Path(root).absolute()
-        parent_fd, _ = _open_directory_chain(absolute.parent, create=False)
+        parent_fd, chain = _open_directory_chain(absolute.parent, create=False)
         try:
             root_fd = os.open(absolute.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
-            opened = os.fstat(root_fd)
-            listed = os.stat(
-                absolute.name, dir_fd=parent_fd, follow_symlinks=False
-            )
-            if (
-                not stat.S_ISDIR(opened.st_mode)
-                or not stat.S_ISDIR(listed.st_mode)
-                or _identity(opened) != _identity(listed)
-            ):
+            try:
+                opened = os.fstat(root_fd)
+                listed = os.stat(
+                    absolute.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(listed.st_mode)
+                    or _identity(opened) != _identity(listed)
+                ):
+                    raise ValueError("owned directory identity changed during capture")
+                return cls(
+                    absolute,
+                    absolute.parent,
+                    absolute.name,
+                    chain,
+                    _identity(os.fstat(parent_fd)),
+                    _identity(opened),
+                )
+            finally:
                 os.close(root_fd)
-                raise ValueError("owned directory identity changed during capture")
-            return cls(
-                absolute,
-                absolute.name,
-                parent_fd,
-                root_fd,
-                _identity(opened),
-            )
-        except Exception:
+        finally:
             os.close(parent_fd)
-            raise
 
     def cleanup(self) -> bool:
-        if self._closed:
-            return False
         try:
-            return cleanup_pinned_directory(
-                self._parent_fd,
-                self.name,
-                self._root_fd,
-                self.root_identity,
-            )
+            parent_fd, chain = _open_directory_chain(self.parent, create=False)
         except (OSError, ValueError):
             return False
+        try:
+            if (
+                chain != self.parent_chain
+                or _identity(os.fstat(parent_fd)) != self.parent_identity
+            ):
+                return False
+            try:
+                root_fd = os.open(self.name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            except OSError:
+                return False
+            try:
+                listed = os.stat(self.name, dir_fd=parent_fd, follow_symlinks=False)
+                opened = os.fstat(root_fd)
+                if (
+                    not stat.S_ISDIR(listed.st_mode)
+                    or _identity(listed) != self.root_identity
+                    or _identity(opened) != self.root_identity
+                ):
+                    return False
+                return cleanup_pinned_directory(
+                    parent_fd,
+                    self.name,
+                    root_fd,
+                    self.root_identity,
+                )
+            finally:
+                os.close(root_fd)
+        except (OSError, ValueError):
+            return False
+        finally:
+            os.close(parent_fd)
 
-    def close(self) -> None:
-        if not self._closed:
-            os.close(self._root_fd)
-            os.close(self._parent_fd)
-            self._closed = True
+
+@dataclass(frozen=True)
+class OwnedDirectoryCleanupFailure:
+    """Identity evidence for one owned working tree that could not be removed."""
+
+    path: Path
+    expected_device: int
+    expected_inode: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": str(self.path),
+            "expected_device": self.expected_device,
+            "expected_inode": self.expected_inode,
+        }
+
+
+class OwnedDirectoryCleanupError(RuntimeError):
+    """One or more owned working trees could not be safely cleaned."""
+
+    def __init__(self, failures: tuple[OwnedDirectoryCleanupFailure, ...]) -> None:
+        self.failures = failures
+        paths = ", ".join(str(item.path) for item in failures)
+        super().__init__(f"owned working-tree cleanup failed: {paths}")
 
 
 def _hash_directory_fd(

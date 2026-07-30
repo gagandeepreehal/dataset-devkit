@@ -25,6 +25,7 @@ from dataset_devkit.extraction.staging import (
     TombstoneRecord,
     owned_tombstone_record_matches,
 )
+from dataset_devkit.publication import OwnedDirectoryCleanupError
 from dataset_devkit.quarantine import (
     FailureCategory,
     QuarantineArtifact,
@@ -159,6 +160,8 @@ def _has_owned_artifacts(
     extraction: RecordingExtractionResult | None,
     error: Exception,
 ) -> bool:
+    if isinstance(error, OwnedDirectoryCleanupError) and error.failures:
+        return True
     if isinstance(error, StagedImageCleanupError) and any(
         owned_tombstone_record_matches(record) for record in error.tombstones
     ):
@@ -261,6 +264,15 @@ class RecordingCoordinator:
             source_details["owned_tombstones"] = tuple(
                 _tombstone_details(record) for record in error.tombstones
             )
+        if isinstance(error, OwnedDirectoryCleanupError):
+            source_details["owned_working_trees"] = tuple(
+                item.to_dict() for item in error.failures
+            )
+            if error.__cause__ is not None:
+                source_details["cleanup_original_cause"] = {
+                    "exception_type": type(error.__cause__).__name__,
+                    "exception_message": _safe_exception_message(error.__cause__),
+                }
         artifact: QuarantineArtifact | None = None
         quarantine_error: QuarantinePersistenceFailure | None = None
         try:

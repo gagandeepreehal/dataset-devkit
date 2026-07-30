@@ -8,6 +8,8 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -15,12 +17,15 @@ import dataset_devkit.publication as publication
 from conftest import FeatureFactory
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.export import export_dataset
+from dataset_devkit.extraction.models import RecordingExtractionResult
 from dataset_devkit.publication import (
-    PinnedDirectoryLease,
+    OwnedDirectoryAuthority,
+    OwnedDirectoryCleanupError,
     StagingLease,
     hash_regular_files_fd,
     publish_staging,
 )
+from dataset_devkit.services import _WorkingExtractionRegistry
 from dataset_devkit.validation import DatasetValidationError, finalize_dataset
 from test_export_dataset import _evidence
 
@@ -74,25 +79,78 @@ def test_staging_lease_cleanup_never_removes_same_name_replacement(
         lease.close()
 
 
-def test_pinned_directory_cleanup_never_removes_same_name_replacement(
+def test_owned_directory_cleanup_never_removes_same_name_replacement(
     tmp_path: Path,
 ) -> None:
     owned = tmp_path / "owned"
     owned.mkdir()
     (owned / "payload").write_bytes(b"owned")
-    lease = PinnedDirectoryLease.capture(owned)
+    authority = OwnedDirectoryAuthority.capture(owned)
     displaced = tmp_path / "displaced"
     owned.rename(displaced)
     owned.mkdir()
     sentinel = owned / "keep"
     sentinel.write_bytes(b"unrelated")
 
+    assert not authority.cleanup()
+    assert sentinel.read_bytes() == b"unrelated"
+    assert (displaced / "payload").read_bytes() == b"owned"
+
+
+def test_working_registry_uses_bounded_descriptors_for_many_recordings(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(resource, "RLIMIT_NOFILE"):
+        pytest.skip("platform has no RLIMIT_NOFILE")
+    registry = _WorkingExtractionRegistry()
+    roots = []
+    original_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    soft, hard = original_limit
+    limited_soft = 64 if soft == resource.RLIM_INFINITY else min(soft, 64)
+    if limited_soft < 16:
+        pytest.skip("existing file-descriptor limit is too low")
     try:
-        assert not lease.cleanup()
-        assert sentinel.read_bytes() == b"unrelated"
-        assert tuple(displaced.iterdir()) == ()
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limited_soft, hard))
+        for index in range(110):
+            root = tmp_path / f"working-{index:03d}"
+            root.mkdir()
+            (root / "payload").write_bytes(b"owned")
+            roots.append(root)
+            result = cast(
+                RecordingExtractionResult,
+                SimpleNamespace(staging_root=root),
+            )
+            registry.register(f"recording-{index:06d}", result)
+        registry.cleanup_all()
     finally:
-        lease.close()
+        resource.setrlimit(resource.RLIMIT_NOFILE, original_limit)
+
+    assert all(not root.exists() for root in roots)
+
+
+def test_working_registry_surfaces_cleanup_failure_and_preserves_replacement(
+    tmp_path: Path,
+) -> None:
+    registry = _WorkingExtractionRegistry()
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    (owned / "payload").write_bytes(b"owned")
+    registry.register(
+        "recording-000000",
+        cast(RecordingExtractionResult, SimpleNamespace(staging_root=owned)),
+    )
+    displaced = tmp_path / "displaced"
+    owned.rename(displaced)
+    owned.mkdir()
+    sentinel = owned / "keep"
+    sentinel.write_bytes(b"unrelated")
+
+    with pytest.raises(OwnedDirectoryCleanupError) as captured:
+        registry.cleanup_all()
+
+    assert captured.value.failures[0].path == owned
+    assert sentinel.read_bytes() == b"unrelated"
+    assert (displaced / "payload").read_bytes() == b"owned"
 
 
 def test_displaced_validated_staging_replacement_is_never_published(
