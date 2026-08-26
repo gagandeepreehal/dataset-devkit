@@ -1,126 +1,170 @@
 # dataset-devkit
 
-`dataset-devkit` is a Python 3.12 package for building deterministic robotics datasets directly
-from MCAP recordings in a Hugging Face dataset repository. A commit-pinned repository manifest
-is the single input contract. Native MCAP/protobuf extraction, persistent HEVC decode, deterministic camera
-selection, GNSS interpolation, and verified JPEG staging are a separate focused service. Typed
-validity/sanity policy, safe quarantine reports, independent-recording partial-export gating,
-deterministic automatic/annotation/hybrid scene graphs, real-timestamp features and tags,
-exact-quota scenario selection, and auditable scene-level train/test splitting are implemented.
-Deterministic nuScenes export, comprehensive validation, an indexed read-only Dataset SDK,
-content manifests, and no-overwrite atomic publication are implemented as one standalone pipeline.
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+![Status: Alpha](https://img.shields.io/badge/status-alpha-orange)
+![Platform: POSIX](https://img.shields.io/badge/platform-POSIX-lightgrey)
 
-## Install for development
+Build deterministic, nuScenes-compatible robotics datasets directly from MCAP recordings stored
+in a Hugging Face dataset repository.
 
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e '.[dev]'
+`dataset-devkit` pins every build to an immutable repository commit, verifies every recording by
+size and SHA-256, extracts synchronized camera and GNSS data, constructs scenes, and publishes a
+validated dataset through an atomic, no-overwrite workflow.
+
+> [!IMPORTANT]
+> This project is in alpha. Its configuration and output contracts are strict by design, but the
+> public API may still evolve before a stable release.
+
+## Highlights
+
+- **Reproducible inputs** — one Hugging Face dataset repository, one full commit SHA, and one
+  ordered manifest define the complete source corpus.
+- **Verified acquisition** — downloaded MCAPs are checked against their declared byte size and
+  SHA-256 before entering the trusted local cache.
+- **Native extraction** — protobuf camera and GNSS messages are read directly from MCAP, with
+  persistent HEVC decoding, deterministic frame selection, and GNSS interpolation.
+- **Auditable quality controls** — validity rules, sanity policies, quarantine reports, filtering,
+  scenario quotas, and train/test assignment produce explicit evidence.
+- **Safe publication** — the nuScenes-compatible output is validated before one atomic rename;
+  existing datasets are never overwritten.
+- **Read-only SDK** — inspect published tables, scenes, samples, camera records, and ego poses from
+  Python.
+
+## Pipeline
+
+```text
+Hugging Face dataset repository
+        │
+        ▼
+Pinned manifest → verified MCAP cache → camera/GNSS extraction → validity and scenes
+        │
+        ▼
+Features and scenarios → scene-level split → nuScenes export → validation → atomic publication
 ```
 
-Copy the example files, then validate their paths and policies in code:
+## Quickstart
+
+### Requirements
+
+- Python 3.12 or newer
+- A POSIX environment such as Linux or macOS
+- Access to a Hugging Face dataset repository containing the expected MCAP schema
+
+Windows is not supported because the cache and publication safety model relies on POSIX file
+locks and no-follow, descriptor-relative filesystem operations.
+
+### Install from source
+
+```bash
+git clone https://github.com/gagandeepreehal/dataset-devkit.git
+cd dataset-devkit
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+For a private Hugging Face repository, authenticate through the standard client before building:
+
+```bash
+hf auth login
+```
+
+Tokens are read by `huggingface_hub`; they do not belong in the dataset configuration.
+
+### Build the example
 
 ```bash
 cp examples/dataset_config.json dataset_config.json
 cp examples/annotations.jsonl annotations.jsonl
-python -c 'from pathlib import Path; from dataset_devkit.config import load_config; print(load_config(Path("dataset_config.json")))'
+
+dataset-devkit build --config dataset_config.json
 ```
 
-The stable command contracts are:
+The example configuration is pinned to a real immutable commit of
+`gagandeepreehal/minuszero-indian-autonomous-driving-monocam`. Adjust its source, topics, camera
+requirements, scene rules, and output paths for your dataset.
+
+## Source contract
+
+The configuration identifies exactly one Hugging Face dataset repository:
+
+```json
+{
+  "huggingface": {
+    "repo_id": "owner/dataset",
+    "revision": "b13c3bd3a049c73b560910ef5dbc60cbd28c441b",
+    "manifest_path": "manifest.jsonl"
+  }
+}
+```
+
+The revision must be a full lowercase 40-character commit SHA. Branches and tags are rejected so
+the same configuration always identifies the same repository snapshot.
+
+The repository manifest is UTF-8 JSONL with one MCAP per row:
+
+```json
+{"repo_path":"data/2025-04-11/run.mcap","source_size":30883381,"sha256":"4af1b3aaa2db2f146c0ace8d1d339678640852181307980e7c918b107491ea96"}
+```
+
+Each row requires:
+
+| Field | Contract |
+| --- | --- |
+| `repo_path` | Normalized repository path below `data/`, ending in `.mcap` |
+| `source_size` | Positive byte size as a JSON integer |
+| `sha256` | Lowercase 64-character SHA-256 digest |
+
+Manifest order is build order. Duplicate or unsafe paths, malformed hashes, invalid sizes, and an
+empty manifest fail before recording processing begins.
+
+See [Configuration](docs/configuration.md) for the complete typed configuration contract.
+
+## Command-line interface
 
 ```bash
+# Build and atomically publish a dataset
 dataset-devkit build --config dataset_config.json
+
+# Validate an existing publication
 dataset-devkit validate --dataroot DATASET --version v1.0-trainval
+
+# Print a compact dataset summary
 dataset-devkit inspect --dataroot DATASET --version v1.0-trainval
 ```
 
-Each command prints one concise deterministic JSON object to stdout. Configuration/usage failures
-exit 2; operational or validation failures exit 1 with one safe stderr diagnostic and no normal
-traceback. A successful build publishes at `paths.output_dir/v1.0-trainval`; the dataroot itself
-contains the `v1.0-trainval/`, `samples/`, `maps/`, and `mz_extensions/` children.
-If identity-safe working-tree cleanup fails, the CLI emits only
-`dataset-devkit: error: owned working-tree cleanup failed; manual cleanup required`; local paths
-and identity evidence remain available through the structured Python exception, but are not
-printed at the command boundary. Per-recording failures also retain that evidence in their
-quarantine reports; post-export or global cleanup failures may have no per-recording quarantine
-report.
+Every command prints one deterministic JSON object to standard output. Configuration and usage
+errors exit with status `2`; operational and validation failures exit with status `1` and a safe,
+concise diagnostic.
 
-Builds run in a uniquely named sibling `.v1.0-trainval.staging-*` directory. Tables, assets,
-extensions, official-SDK smoke loading, and the final manifest are validated before one atomic
-rename. Existing final dataroots are never overwritten. An invocation-owned staging directory is
-removed after an ordinary failure; if identity-safe cleanup cannot be proven, it is deliberately
-left for operator recovery instead of deleting an ambiguous path.
+## Published dataset
 
-Published dataroots are read-only artifacts: use `validate`, `inspect`, or the read-only `Dataset`
-SDK, and rebuild into an absent destination instead of editing a published tree. Publication
-detects accidental or cooperative concurrent mutation and identity/path substitution, but it is
-not an isolation boundary against a non-cooperating process running as the same user. See the
-[publication threat model](docs/export.md#publication-threat-model-and-read-only-contract) for the
-exact guarantees and deployment requirements for untrusted writers.
+A successful build publishes the following structure below `paths.output_dir`:
 
-The secure cache backend is supported on POSIX platforms only. It requires POSIX file locks and
-descriptor-relative, no-follow filesystem operations; Windows is not a supported runtime.
-Verified extraction generations are immutable cache evidence, never mutable build staging. Every
-reuse verifies and streams JPEGs one at a time into a fresh per-build directory below
-`paths.work_dir`; concurrent builds therefore receive independent inodes without retaining the
-generation's aggregate image payload in memory. The cache's status/store APIs expose only
-non-executable metadata; only explicit materialization returns extraction evidence, and all paths
-in that result belong to the fresh working invocation. Owned working trees are removed after
-export has copied the images, and on safe failure paths. Cleanup uses closed identity records, so
-the registry does not retain descriptors per recording; a cleanup that cannot revalidate the
-recorded path/device/inode blocks publication and leaves evidence for operator recovery. Artifacts
-explicitly reported as preserved quarantine evidence also remain in place.
+```text
+v1.0-trainval/
+├── maps/
+├── mz_extensions/
+├── samples/
+└── v1.0-trainval/
+    ├── calibrated_sensor.json
+    ├── ego_pose.json
+    ├── log.json
+    ├── sample.json
+    ├── sample_data.json
+    ├── scene.json
+    └── ...
+```
 
-## Hugging Face acquisition
+The official nuScenes tables and image assets are accompanied by deterministic extension files
+containing source fingerprints, validity evidence, annotations, tags, split decisions, pipeline
+audit data, and a content manifest.
 
-Configuration names one Hugging Face dataset repository, a full lowercase 40-character commit,
-and a repository manifest. Each manifest row supplies an exact `data/...mcap` repository path,
-positive byte size, and lowercase SHA-256. Files are downloaded with `huggingface_hub`, verified
-locally, and atomically promoted into the trusted cache. Authentication, when required, comes
-from the standard Hugging Face login or environment; tokens are never configuration fields.
+Published datasets are read-only artifacts. Rebuild into an absent destination instead of editing
+an existing publication.
 
-See [extraction.md](docs/extraction.md) for the exact source schema, timestamp, interpolation,
-staging, and structural-failure contract.
-
-See [validity.md](docs/validity.md) for invalidity codes and thresholds, audit/drop behavior,
-sanity modes, quarantine reports, and the partial-export authorization gate.
-
-See [scenes.md](docs/scenes.md) for exact greedy segmentation, strict annotation JSONL matching,
-hybrid exclusion, UUIDv5 identities, per-camera chains, and structural graph validation.
-
-See [selection.md](docs/selection.md) for real-timestamp trajectory features, complete-evidence
-filtering, and deterministic exact-quota scenario rules.
-
-See [export.md](docs/export.md) for the official nuScenes table layout, exact timestamp and image
-copy rules, loader-required non-semantic map compatibility scaffold, extension tables, exporter
-evidence boundary, validation/manifest semantics, atomic publication, and Dataset SDK methods.
-
-All recordings are attempted independently through acquisition, extraction, validity, sanity,
-scene construction, feature computation, and per-recording export preflight. Any attributable
-failure at those stages is quarantined and blocks publication by default. Setting
-`execution.allow_partial_export` to `true` permits successful recordings only when every failure
-report was durably quarantined and `cleanup_complete` is `true`. Cleanup debt blocks publication
-and authorizes zero recordings regardless of the partial-export setting. An authorized partial
-build explicitly reports `partial: true` and the failed repository paths.
-
-## Scene-level train/test split
-
-`split_selected_scenes` validates the complete Task 6 feature population and scenario-selection
-result before assigning every selected scene exactly once. The exact test target is
-`floor(scene_count * test_fraction + 0.5)`. When configured, primary-scenario stratification uses
-deterministic SHA-256 ranking and largest-remainder apportionment; singleton strata and global
-targets that cannot preserve both train and test are recorded as explicit fallbacks. A scene's
-complete sample and per-camera sample-data chains always stay in its assigned split.
-
-`write_split_extension` revalidates all upstream evidence before atomically writing canonical,
-wall-clock-free `mz_extensions/split.json`. The extension records source-disambiguated
-assignments, exact counts, per-stratum audits, fingerprints, and chronological adjacent-scene
-cross-split evidence with a neighboring-context leakage warning. Published validation uses the
-compact complete Task 5 scene chronology in `pipeline_audit.json`, rather than treating filtered
-or unselected gaps as adjacency. Use `validate_scene_split` to
-recompute and validate an in-memory result; these three functions are the public Task 7 APIs.
-
-The stable Python import is:
+## Python SDK
 
 ```python
 from pathlib import Path
@@ -128,26 +172,72 @@ from pathlib import Path
 from dataset_devkit import Dataset
 
 dataset = Dataset(dataroot=Path("DATASET"), version="v1.0-trainval")
+
 scene = dataset.table("scene")[0]
 samples = dataset.scene_samples(scene["token"])
-front = dataset.camera(samples[0]["token"], "CAM_FRONT")
-pose = dataset.ego_pose(front["token"])
+front_camera = dataset.camera(samples[0]["token"], "CAM_FRONT")
+ego_pose = dataset.ego_pose(front_camera["token"])
 ```
 
-See [configuration.md](docs/configuration.md) for the complete configuration and source contract.
-The generated schema is checked in at
-`schema/dataset_config.schema.json`.
+The SDK is intentionally read-only: published evidence is inspected, never mutated in place.
 
-## Quality checks
+## Reliability and failure handling
+
+- Each recording is acquired, extracted, validated, and preflighted independently.
+- Recording failures receive durable quarantine reports and block publication by default.
+- Optional partial publication is allowed only when every failure is quarantined and all owned
+  working data is safely cleaned up.
+- Cache reuse re-verifies source and extraction evidence.
+- Symbolic links, hard-linked cache files, unsafe repository paths, and cache identity changes fail
+  closed.
+- Final output is validated, content-manifested, and atomically renamed into place.
+
+For the exact guarantees and threat boundaries, read
+[Export and publication](docs/export.md#publication-threat-model-and-read-only-contract).
+
+## Documentation
+
+| Guide | Contents |
+| --- | --- |
+| [Configuration](docs/configuration.md) | Hugging Face source, manifest, cache, and all policy sections |
+| [Extraction](docs/extraction.md) | MCAP schema, timestamps, HEVC decoding, GNSS interpolation, and staging |
+| [Validity](docs/validity.md) | Invalidity codes, sanity checks, quarantine, and partial publication |
+| [Scenes](docs/scenes.md) | Automatic, annotation-only, and hybrid scene construction |
+| [Selection](docs/selection.md) | Features, filters, scenario quotas, and deterministic splitting |
+| [Export](docs/export.md) | nuScenes tables, extension evidence, validation, SDK, and publication |
+
+## Current scope
+
+- Camera and GNSS data only
+- MCAP recordings using the expected protobuf and HEVC source schema
+- Hugging Face dataset repositories only
+- Commit-pinned, manifest-driven full-corpus builds
+- POSIX environments only
+- nuScenes `v1.0-trainval` publication contract
+
+LiDAR ingestion, symbolic revisions, ad hoc repository scanning, source subsetting, mutable output,
+and Windows support are intentionally outside the first release.
+
+## Development
+
+Install the development dependencies:
 
 ```bash
-pytest
+python -m pip install -e '.[dev]'
+```
+
+Run the complete local quality gate:
+
+```bash
+pytest -q
 ruff check .
 mypy
 PYTHONPATH=src python -m dataset_devkit.schema
 git diff --exit-code schema/dataset_config.schema.json
 python -m build --wheel --no-isolation
-python -m venv --system-site-packages /tmp/dataset-devkit-smoke
-/tmp/dataset-devkit-smoke/bin/pip install --no-deps dist/dataset_devkit-0.1.0-py3-none-any.whl
-/tmp/dataset-devkit-smoke/bin/dataset-devkit --help
 ```
+
+## License
+
+This repository does not yet include an open-source license. Until one is added, the source is
+publicly visible but remains all rights reserved.
