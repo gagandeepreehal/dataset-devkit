@@ -1,59 +1,73 @@
-# dataset-devkit
+# Minus Zero Dataset DevKit
 
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 ![Status: Alpha](https://img.shields.io/badge/status-alpha-orange)
 ![Platform: POSIX](https://img.shields.io/badge/platform-POSIX-lightgrey)
 
-Build deterministic, nuScenes-compatible robotics datasets directly from MCAP recordings stored
-in a Hugging Face dataset repository.
+Welcome to the development kit for creating compact, reproducible, nuScenes-compatible datasets
+from the openly released Minus Zero autonomous-driving datasets.
 
-`dataset-devkit` pins every build to an immutable repository commit, verifies every recording by
-size and SHA-256, extracts synchronized camera and GNSS data, constructs scenes, and publishes a
-validated dataset through an atomic, no-overwrite workflow.
+The source releases contain Minus Zero sensor recordings in MCAP format. They are **not**
+nuScenes datasets. This devkit reads those recordings, selects useful driving scenes, subsamples
+the sensor streams, and publishes a derived dataset using the nuScenes table and directory format.
 
 > [!IMPORTANT]
-> This project is in alpha. Its configuration and output contracts are strict by design, but the
-> public API may still evolve before a stable release.
+> This project is independent of the official nuScenes project and is not affiliated with or
+> endorsed by Motional. Compatibility refers to the published data structure and supported loader
+> behavior, not to the sensor suite, annotations, tasks, or benchmark content of the nuScenes
+> dataset.
 
-## Highlights
+## Overview
 
-- **Reproducible inputs** — one Hugging Face dataset repository, one full commit SHA, and one
-  ordered manifest define the complete source corpus.
-- **Verified acquisition** — downloaded MCAPs are checked against their declared byte size and
-  SHA-256 before entering the trusted local cache.
-- **Native extraction** — protobuf camera and GNSS messages are read directly from MCAP, with
-  persistent HEVC decoding, deterministic frame selection, and GNSS interpolation.
-- **Auditable quality controls** — validity rules, sanity policies, quarantine reports, filtering,
-  scenario quotas, and train/test assignment produce explicit evidence.
-- **Safe publication** — the nuScenes-compatible output is validated before one atomic rename;
-  existing datasets are never overwritten.
-- **Read-only SDK** — inspect published tables, scenes, samples, camera records, and ego poses from
-  Python.
+- [What this devkit does](#what-this-devkit-does)
+- [Devkit setup](#devkit-setup)
+- [Source dataset setup](#source-dataset-setup)
+- [Getting started](#getting-started)
+- [Subsampling and selection](#subsampling-and-selection)
+- [Output format](#output-format)
+- [Python SDK](#python-sdk)
+- [Documentation](#documentation)
+- [Known limitations](#known-limitations)
+- [Citation](#citation)
+- [License](#license)
 
-## Pipeline
+## What this devkit does
+
+`dataset-devkit` turns a pinned Minus Zero dataset release into a smaller dataset for research,
+experimentation, and model development:
 
 ```text
-Hugging Face dataset repository
-        │
-        ▼
-Pinned manifest → verified MCAP cache → camera/GNSS extraction → validity and scenes
-        │
-        ▼
-Features and scenarios → scene-level split → nuScenes export → validation → atomic publication
+Minus Zero MCAP release on Hugging Face
+                    │
+                    ▼
+       verified download and extraction
+                    │
+                    ▼
+ camera/GNSS subsampling, validation, and scene construction
+                    │
+                    ▼
+       filtering and scenario-based selection
+                    │
+                    ▼
+      train/test split and nuScenes-compatible export
 ```
 
-## Quickstart
+The pipeline provides:
 
-### Requirements
+- commit-pinned and checksum-verified MCAP acquisition from Hugging Face;
+- deterministic camera-frame downsampling and GNSS interpolation;
+- automatic, annotation-driven, or hybrid scene construction;
+- scene tagging, quality filtering, and exact scenario quotas;
+- deterministic scene-level train/test splitting;
+- validated nuScenes-compatible tables and camera assets; and
+- provenance, audit, quarantine, and content-manifest extensions.
 
-- Python 3.12 or newer
-- A POSIX environment such as Linux or macOS
-- Access to a Hugging Face dataset repository containing the expected MCAP schema
+The result is a **derived subset** of a Minus Zero release. The original MCAP files remain the
+source of truth and are not modified.
 
-Windows is not supported because the cache and publication safety model relies on POSIX file
-locks and no-follow, descriptor-relative filesystem operations.
+## Devkit setup
 
-### Install from source
+The devkit requires Python 3.12 or newer and a POSIX environment such as Linux or macOS.
 
 ```bash
 git clone https://github.com/gagandeepreehal/dataset-devkit.git
@@ -64,83 +78,107 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
-For a private Hugging Face repository, authenticate through the standard client before building:
+Windows is not currently supported because safe caching and publication rely on POSIX file locks
+and descriptor-relative, no-follow filesystem operations.
+
+## Source dataset setup
+
+Minus Zero dataset releases are hosted as Hugging Face dataset repositories. A build uses three
+pieces of source identity:
+
+1. the Hugging Face repository name;
+2. a full 40-character commit SHA; and
+3. the release's ordered `manifest.jsonl`.
+
+The included example targets the
+[`gagandeepreehal/minuszero-indian-autonomous-driving-monocam`](https://huggingface.co/datasets/gagandeepreehal/minuszero-indian-autonomous-driving-monocam)
+release. Other supported Minus Zero releases can be selected by changing the source configuration
+and the sensor policies that describe that release.
+
+For a private or gated release, authenticate with the standard Hugging Face client:
 
 ```bash
 hf auth login
 ```
 
-Tokens are read by `huggingface_hub`; they do not belong in the dataset configuration.
+Authentication tokens are read by `huggingface_hub` and must not be stored in the configuration.
 
-### Build the example
-
-```bash
-cp examples/dataset_config.json dataset_config.json
-cp examples/annotations.jsonl annotations.jsonl
-
-dataset-devkit build --config dataset_config.json
-```
-
-The example configuration is pinned to a real immutable commit of
-`gagandeepreehal/minuszero-indian-autonomous-driving-monocam`. Adjust its source, topics, camera
-requirements, scene rules, and output paths for your dataset.
-
-## Source contract
-
-The configuration identifies exactly one Hugging Face dataset repository:
-
-```json
-{
-  "huggingface": {
-    "repo_id": "owner/dataset",
-    "revision": "b13c3bd3a049c73b560910ef5dbc60cbd28c441b",
-    "manifest_path": "manifest.jsonl"
-  }
-}
-```
-
-The revision must be a full lowercase 40-character commit SHA. Branches and tags are rejected so
-the same configuration always identifies the same repository snapshot.
-
-The repository manifest is UTF-8 JSONL with one MCAP per row:
+Each manifest row identifies one recording and its expected content:
 
 ```json
 {"repo_path":"data/2025-04-11/run.mcap","source_size":30883381,"sha256":"4af1b3aaa2db2f146c0ace8d1d339678640852181307980e7c918b107491ea96"}
 ```
 
-Each row requires:
-
-| Field | Contract |
+| Field | Description |
 | --- | --- |
-| `repo_path` | Normalized repository path below `data/`, ending in `.mcap` |
-| `source_size` | Positive byte size as a JSON integer |
-| `sha256` | Lowercase 64-character SHA-256 digest |
+| `repo_path` | Path to an `.mcap` recording below the release's `data/` directory |
+| `source_size` | Expected file size in bytes |
+| `sha256` | Expected lowercase SHA-256 digest |
 
-Manifest order is build order. Duplicate or unsafe paths, malformed hashes, invalid sizes, and an
-empty manifest fail before recording processing begins.
+The commit and manifest make the input corpus reproducible. Branch names, tags, repository scans,
+and unverified recordings are not accepted as build inputs.
 
-See [Configuration](docs/configuration.md) for the complete typed configuration contract.
+## Getting started
 
-## Command-line interface
+Copy the example configuration and annotations into the working directory:
 
 ```bash
-# Build and atomically publish a dataset
+cp examples/dataset_config.json dataset_config.json
+cp examples/annotations.jsonl annotations.jsonl
+```
+
+Review the source revision, topics, required cameras, sampling rate, scene rules, scenario quotas,
+and output paths, then build the derived dataset:
+
+```bash
 dataset-devkit build --config dataset_config.json
+```
 
-# Validate an existing publication
+The command downloads and verifies the source MCAPs, processes each recording independently, and
+publishes the result only after final validation succeeds.
+
+To validate or inspect an existing output:
+
+```bash
 dataset-devkit validate --dataroot DATASET --version v1.0-trainval
-
-# Print a compact dataset summary
 dataset-devkit inspect --dataroot DATASET --version v1.0-trainval
 ```
 
 Every command prints one deterministic JSON object to standard output. Configuration and usage
-errors exit with status `2`; operational and validation failures exit with status `1` and a safe,
-concise diagnostic.
+errors exit with status `2`; operational and validation failures exit with status `1`.
 
-## Published dataset
+## Subsampling and selection
 
-A successful build publishes the following structure below `paths.output_dir`:
+Subsampling is explicit and reproducible. It happens in several stages:
+
+1. **Temporal sampling** selects camera frames at `downsampling.target_fps` within a configured
+   timestamp tolerance.
+2. **Validity checks** evaluate camera availability, timestamp continuity, GNSS quality, and sensor
+   synchronization.
+3. **Scene construction** groups valid samples into bounded driving scenes.
+4. **Feature and tag generation** describes motion such as straight driving, curvature, turns,
+   stopping, and stationary behavior.
+5. **Scenario rules** select exact seeded quotas from the eligible scenes.
+6. **Scene-level splitting** assigns every selected scene to one train or test partition without
+   splitting its camera chains.
+
+For example, a scenario rule can request a deterministic subset of left-turn scenes:
+
+```json
+{
+  "name": "Left Turn",
+  "quota": 100,
+  "required_all_tags": ["left_turn"],
+  "excluded_tags": ["stationary"]
+}
+```
+
+The selected result records its source identities, filtering decisions, scenario assignments, and
+split evidence so it can be audited and reproduced.
+
+## Output format
+
+A successful build publishes a nuScenes-compatible dataroot below `paths.output_dir`:
 
 ```text
 v1.0-trainval/
@@ -157,14 +195,18 @@ v1.0-trainval/
     └── ...
 ```
 
-The official nuScenes tables and image assets are accompanied by deterministic extension files
-containing source fingerprints, validity evidence, annotations, tags, split decisions, pipeline
-audit data, and a content manifest.
+The core tables and camera assets follow the supported nuScenes layout. `mz_extensions/` preserves
+information that does not belong in the standard tables, including source fingerprints, validity
+evidence, scenario assignments, split decisions, pipeline audit data, and the final content
+manifest.
 
-Published datasets are read-only artifacts. Rebuild into an absent destination instead of editing
-an existing publication.
+Published outputs are read-only artifacts. The devkit validates the complete staging dataset and
+then performs one atomic, no-overwrite publication. To change a dataset, rebuild it into a new,
+absent destination.
 
 ## Python SDK
+
+The included read-only SDK provides convenient access to a published dataset:
 
 ```python
 from pathlib import Path
@@ -179,56 +221,45 @@ front_camera = dataset.camera(samples[0]["token"], "CAM_FRONT")
 ego_pose = dataset.ego_pose(front_camera["token"])
 ```
 
-The SDK is intentionally read-only: published evidence is inspected, never mutated in place.
-
-## Reliability and failure handling
-
-- Each recording is acquired, extracted, validated, and preflighted independently.
-- Recording failures receive durable quarantine reports and block publication by default.
-- Optional partial publication is allowed only when every failure is quarantined and all owned
-  working data is safely cleaned up.
-- Cache reuse re-verifies source and extraction evidence.
-- Symbolic links, hard-linked cache files, unsafe repository paths, and cache identity changes fail
-  closed.
-- Final output is validated, content-manifested, and atomically renamed into place.
-
-For the exact guarantees and threat boundaries, read
-[Export and publication](docs/export.md#publication-threat-model-and-read-only-contract).
+The official `nuscenes-devkit` is also smoke-tested against the exported table structure during
+publication. Minus Zero extension files remain specific to this project.
 
 ## Documentation
 
 | Guide | Contents |
 | --- | --- |
-| [Configuration](docs/configuration.md) | Hugging Face source, manifest, cache, and all policy sections |
-| [Extraction](docs/extraction.md) | MCAP schema, timestamps, HEVC decoding, GNSS interpolation, and staging |
-| [Validity](docs/validity.md) | Invalidity codes, sanity checks, quarantine, and partial publication |
+| [Configuration](docs/configuration.md) | Source identity, paths, sensors, policies, and publication settings |
+| [Extraction](docs/extraction.md) | MCAP schema, HEVC decoding, timestamps, GNSS interpolation, and staging |
+| [Validity](docs/validity.md) | Quality rules, sanity checks, quarantine, and partial publication |
 | [Scenes](docs/scenes.md) | Automatic, annotation-only, and hybrid scene construction |
-| [Selection](docs/selection.md) | Features, filters, scenario quotas, and deterministic splitting |
-| [Export](docs/export.md) | nuScenes tables, extension evidence, validation, SDK, and publication |
+| [Selection](docs/selection.md) | Features, filters, exact scenario quotas, and deterministic splitting |
+| [Export](docs/export.md) | Tables, extensions, validation, SDK behavior, and publication guarantees |
 
-## Current scope
+## Known limitations
 
-- Camera and GNSS data only
-- MCAP recordings using the expected protobuf and HEVC source schema
-- Hugging Face dataset repositories only
-- Commit-pinned, manifest-driven full-corpus builds
-- POSIX environments only
-- nuScenes `v1.0-trainval` publication contract
+- The first release supports camera and GNSS data only.
+- Source MCAPs must use the expected Minus Zero protobuf and HEVC schema.
+- Outputs contain selected Minus Zero scenes; they do not reproduce the official nuScenes sensor
+  suite, annotations, maps, evaluation tasks, or benchmark splits.
+- `v1.0-trainval` is the only publication version currently supported.
+- Input releases must be hosted on Hugging Face and pinned by commit and manifest.
+- LiDAR ingestion, arbitrary source repositories, symbolic revisions, and Windows are not
+  supported.
 
-LiDAR ingestion, symbolic revisions, ad hoc repository scanning, source subsetting, mutable output,
-and Windows support are intentionally outside the first release.
+## Citation
+
+When publishing work based on a generated dataset, cite the specific Minus Zero source release
+using the citation information on its Hugging Face dataset card. Also identify this devkit by its
+repository URL and the release tag or commit used for generation. This keeps the original data and
+the derived dataset-building software independently traceable.
 
 ## Development
 
-Install the development dependencies:
+Install the development dependencies and run the local quality gate:
 
 ```bash
 python -m pip install -e '.[dev]'
-```
 
-Run the complete local quality gate:
-
-```bash
 pytest -q
 ruff check .
 mypy
@@ -239,5 +270,6 @@ python -m build --wheel --no-isolation
 
 ## License
 
-This repository does not yet include an open-source license. Until one is added, the source is
-publicly visible but remains all rights reserved.
+This repository does not yet include an open-source software license. Until one is added, the
+source is publicly visible but remains all rights reserved. Each Minus Zero dataset release is
+governed by the license stated on its own dataset card.
