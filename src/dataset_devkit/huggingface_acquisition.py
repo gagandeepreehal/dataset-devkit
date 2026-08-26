@@ -19,6 +19,7 @@ from dataset_devkit.provenance import (
     ArtifactIdentity,
     ExtractionManifest,
     SourceFingerprint,
+    canonical_hash,
     canonical_json,
     extraction_config_hash,
     load_extraction_manifest,
@@ -60,41 +61,94 @@ class _VerifiedFile:
     sha256: str
 
 
-def _ensure_directory(path: Path) -> None:
+def _ensure_cache_root(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     value = path.lstat()
     if not stat.S_ISDIR(value.st_mode):
         raise AcquisitionError(f"cache component is not a directory: {path}")
 
 
-def _verify_file(path: Path) -> _VerifiedFile:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _ensure_beneath(root: Path, *components: str) -> Path:
+    _ensure_cache_root(root)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(root, flags)
     try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise AcquisitionError(f"download is not an owned regular file: {path.name}") from error
-    before = os.fstat(descriptor)
-    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        for component in components:
+            if not component or component in {".", ".."} or "/" in component:
+                raise AcquisitionError("invalid cache directory component")
+            try:
+                os.mkdir(component, 0o700, dir_fd=descriptor)
+                os.fsync(descriptor)
+            except FileExistsError:
+                pass
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except OSError as error:
+                raise AcquisitionError(
+                    f"cache component is not a trusted directory: {component}"
+                ) from error
+            os.close(descriptor)
+            descriptor = child
+        return root.joinpath(*components)
+    finally:
         os.close(descriptor)
-        raise AcquisitionError(f"download is not an owned regular file: {path.name}")
-    digest = hashlib.sha256()
-    with os.fdopen(descriptor, "rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-        after = os.fstat(stream.fileno())
+
+
+@contextmanager
+def _open_parent_beneath(root: Path, path: Path) -> Iterator[tuple[int, str]]:
     try:
-        leaf = path.lstat()
-    except OSError as error:
-        raise AcquisitionError("download identity changed during verification") from error
-    identity = (before.st_dev, before.st_ino, before.st_size, before.st_nlink)
-    if identity != (after.st_dev, after.st_ino, after.st_size, after.st_nlink) or identity != (
-        leaf.st_dev,
-        leaf.st_ino,
-        leaf.st_size,
-        leaf.st_nlink,
-    ):
-        raise AcquisitionError("download identity changed during verification")
-    return _VerifiedFile(before.st_dev, before.st_ino, before.st_size, digest.hexdigest())
+        relative = path.absolute().relative_to(root.absolute())
+    except ValueError as error:
+        raise AcquisitionError("download returned a path outside owned scratch") from error
+    if not relative.parts:
+        raise AcquisitionError("download did not return a file path")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    descriptors = [os.open(root, flags)]
+    try:
+        for component in relative.parts[:-1]:
+            try:
+                descriptors.append(os.open(component, flags, dir_fd=descriptors[-1]))
+            except OSError as error:
+                raise AcquisitionError(
+                    f"download parent is not a trusted directory: {component}"
+                ) from error
+        yield descriptors[-1], relative.parts[-1]
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _verify_file(path: Path, root: Path) -> _VerifiedFile:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    with _open_parent_beneath(root, path) as (parent_fd, name):
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise AcquisitionError(
+                f"download is not an owned regular file: {path.name}"
+            ) from error
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            os.close(descriptor)
+            raise AcquisitionError(f"download is not an owned regular file: {path.name}")
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+        try:
+            leaf = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise AcquisitionError("download identity changed during verification") from error
+        identity = (before.st_dev, before.st_ino, before.st_size, before.st_nlink)
+        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_nlink) or identity != (
+            leaf.st_dev,
+            leaf.st_ino,
+            leaf.st_size,
+            leaf.st_nlink,
+        ):
+            raise AcquisitionError("download identity changed during verification")
+        return _VerifiedFile(before.st_dev, before.st_ino, before.st_size, digest.hexdigest())
 
 
 def _atomic_write(path: Path, value: object) -> None:
@@ -157,7 +211,7 @@ class HuggingFaceAcquirer:
         download_file: DownloadFile | None = None,
     ) -> None:
         self.huggingface = huggingface
-        self.cache_dir = cache_dir.resolve()
+        self.cache_dir = cache_dir.absolute()
         self.extraction_config_hash = extraction_config_hash
         if download_file is None:
             from huggingface_hub import hf_hub_download
@@ -174,7 +228,6 @@ class HuggingFaceAcquirer:
         )
 
     def _download(self, filename: str, local_dir: Path) -> Path:
-        _ensure_directory(local_dir)
         try:
             returned = Path(
                 self.download_file(
@@ -193,10 +246,18 @@ class HuggingFaceAcquirer:
         return returned
 
     def load_entries(self) -> tuple[ManifestEntry, ...]:
-        local_dir = self.cache_dir / "huggingface-manifest"
-        manifest = self._download(self.huggingface.manifest_path, local_dir)
-        _verify_file(manifest)
-        return parse_manifest(manifest)
+        identity = canonical_hash(
+            {
+                "repo_id": self.huggingface.repo_id,
+                "revision": self.huggingface.revision,
+                "manifest_path": self.huggingface.manifest_path,
+            }
+        )
+        local_dir = _ensure_beneath(self.cache_dir, "huggingface-manifests", identity)
+        with _recording_lock(local_dir):
+            manifest = self._download(self.huggingface.manifest_path, local_dir)
+            _verify_file(manifest, local_dir)
+            return parse_manifest(manifest)
 
     def paths_for(self, source: SourceFingerprint) -> CachePaths:
         directory = self.cache_dir / "huggingface" / source.digest
@@ -217,11 +278,11 @@ class HuggingFaceAcquirer:
             entry.size,
         )
         paths = self.paths_for(source)
-        _ensure_directory(paths.directory)
+        _ensure_beneath(self.cache_dir, "huggingface", source.digest)
         with _recording_lock(paths.directory):
             cached = load_manifest(paths.manifest)
             if cached is not None and cached.source == source and paths.final.exists():
-                verified = _verify_file(paths.final)
+                verified = _verify_file(paths.final, paths.directory)
                 if verified.size == source.size and verified.sha256 == source.sha256:
                     hit = replace(cached, status="cache_hit")
                     _atomic_write(paths.manifest, hit.to_dict())
@@ -229,14 +290,17 @@ class HuggingFaceAcquirer:
                         paths.final, paths.manifest, paths.extraction_manifest, hit
                     )
 
-            returned = self._download(entry.repo_path, paths.directory / "download")
-            verified = _verify_file(returned)
+            scratch = _ensure_beneath(
+                self.cache_dir, "huggingface", source.digest, "download"
+            )
+            returned = self._download(entry.repo_path, scratch)
+            verified = _verify_file(returned, scratch)
             if verified.size != source.size:
                 raise IntegrityError("downloaded size differs from repository manifest")
             if verified.sha256 != source.sha256:
                 raise IntegrityError("downloaded SHA-256 differs from repository manifest")
             os.replace(returned, paths.final)
-            final = _verify_file(paths.final)
+            final = _verify_file(paths.final, paths.directory)
             if final != verified:
                 raise AcquisitionError("promoted cache artifact changed identity")
             artifact = ArtifactIdentity(
@@ -269,7 +333,7 @@ class HuggingFaceAcquirer:
         self, source: SourceFingerprint, completed_extraction_config_hash: str
     ) -> Path:
         paths = self.paths_for(source)
-        _ensure_directory(paths.directory)
+        _ensure_beneath(self.cache_dir, "huggingface", source.digest)
         with _recording_lock(paths.directory):
             manifest = ExtractionManifest(source, completed_extraction_config_hash)
             _atomic_write(paths.extraction_manifest, manifest.to_dict())

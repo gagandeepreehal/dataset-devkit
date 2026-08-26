@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -218,12 +217,6 @@ def _build_evidence_owned(
     entries = acquirer.load_entries()
     if not entries:
         raise BuildOperationalError("repository manifest contains no recordings")
-    config.paths.cache_dir.mkdir(parents=True, exist_ok=True)
-    required_bytes = sum(entry.size for entry in entries)
-    if shutil.disk_usage(config.paths.cache_dir).free < required_bytes:
-        raise BuildOperationalError(
-            f"insufficient cache space for repository manifest ({required_bytes} bytes required)"
-        )
     decoder_factory = runtime.decoder_factory
     extractor_kwargs: dict[str, object] = {}
     if decoder_factory is not None:

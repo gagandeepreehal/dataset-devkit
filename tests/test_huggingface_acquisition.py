@@ -13,6 +13,7 @@ from dataset_devkit.huggingface_acquisition import (
     IntegrityError,
 )
 from dataset_devkit.huggingface_manifest import ManifestEntry
+from dataset_devkit.provenance import canonical_hash
 
 
 class FakeDownload:
@@ -75,6 +76,14 @@ def test_load_entries_downloads_the_configured_manifest_at_the_pinned_commit(
     )
     download = FakeDownload({"manifest.jsonl": row})
     acquirer = make_acquirer(tmp_path, download)
+    identity = canonical_hash(
+        {
+            "repo_id": "owner/dataset",
+            "revision": "a" * 40,
+            "manifest_path": "manifest.jsonl",
+        }
+    )
+    local_dir = tmp_path / "cache" / "huggingface-manifests" / identity
 
     assert acquirer.load_entries() == (ManifestEntry("data/a.mcap", 1, "b" * 64),)
     assert download.calls == [
@@ -83,10 +92,33 @@ def test_load_entries_downloads_the_configured_manifest_at_the_pinned_commit(
             "repo_type": "dataset",
             "revision": "a" * 40,
             "filename": "manifest.jsonl",
-            "local_dir": tmp_path / "cache" / "huggingface-manifest",
+            "local_dir": local_dir,
             "force_download": True,
         }
     ]
+
+
+def test_manifest_scratch_is_isolated_by_repository_revision(tmp_path: Path) -> None:
+    row = (
+        b'{"repo_path":"data/a.mcap","source_size":1,'
+        b'"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n'
+    )
+    first_download = FakeDownload({"manifest.jsonl": row})
+    second_download = FakeDownload({"manifest.jsonl": row})
+    first = make_acquirer(tmp_path, first_download)
+    second = HuggingFaceAcquirer(
+        huggingface=HuggingFaceConfig(
+            repo_id="owner/dataset", revision="c" * 40, manifest_path="manifest.jsonl"
+        ),
+        cache_dir=tmp_path / "cache",
+        extraction_config_hash="c" * 64,
+        download_file=second_download,
+    )
+
+    first.load_entries()
+    second.load_entries()
+
+    assert first_download.calls[0]["local_dir"] != second_download.calls[0]["local_dir"]
 
 
 def test_acquire_rejects_hash_mismatch(tmp_path: Path) -> None:
@@ -181,6 +213,29 @@ def test_acquire_rejects_linked_download_output(tmp_path: Path, kind: str) -> No
 
     with pytest.raises(AcquisitionError, match="owned regular file"):
         acquirer.acquire(ManifestEntry("data/a.mcap", 1, hashlib.sha256(b"x").hexdigest()))
+
+
+def test_acquire_rejects_symlinked_cache_ancestor(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "huggingface").symlink_to(outside, target_is_directory=True)
+    payload = b"mcap-content"
+    acquirer = HuggingFaceAcquirer(
+        huggingface=HuggingFaceConfig(
+            repo_id="owner/dataset", revision="a" * 40, manifest_path="manifest.jsonl"
+        ),
+        cache_dir=cache,
+        extraction_config_hash="c" * 64,
+        download_file=FakeDownload({"data/a.mcap": payload}),
+    )
+
+    with pytest.raises(AcquisitionError, match="cache component"):
+        acquirer.acquire(
+            ManifestEntry("data/a.mcap", len(payload), hashlib.sha256(payload).hexdigest())
+        )
+    assert not tuple(outside.iterdir())
 
 
 def test_extraction_completion_is_source_and_config_bound(tmp_path: Path) -> None:

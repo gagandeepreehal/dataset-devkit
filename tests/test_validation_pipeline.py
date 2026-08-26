@@ -12,7 +12,6 @@ from dataclasses import replace
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -701,25 +700,6 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     monkeypatch.setattr("dataset_devkit.cli.build_dataset", lambda _config: third)
     assert main(["build", "--config", "examples/dataset_config.json"]) == 0
     assert json.loads(capsys.readouterr().out)["dataroot"] == str(third.dataroot)
-
-
-def test_build_rejects_manifest_that_exceeds_available_cache_space(
-    tmp_path: Path,
-    config_factory: Callable[[], GlobalConfig],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    recording = tmp_path / "recording.mcap"
-    recording.write_bytes(b"mcap")
-    repo_path = "data/recording.mcap"
-    config = _pipeline_config(config_factory(), tmp_path, (repo_path,), partial=False)
-    runtime = BuildRuntime(acquirer_factory=lambda _config: _FakeAcquirer({repo_path: recording}))
-    monkeypatch.setattr(
-        "dataset_devkit.services.shutil.disk_usage",
-        lambda _path: SimpleNamespace(free=recording.stat().st_size - 1),
-    )
-
-    with pytest.raises(BuildOperationalError, match="insufficient cache space"):
-        build_dataset(config, runtime=runtime)
 
 
 def test_true_pyav_multicamera_build_is_officially_loadable_and_repeatable(
