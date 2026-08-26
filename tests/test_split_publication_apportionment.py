@@ -23,10 +23,10 @@ def _export_stratified_dataset(
     base_config = config_factory()
     scene_config = _config(base_config, max_duration_s=0.001)
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/strata.mcap",
-        '"strata"',
+        "owner/dataset",
+        "a" * 40,
+        "data/strata.mcap",
+        "b" * 64,
         8,
     )
     timestamps = tuple(
@@ -88,7 +88,7 @@ def _rewrite_leakage_for_assignments(root: Path, split: dict[str, object]) -> No
                 pairs.append(
                     {
                         "source_digest": source,
-                        "source_blob_path": earlier["source_blob_path"],
+                        "source_repo_path": earlier["source_repo_path"],
                         "earlier_scene_token": earlier["scene_token"],
                         "later_scene_token": later["scene_token"],
                         "earlier_last_timestamp_ns": earlier["last_timestamp_ns"],

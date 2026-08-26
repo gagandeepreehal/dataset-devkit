@@ -87,7 +87,7 @@ def test_schema_rejects_duplicate_task6_predicate_arrays() -> None:
         "excluded_labels",
         "blacklisted_scene_tokens",
         "blacklisted_source_digests",
-        "blacklisted_blob_paths",
+        "blacklisted_repo_paths",
     )
     rule_fields = filter_fields[:6]
     for field in filter_fields:
@@ -300,7 +300,7 @@ def test_task6_string_item_and_name_schema_constraints_cover_every_field() -> No
         "excluded_labels",
         "blacklisted_scene_tokens",
         "blacklisted_source_digests",
-        "blacklisted_blob_paths",
+        "blacklisted_repo_paths",
     ):
         assert filters[field]["items"]["minLength"] == 1
         assert filters[field]["items"]["pattern"]
@@ -345,7 +345,7 @@ def test_task6_string_item_and_name_schema_constraints_cover_every_field() -> No
         ("filters", "required_all_labels"),
         ("filters", "blacklisted_scene_tokens"),
         ("filters", "blacklisted_source_digests"),
-        ("filters", "blacklisted_blob_paths"),
+        ("filters", "blacklisted_repo_paths"),
         ("rule", "required_all_tags"),
         ("rule", "required_all_labels"),
         ("rule", "name"),

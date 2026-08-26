@@ -365,7 +365,7 @@ def pipeline_graph_scene_sequence(
     return [
         {
             "source_digest": graph.source.digest,
-            "source_blob_path": graph.source.blob_path,
+            "source_repo_path": graph.source.repo_path,
             "scene_token": scene.token,
             "ordinal": scene.ordinal,
             "first_timestamp_ns": scene.first_timestamp_ns,
@@ -782,7 +782,6 @@ def _validate_boundary(evidence: ExportEvidence) -> None:
     if evidence.resolved_config.split != evidence.split_config:
         raise ValueError("resolved global split config differs from export evidence")
     configured_paths = (
-        evidence.resolved_config.azure.blob_list,
         evidence.resolved_config.paths.work_dir,
         evidence.resolved_config.paths.cache_dir,
         evidence.resolved_config.paths.output_dir,
@@ -913,7 +912,7 @@ def _export_into(
         logs.append(
             {
                 "token": token,
-                "logfile": graph.source.blob_path,
+                "logfile": graph.source.repo_path,
                 "vehicle": "",
                 "date_captured": "",
                 "location": "",

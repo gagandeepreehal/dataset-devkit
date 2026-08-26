@@ -13,10 +13,10 @@ from dataset_devkit.config import GlobalConfig, load_config
 def minimal_config() -> dict[str, object]:
     return {
         "schema_version": "1.0",
-        "azure": {
-            "account_url": "https://example.blob.core.windows.net",
-            "container": "ecal-batchstore",
-            "blob_list": "mcap_blobs.txt",
+        "huggingface": {
+            "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-monocam",
+            "revision": "a" * 40,
+            "manifest_path": "manifest.jsonl",
         },
         "paths": {
             "work_dir": "../work",
@@ -99,7 +99,11 @@ def test_load_config_is_strict_and_resolves_relative_paths(tmp_path: Path) -> No
     config = load_config(config_path)
 
     assert isinstance(config, GlobalConfig)
-    assert config.azure.blob_list == (config_path.parent / "mcap_blobs.txt").resolve()
+    assert config.huggingface.repo_id == (
+        "gagandeepreehal/minuszero-indian-autonomous-driving-monocam"
+    )
+    assert config.huggingface.revision == "a" * 40
+    assert config.huggingface.manifest_path == "manifest.jsonl"
     assert config.paths.work_dir == (config_path.parent / "../work").resolve()
     assert config.annotations.path == (config_path.parent / "annotations.jsonl").resolve()
 
@@ -239,37 +243,13 @@ def test_quarantine_cannot_be_disabled(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, data))
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("azure.client_secret", "do-not-store-this"),
-        (
-            "azure.account_url",
-            "https://example.blob.core.windows.net?sv=2024-11-04&sig=signature",
-        ),
-        (
-            "azure.container",
-            "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=secret",
-        ),
-        ("azure.access_token", "do-not-store-this"),
-        ("azure.container", "sk-abcdefghijklmnopqrstuvwxyz012345"),
-    ],
-)
-def test_embedded_credentials_are_rejected(tmp_path: Path, field: str, value: str) -> None:
-    data = minimal_config()
-    set_nested(data, field, value)
-
-    with pytest.raises(ValidationError, match="credential"):
-        load_config(write_config(tmp_path, data))
-
-
 def test_ordinary_urls_and_secret_named_paths_are_allowed(tmp_path: Path) -> None:
     data = minimal_config()
     set_nested(data, "annotations.path", "secret-camera/annotations.jsonl")
 
     config = load_config(write_config(tmp_path, data))
 
-    assert config.azure.account_url == "https://example.blob.core.windows.net"
+    assert config.huggingface.repo_id.endswith("/minuszero-indian-autonomous-driving-monocam")
     assert config.annotations.path.name == "annotations.jsonl"
 
 
@@ -282,73 +262,54 @@ def test_non_bearer_credentials_remain_rejected_in_path_fields(tmp_path: Path) -
 
 
 @pytest.mark.parametrize(
-    "account_url",
+    "repo_id",
     [
-        "https://user@example.blob.core.windows.net",
-        "https://user:password@example.blob.core.windows.net",
+        "owner",
+        "/dataset",
+        "owner/",
+        "owner/dataset/extra",
+        "owner dataset/name",
+        "https://huggingface.co/datasets/owner/dataset",
     ],
 )
-def test_account_url_rejects_url_userinfo(tmp_path: Path, account_url: str) -> None:
+def test_huggingface_repo_id_must_be_owner_and_name(tmp_path: Path, repo_id: str) -> None:
     data = minimal_config()
-    set_nested(data, "azure.account_url", account_url)
+    set_nested(data, "huggingface.repo_id", repo_id)
 
-    with pytest.raises(ValidationError, match="credential|userinfo"):
+    with pytest.raises(ValidationError, match="repo_id"):
         load_config(write_config(tmp_path, data))
 
 
 @pytest.mark.parametrize(
-    "account_url",
+    "revision",
     [
-        "https://account.blob.core.windows.net",
-        "https://account.blob.core.windows.net/",
-        "https://account.blob.core.windows.net:443/",
-        "https://account.blob.core.usgovcloudapi.net",
-        "https://account.blob.core.chinacloudapi.cn",
-        "https://account.blob.core.cloudapi.de",
-        "https://account.privatelink.blob.core.windows.net",
-        "https://account.privatelink.blob.core.usgovcloudapi.net",
+        "main",
+        "A" * 40,
+        "a" * 39,
+        "g" * 40,
     ],
 )
-def test_azure_blob_service_urls_are_accepted(tmp_path: Path, account_url: str) -> None:
+def test_huggingface_revision_requires_full_lowercase_commit(
+    tmp_path: Path, revision: str
+) -> None:
     data = minimal_config()
-    set_nested(data, "azure.account_url", account_url)
+    set_nested(data, "huggingface.revision", revision)
 
-    assert load_config(write_config(tmp_path, data)).azure.account_url == account_url
-
-
-@pytest.mark.parametrize(
-    "account_url",
-    [
-        "http://account.blob.core.windows.net",
-        "ftp://account.blob.core.windows.net",
-        "https://example.com",
-        "https://blob.evil.com",
-        "https://.blob.core.windows.net",
-        "https://-account.blob.core.windows.net",
-        "https://account.blob.core.windows.net:bad",
-        "https://account.blob.core.windows.net/container",
-        "https://account.blob.core.windows.net/#fragment",
-        "https://account.blob.core.windows.net/#",
-        "https:///missing-host",
-    ],
-)
-def test_account_url_requires_https_azure_blob_service(tmp_path: Path, account_url: str) -> None:
-    data = minimal_config()
-    set_nested(data, "azure.account_url", account_url)
-
-    with pytest.raises(ValidationError, match="account_url"):
+    with pytest.raises(ValidationError, match="revision"):
         load_config(write_config(tmp_path, data))
 
 
 @pytest.mark.parametrize(
-    "container",
-    ["ab", "A-container", "-container", "container-", "bad--container", "bad_name"],
+    "manifest_path",
+    ["/manifest.jsonl", "../manifest.jsonl", "a/../manifest.jsonl", r"a\manifest.jsonl", "a%2fb"],
 )
-def test_azure_container_name_rules_are_enforced(tmp_path: Path, container: str) -> None:
+def test_huggingface_manifest_path_is_safe_relative_posix(
+    tmp_path: Path, manifest_path: str
+) -> None:
     data = minimal_config()
-    set_nested(data, "azure.container", container)
+    set_nested(data, "huggingface.manifest_path", manifest_path)
 
-    with pytest.raises(ValidationError, match="container"):
+    with pytest.raises(ValidationError, match="manifest_path"):
         load_config(write_config(tmp_path, data))
 
 
@@ -369,7 +330,7 @@ def test_topic_names_must_be_nonblank(tmp_path: Path, field: str, value: str) ->
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl",
     ],
 )
-def test_raw_azure_keys_and_jwts_are_rejected_in_values(tmp_path: Path, secret: str) -> None:
+def test_raw_base64_secrets_and_jwts_are_rejected_in_values(tmp_path: Path, secret: str) -> None:
     data = minimal_config()
     set_nested(data, "publication.version", secret)
 
@@ -384,7 +345,7 @@ def test_raw_azure_keys_and_jwts_are_rejected_in_values(tmp_path: Path, secret: 
         "password",
         "secret",
         "account_key",
-        "azure_storage_account_key",
+        "hf_token",
         "access_token",
     ],
 )
@@ -392,8 +353,8 @@ def test_explicit_credential_field_names_are_rejected(
     tmp_path: Path, credential_field: str
 ) -> None:
     data = minimal_config()
-    azure: dict[str, object] = data["azure"]  # type: ignore[assignment]
-    azure[credential_field] = "embedded-value"
+    huggingface: dict[str, object] = data["huggingface"]  # type: ignore[assignment]
+    huggingface[credential_field] = "embedded-value"
 
     with pytest.raises(ValidationError, match="credential key"):
         load_config(write_config(tmp_path, data))
@@ -515,18 +476,12 @@ def test_multi_separator_bearer_token_is_rejected_in_non_path_field(tmp_path: Pa
 @pytest.mark.parametrize(
     ("field", "url"),
     [
-        (
-            "azure.account_url",
-            "https://example.blob.core.windows.net?password=embedded",
-        ),
+        ("publication.version", "https://example.test/data?password=embedded"),
         (
             "publication.version",
             "https://example.test/data?access_token=embedded",
         ),
-        (
-            "azure.account_url",
-            "https://example.blob.core.windows.net/container?sv=2024-11-04&sp=r&se=2030-01-01&sig=embedded",
-        ),
+        ("publication.version", "https://example.test/data?sig=embedded"),
     ],
 )
 def test_credential_bearing_url_queries_are_rejected(tmp_path: Path, field: str, url: str) -> None:
@@ -535,44 +490,6 @@ def test_credential_bearing_url_queries_are_rejected(tmp_path: Path, field: str,
 
     with pytest.raises(ValidationError, match="credential"):
         load_config(write_config(tmp_path, data))
-
-
-def test_ordinary_url_query_parameters_are_allowed(tmp_path: Path) -> None:
-    data = minimal_config()
-    set_nested(
-        data,
-        "azure.account_url",
-        "https://example.blob.core.windows.net?api-version=2023-11-03&comp=list",
-    )
-
-    config = load_config(write_config(tmp_path, data))
-
-    assert "api-version=2023-11-03" in config.azure.account_url
-
-
-@pytest.mark.parametrize(
-    ("query_key", "query_value"),
-    [
-        ("sp", "robotics"),
-        ("st", "2026-01-01T00:00:00Z"),
-        ("se", "2030-01-01T00:00:00Z"),
-        ("sr", "search"),
-        ("sv", "2024-11-04"),
-    ],
-)
-def test_standalone_sas_metadata_query_parameters_are_allowed(
-    tmp_path: Path, query_key: str, query_value: str
-) -> None:
-    data = minimal_config()
-    set_nested(
-        data,
-        "azure.account_url",
-        f"https://example.blob.core.windows.net?{query_key}={query_value}",
-    )
-
-    config = load_config(write_config(tmp_path, data))
-
-    assert f"{query_key}={query_value}" in config.azure.account_url
 
 
 def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> None:
@@ -722,7 +639,7 @@ def test_manifest_and_publication_identifiers_are_safe_segments(
 @pytest.mark.parametrize(
     "section",
     [
-        "azure",
+        "huggingface",
         "paths",
         "topics",
         "downsampling",

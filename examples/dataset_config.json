@@ -1,9 +1,9 @@
 {
   "schema_version": "1.0",
-  "azure": {
-    "account_url": "https://roboticsdata.blob.core.windows.net",
-    "container": "recordings",
-    "blob_list": "mcap_blobs.txt"
+  "huggingface": {
+    "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-monocam",
+    "revision": "b13c3bd3a049c73b560910ef5dbc60cbd28c441b",
+    "manifest_path": "manifest.jsonl"
   },
   "paths": {
     "work_dir": "../var/work",

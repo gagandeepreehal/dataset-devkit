@@ -33,31 +33,6 @@
       "title": "AnnotationsConfig",
       "type": "object"
     },
-    "AzureConfig": {
-      "additionalProperties": false,
-      "properties": {
-        "account_url": {
-          "title": "Account Url",
-          "type": "string"
-        },
-        "blob_list": {
-          "format": "path",
-          "title": "Blob List",
-          "type": "string"
-        },
-        "container": {
-          "title": "Container",
-          "type": "string"
-        }
-      },
-      "required": [
-        "account_url",
-        "container",
-        "blob_list"
-      ],
-      "title": "AzureConfig",
-      "type": "object"
-    },
     "DownsamplingConfig": {
       "additionalProperties": false,
       "properties": {
@@ -102,7 +77,7 @@
     "FiltersConfig": {
       "additionalProperties": false,
       "properties": {
-        "blacklisted_blob_paths": {
+        "blacklisted_repo_paths": {
           "items": {
             "minLength": 1,
             "not": {
@@ -111,7 +86,7 @@
             "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
             "type": "string"
           },
-          "title": "Blacklisted Blob Paths",
+          "title": "Blacklisted Repo Paths",
           "type": "array",
           "uniqueItems": true
         },
@@ -532,6 +507,30 @@
         "sync_gap_max_ms"
       ],
       "title": "GnssConfig",
+      "type": "object"
+    },
+    "HuggingFaceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_path": {
+          "title": "Manifest Path",
+          "type": "string"
+        },
+        "repo_id": {
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_id",
+        "revision",
+        "manifest_path"
+      ],
+      "title": "HuggingFaceConfig",
       "type": "object"
     },
     "ImageConfig": {
@@ -1091,9 +1090,6 @@
     "annotations": {
       "$ref": "#/$defs/AnnotationsConfig"
     },
-    "azure": {
-      "$ref": "#/$defs/AzureConfig"
-    },
     "downsampling": {
       "$ref": "#/$defs/DownsamplingConfig"
     },
@@ -1108,6 +1104,9 @@
     },
     "gnss": {
       "$ref": "#/$defs/GnssConfig"
+    },
+    "huggingface": {
+      "$ref": "#/$defs/HuggingFaceConfig"
     },
     "image": {
       "$ref": "#/$defs/ImageConfig"
@@ -1147,7 +1146,7 @@
   },
   "required": [
     "schema_version",
-    "azure",
+    "huggingface",
     "paths",
     "topics",
     "downsampling",

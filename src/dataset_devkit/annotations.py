@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from dataset_devkit.blob_list import BlobListError, validate_blob_path
+from dataset_devkit.repository_paths import RepositoryPathError, validate_repo_mcap_path
 
 
 class AnnotationFormatError(ValueError):
@@ -29,7 +29,7 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 @dataclass(frozen=True)
 class ParsedAnnotation:
     line_number: int
-    blob_path: str
+    repo_path: str
     timestamp_ns: int
     labels: tuple[str, ...]
 
@@ -44,8 +44,8 @@ class AnnotationBudgets:
     max_labels_per_record: int = 256
     max_label_chars: int = 256
     max_label_bytes: int = 1024
-    max_blob_chars: int = 2048
-    max_blob_bytes: int = 4096
+    max_repo_path_chars: int = 2048
+    max_repo_path_bytes: int = 4096
 
     def __post_init__(self) -> None:
         if any(value <= 0 for value in self.__dict__.values()):
@@ -56,22 +56,24 @@ DEFAULT_ANNOTATION_BUDGETS = AnnotationBudgets()
 
 
 def _parse_record(value: object, line_number: int, budgets: AnnotationBudgets) -> ParsedAnnotation:
-    if not isinstance(value, dict) or set(value) != {"blob_path", "timestamp_ns", "labels"}:
+    if not isinstance(value, dict) or set(value) != {"repo_path", "timestamp_ns", "labels"}:
         raise AnnotationFormatError(
             f"invalid annotation object at line {line_number}: exact keys are required"
         )
-    blob_path = value["blob_path"]
+    repo_path = value["repo_path"]
     timestamp = value["timestamp_ns"]
     labels = value["labels"]
-    if not isinstance(blob_path, str):
-        raise AnnotationFormatError(f"invalid blob_path at line {line_number}")
-    if len(blob_path) > budgets.max_blob_chars:
-        raise AnnotationFormatError(f"blob path characters exceed budget at line {line_number}")
-    if len(blob_path.encode("utf-8")) > budgets.max_blob_bytes:
-        raise AnnotationFormatError(f"blob path bytes exceed budget at line {line_number}")
+    if not isinstance(repo_path, str):
+        raise AnnotationFormatError(f"invalid repo_path at line {line_number}")
+    if len(repo_path) > budgets.max_repo_path_chars:
+        raise AnnotationFormatError(
+            f"repository path characters exceed budget at line {line_number}"
+        )
+    if len(repo_path.encode("utf-8")) > budgets.max_repo_path_bytes:
+        raise AnnotationFormatError(f"repository path bytes exceed budget at line {line_number}")
     try:
-        validate_blob_path(blob_path, line_number=line_number)
-    except BlobListError as error:
+        validate_repo_mcap_path(repo_path, line_number=line_number)
+    except RepositoryPathError as error:
         raise AnnotationFormatError(str(error)) from error
     if not isinstance(timestamp, int) or isinstance(timestamp, bool) or timestamp < 0:
         raise AnnotationFormatError(
@@ -97,7 +99,7 @@ def _parse_record(value: object, line_number: int, budgets: AnnotationBudgets) -
             raise AnnotationFormatError(f"label characters exceed budget at line {line_number}")
         if len(label.encode("utf-8")) > budgets.max_label_bytes:
             raise AnnotationFormatError(f"label bytes exceed budget at line {line_number}")
-    return ParsedAnnotation(line_number, blob_path, timestamp, tuple(labels))
+    return ParsedAnnotation(line_number, repo_path, timestamp, tuple(labels))
 
 
 def parse_annotations(
@@ -146,7 +148,7 @@ def parse_annotations(
                     f"invalid JSON at line {line_number}: {error}"
                 ) from error
             record = _parse_record(value, line_number, budgets)
-            identity = (record.blob_path, record.timestamp_ns, record.labels)
+            identity = (record.repo_path, record.timestamp_ns, record.labels)
             if identity in identities:
                 raise AnnotationFormatError(
                     f"duplicate annotation at line {line_number} "

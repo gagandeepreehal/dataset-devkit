@@ -121,7 +121,7 @@ def test_many_short_scenes_index_feature_records_once_with_linear_visits(
         tmp_path / "annotations.jsonl",
         [
             {
-                "blob_path": SOURCE.blob_path,
+                "repo_path": SOURCE.repo_path,
                 "timestamp_ns": timestamp,
                 "labels": ["category/performance"],
             }
@@ -221,7 +221,7 @@ def test_one_sample_scene_has_finite_stationary_metrics(
 ) -> None:
     annotations = _annotations(
         tmp_path / "annotations.jsonl",
-        [{"blob_path": SOURCE.blob_path, "timestamp_ns": 0, "labels": ["category/demo"]}],
+        [{"repo_path": SOURCE.repo_path, "timestamp_ns": 0, "labels": ["category/demo"]}],
     )
     config = _annotation_config(
         config_factory(), mode="annotation_only", tolerance_ms=1, before_s=0, after_s=0

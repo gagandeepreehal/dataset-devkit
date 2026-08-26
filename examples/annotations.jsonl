@@ -1,2 +1,2 @@
-# Exact blob paths; blank and comment-only lines are allowed.
-{"blob_path":"mcap-h265/fleet/2026-07-01/vehicle-001/run-0001.mcap","timestamp_ns":1782864000000000000,"labels":["reviewed-turn"]}
+# Exact repository paths; blank and comment-only lines are allowed.
+{"repo_path":"data/fleet/2026-07-01/vehicle-001/run-0001.mcap","timestamp_ns":1782864000000000000,"labels":["reviewed-turn"]}

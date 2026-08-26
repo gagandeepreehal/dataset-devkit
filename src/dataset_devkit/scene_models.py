@@ -30,7 +30,7 @@ def _jsonable(value: object) -> object:
 class AnnotationRecord:
     token: str
     line_number: int
-    blob_path: str
+    repo_path: str
     timestamp_ns: int
     labels: tuple[str, ...]
 
@@ -71,7 +71,7 @@ class SceneRecord:
     labels: tuple[str, ...]
     annotation_refs: tuple[str, ...]
     annotation_window_ref: str
-    source_blob_path: str
+    source_repo_path: str
 
 
 @dataclass(frozen=True)

@@ -3,7 +3,7 @@
 Task 5 consumes one successful recording policy result at a time. Its only sample input is
 `ValidityReport.final_candidates`. Invalid retained audit samples, dropped invalid samples, and
 grid misses remain in the Task 4 report and can never become scenes. The builder also takes the
-exact Azure `SourceFingerprint`; local MCAP and staging paths are preserved as references but are
+exact Hugging Face `SourceFingerprint`; local MCAP and staging paths are preserved as references but are
 never token inputs.
 
 ## Configuration and integer time
@@ -44,24 +44,24 @@ The file is UTF-8 JSONL. Blank lines and lines whose first non-whitespace charac
 ignored. Every other line is one object with exactly these keys:
 
 ```json
-{"blob_path":"mcap-h265/fleet/run.mcap","timestamp_ns":1720000000000000000,"labels":["turn","rain"]}
+{"repo_path":"data/fleet/run.mcap","timestamp_ns":1720000000000000000,"labels":["turn","rain"]}
 ```
 
-`blob_path` must be an exact validated `mcap-h265/...mcap` container-relative path; basename and
+`repo_path` must be an exact validated `data/...mcap` repository path; basename and
 prefix matching are never used. `timestamp_ns` is a nonnegative JSON integer (not a boolean,
 float, or string). `labels` is a nonempty array of unique, trimmed, nonblank strings. Unknown or
-duplicate JSON keys and duplicate `(blob_path, timestamp_ns, labels)` records are line-numbered
+duplicate JSON keys and duplicate `(repo_path, timestamp_ns, labels)` records are line-numbered
 errors.
 
 Parsing is binary streaming and never loads the complete file. Stable inclusive defaults bound
 the file to 64 MiB, each physical line payload to 256 KiB, records to 250,000, labels per record
-to 256, each label to 256 Unicode characters/1,024 UTF-8 bytes, and each blob path to 2,048
+to 256, each label to 256 Unicode characters/1,024 UTF-8 bytes, and each repository path to 2,048
 characters/4,096 bytes. The line limit excludes either an LF or CRLF terminator consistently; the
 total-file limit includes every terminator byte. Exceeding any bound is a line-numbered format
 error.
 
-Every parsed record receives an audit. Records for another exact blob are
-`different_recording`. For the current blob, matching uses the nearest final valid logical
+Every parsed record receives an audit. Records for another exact repository path are
+`different_recording`. For the current recording, matching uses the nearest final valid logical
 sample. An exact distance tie chooses the earlier sample. Tolerance equality matches; a larger
 distance is `outside_tolerance`. Audits preserve the nearest sample timestamp, signed
 `sample - annotation` error, and absolute error only for a match. Every unmatched reason has null
@@ -86,7 +86,7 @@ appearance order. Annotation scenes may be shorter than automatic duration/sampl
 ## UUIDv5 graph and validation
 
 Scene, sample, per-camera sample-data, source annotation, and merged-window tokens use UUIDv5
-under `scenes.dataset_namespace`. Canonical identities include the exact source fingerprint/blob
+under `scenes.dataset_namespace`. Canonical identities include the exact source fingerprint/repository
 path and the relevant kind, configuration, timestamps, annotation/window identity, camera
 channel, and real camera timestamp/ordinal. They never include wall time, Python `hash()`, random
 UUIDs, local directories, or mapping iteration order.
@@ -114,7 +114,7 @@ record contains one logical timestamp, its canonical sorted nonempty expected ca
 the selected batch timestamp, and its valid-run identity. Sample data carries the complete immutable
 staged-image evidence rather than only a local path. Validation binds each sample's batch timestamp
 back to this source evidence, recomputes annotation UUIDs, and requires every scene's exact source
-blob path.
+repository path.
 `validate_scene_graph` checks globally unique tokens, foreign references, endpoint/count/order
 consistency, symmetric acyclic chains, within-scene channel chains and real pose timestamps,
 exactly one sample-data record per expected channel, no missing/extra/duplicate channel, unique

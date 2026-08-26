@@ -38,10 +38,10 @@ def _graph(
         for timestamp in (index * 2_000_000_000, index * 2_000_000_000 + 1_000_000)
     )
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        f"mcap-h265/{name}.mcap",
-        f'"{name}"',
+        "owner/dataset",
+        "a" * 40,
+        f"data/{name}.mcap",
+        "b" * 64,
         8,
     )
     report = _report(tmp_path / name, timestamps)
@@ -69,7 +69,7 @@ def _evidence(
                 scene_token=scene.token,
                 scene_name=scene.name,
                 source=graph.source,
-                source_blob_path=graph.source.blob_path,
+                source_repo_path=graph.source.repo_path,
             ),
             computed_tags=("selected",)
             if graph is selected_graph and index in {0, 2}

@@ -23,14 +23,14 @@ def config_factory() -> Callable[[], GlobalConfig]:
 @pytest.fixture
 def feature_factory() -> FeatureFactory:
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/a.mcap",
-        '"e"',
+        "owner/dataset",
+        "a" * 40,
+        "data/a.mcap",
+        "b" * 64,
         1,
     )
     base = SceneFeatures(
-        "scene", "scene", source, source.blob_path, (), ("moving",), "front", ("front",), 0,
+        "scene", "scene", source, source.repo_path, (), ("moving",), "front", ("front",), 0,
         (0,), (), (), (0.0,), (), (True,), (), 10.0, 5.0, 0.5, 0.5, 0.5, 0.5, 0.5,
         0, 0, 0.0, (0.0,), (), 0.0, 0.0, 0.0, (), 1.0, 1.0, (), 0.0, 0.0,
     )

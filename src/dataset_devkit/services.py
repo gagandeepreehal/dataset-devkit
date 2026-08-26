@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -11,8 +12,6 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol
 
-from dataset_devkit.acquisition import AcquisitionResult, AzureBlobAcquirer
-from dataset_devkit.blob_list import parse_blob_list
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.coordinator import (
     PublicationBlockedError,
@@ -36,6 +35,8 @@ from dataset_devkit.extraction.models import RecordingExtractionResult
 from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.features import SceneFeatures, compute_recording_features
 from dataset_devkit.filtering import filter_scenes
+from dataset_devkit.huggingface_acquisition import AcquisitionResult, HuggingFaceAcquirer
+from dataset_devkit.huggingface_manifest import ManifestEntry
 from dataset_devkit.provenance import SourceFingerprint, canonical_hash, extraction_config_hash
 from dataset_devkit.publication import (
     OwnedDirectoryAuthority,
@@ -57,7 +58,9 @@ class BuildOperationalError(RuntimeError):
 
 
 class AcquirerProtocol(Protocol):
-    def acquire(self, blob_path: str) -> AcquisitionResult: ...
+    def load_entries(self) -> tuple[ManifestEntry, ...]: ...
+
+    def acquire(self, entry: ManifestEntry) -> AcquisitionResult: ...
 
     def extraction_cache_reusable(
         self, source: SourceFingerprint, expected_extraction_config_hash: str
@@ -72,7 +75,7 @@ class AcquirerProtocol(Protocol):
 class BuildRuntime:
     """Injectable external-runtime boundary used by deterministic tests."""
 
-    acquirer_factory: Callable[[GlobalConfig], AcquirerProtocol] = AzureBlobAcquirer.from_config
+    acquirer_factory: Callable[[GlobalConfig], AcquirerProtocol] = HuggingFaceAcquirer.from_config
     decoder_factory: Callable[[], HevcDecoder] | None = None
     extraction_cache_factory: Callable[[Path], ExtractionResultCache] = ExtractionResultCache
     official_smoke: bool = True
@@ -211,10 +214,16 @@ def _build_evidence_owned(
     runtime: BuildRuntime,
     working: _WorkingExtractionRegistry,
 ) -> tuple[ExportEvidence, tuple[str, ...]]:
-    blobs = parse_blob_list(config.azure.blob_list)
-    if not blobs:
-        raise BuildOperationalError("blob list contains no recordings")
     acquirer = runtime.acquirer_factory(config)
+    entries = acquirer.load_entries()
+    if not entries:
+        raise BuildOperationalError("repository manifest contains no recordings")
+    config.paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    required_bytes = sum(entry.size for entry in entries)
+    if shutil.disk_usage(config.paths.cache_dir).free < required_bytes:
+        raise BuildOperationalError(
+            f"insufficient cache space for repository manifest ({required_bytes} bytes required)"
+        )
     decoder_factory = runtime.decoder_factory
     extractor_kwargs: dict[str, object] = {}
     if decoder_factory is not None:
@@ -228,21 +237,21 @@ def _build_evidence_owned(
         **extractor_kwargs,  # type: ignore[arg-type]
     )
 
-    def acquire_one(blob: str) -> AcquisitionResult | Exception:
+    def acquire_one(entry: ManifestEntry) -> AcquisitionResult | Exception:
         try:
-            return acquirer.acquire(blob)
+            return acquirer.acquire(entry)
         except Exception as error:
             return error
 
     with ThreadPoolExecutor(max_workers=config.execution.workers) as executor:
-        acquired_outcomes = tuple(executor.map(acquire_one, blobs))
-    acquired: list[tuple[int, str, AcquisitionResult]] = []
-    acquisition_errors: list[tuple[int, str, Exception]] = []
-    for index, (blob, outcome) in enumerate(zip(blobs, acquired_outcomes, strict=True)):
+        acquired_outcomes = tuple(executor.map(acquire_one, entries))
+    acquired: list[tuple[int, ManifestEntry, AcquisitionResult]] = []
+    acquisition_errors: list[tuple[int, ManifestEntry, Exception]] = []
+    for index, (entry, outcome) in enumerate(zip(entries, acquired_outcomes, strict=True)):
         if isinstance(outcome, Exception):
-            acquisition_errors.append((index, blob, outcome))
+            acquisition_errors.append((index, entry, outcome))
         else:
-            acquired.append((index, blob, outcome))
+            acquired.append((index, entry, outcome))
     acquisition_by_path = {
         item.artifact_path.resolve(): item for _, _, item in acquired
     }
@@ -287,13 +296,13 @@ def _build_evidence_owned(
         return extracted
 
     coordinator = RecordingCoordinator(config=config, extractor=extract_cached)
-    source_config_hash = canonical_hash(config.azure.model_dump(mode="json"))
+    source_config_hash = canonical_hash(config.huggingface.model_dump(mode="json"))
     extraction_hash = extraction_config_hash(config)
     acquisition_failures: list[RecordingFailure] = []
-    for index, blob, error in acquisition_errors:
+    for index, entry, error in acquisition_errors:
         request = RecordingRequest(
             f"recording-{index:06d}",
-            Path(blob),
+            Path(entry.repo_path),
             source_config_hash,
             extraction_hash,
         )
@@ -447,7 +456,7 @@ def _build_evidence_owned(
         except Exception:
             quarantine_complete = False
     failures = tuple(
-        blobs[int(item.recording_id.removeprefix("recording-"))]
+        entries[int(item.recording_id.removeprefix("recording-"))].repo_path
         for item in all_failures
     )
     if failures and (
@@ -490,7 +499,7 @@ def _build_evidence_owned(
         {"schema_version": 1, "state": "pending_finalization"},
         {
             "schema_version": 1,
-            "blob_order": list(blobs),
+            "source_order": [entry.repo_path for entry in entries],
             "failed_recordings": list(failures),
             "filter": {
                 "accepted": [

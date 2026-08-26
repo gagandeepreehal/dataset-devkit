@@ -60,7 +60,7 @@ class StratumSplitAudit:
 @dataclass(frozen=True)
 class AdjacentSceneLeakagePair:
     source_digest: str
-    source_blob_path: str
+    source_repo_path: str
     earlier_scene_token: str
     later_scene_token: str
     earlier_last_timestamp_ns: int
@@ -175,7 +175,7 @@ def _validate_inputs(
         feature = features[identity]
         assignment = assignments[identity]
         graph = graph_by_source[identity[1]]
-        if feature.source != graph.source or feature.source_blob_path != graph.source.blob_path:
+        if feature.source != graph.source or feature.source_repo_path != graph.source.repo_path:
             raise ValueError("selected feature source evidence differs from its recording graph")
         selected_scene = scene_by_identity.get(identity)
         if selected_scene is None:
@@ -413,7 +413,7 @@ def _compute_split(
                 pairs.append(
                     AdjacentSceneLeakagePair(
                         graph.source.digest,
-                        graph.source.blob_path,
+                        graph.source.repo_path,
                         earlier.token,
                         later.token,
                         earlier.last_timestamp_ns,

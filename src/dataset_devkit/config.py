@@ -6,7 +6,7 @@ import json
 import math
 import re
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 from urllib.parse import parse_qsl, urlsplit
 from uuid import UUID
@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema, field_validat
 
 from dataset_devkit.identifiers import SafeSegment
 
-_AZURE_ACCOUNT_KEY_PATTERN = re.compile(
+_BASE64_SECRET_PATTERN = re.compile(
     r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{86}==(?=$|[^A-Za-z0-9+/=])"
 )
 _JWT_PATTERN = re.compile(
@@ -52,21 +52,13 @@ _CREDENTIAL_KEY_NAMES = {
     "storagekey",
 }
 _CREDENTIAL_QUERY_KEYS = _CREDENTIAL_KEY_NAMES | {"sig", "signature"}
-_AZURE_BLOB_HOST_SUFFIXES = (
-    ".blob.core.windows.net",
-    ".blob.core.usgovcloudapi.net",
-    ".blob.core.chinacloudapi.cn",
-    ".blob.core.cloudapi.de",
-)
 _PATH_FIELD_LOCATIONS = {
-    "config.azure.blob_list",
     "config.paths.work_dir",
     "config.paths.cache_dir",
     "config.paths.output_dir",
     "config.annotations.path",
     "config.quarantine.directory",
 }
-_HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 def _is_credential_key(key: object) -> bool:
@@ -113,20 +105,6 @@ def _looks_like_opaque_bearer_token(value: str) -> bool:
     return _BEARER_TOKEN_PATTERN.fullmatch(payload) is not None
 
 
-def _is_azure_blob_service_host(hostname: str | None) -> bool:
-    if hostname is None:
-        return False
-    for suffix in _AZURE_BLOB_HOST_SUFFIXES:
-        if not hostname.endswith(suffix):
-            continue
-        prefix = hostname[: -len(suffix)]
-        labels = prefix.split(".")
-        if len(labels) == 2 and labels[1] == "privatelink":
-            labels.pop()
-        return len(labels) == 1 and _HOST_LABEL_PATTERN.fullmatch(labels[0]) is not None
-    return False
-
-
 def _paths_overlap(first: Path, second: Path) -> bool:
     return first == second or first in second.parents or second in first.parents
 
@@ -156,44 +134,38 @@ class ConfigRootError(ValueError):
     """Raised when a JSON configuration does not contain an object root."""
 
 
-class AzureConfig(StrictModel):
-    account_url: str
-    container: str
-    blob_list: Path
+class HuggingFaceConfig(StrictModel):
+    repo_id: str
+    revision: str
+    manifest_path: str
 
-    @field_validator("account_url")
+    @field_validator("repo_id")
     @classmethod
-    def reject_url_userinfo(cls, value: str) -> str:
-        parsed = urlsplit(value)
-        hostname = parsed.hostname
-        try:
-            _ = parsed.port
-        except ValueError as error:
-            raise ValueError("account_url must contain a valid port") from error
-        if parsed.scheme != "https" or not _is_azure_blob_service_host(hostname):
-            raise ValueError("account_url must be an HTTPS Azure Blob service URL")
-        if parsed.username is not None or parsed.password is not None:
-            raise ValueError("account_url must not contain credential userinfo")
-        if parsed.path not in {"", "/"}:
-            raise ValueError("account_url must not contain a container or blob path")
-        if "#" in value:
-            raise ValueError("account_url must not contain a fragment")
-        if _has_credential_url_query(value):
-            raise ValueError("account_url must not contain credential query parameters")
+    def validate_repo_id(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*", value) is None:
+            raise ValueError("repo_id must be exactly owner/name")
         return value
 
-    @field_validator("container")
+    @field_validator("revision")
     @classmethod
-    def validate_container_name(cls, value: str) -> str:
-        valid = (
-            3 <= len(value) <= 63
-            and re.fullmatch(r"[a-z0-9-]+", value) is not None
-            and value[0].isalnum()
-            and value[-1].isalnum()
-            and "--" not in value
-        )
-        if not valid:
-            raise ValueError("container must follow Azure container naming rules")
+    def validate_revision(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            raise ValueError("revision must be a full lowercase commit SHA")
+        return value
+
+    @field_validator("manifest_path")
+    @classmethod
+    def validate_manifest_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if (
+            path.is_absolute()
+            or not value
+            or "\\" in value
+            or any(marker in value for marker in ("%", "?", "#"))
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+            or path.as_posix() != value
+        ):
+            raise ValueError("manifest_path must be a normalized relative repository path")
         return value
 
 
@@ -536,7 +508,7 @@ class FiltersConfig(StrictModel):
     blacklisted_source_digests: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    blacklisted_blob_paths: list[TrimmedNonBlankString] = Field(
+    blacklisted_repo_paths: list[TrimmedNonBlankString] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
 
@@ -549,7 +521,7 @@ class FiltersConfig(StrictModel):
         "excluded_labels",
         "blacklisted_scene_tokens",
         "blacklisted_source_digests",
-        "blacklisted_blob_paths",
+        "blacklisted_repo_paths",
     )
     @classmethod
     def validate_string_lists(cls, values: list[str]) -> list[str]:
@@ -708,7 +680,7 @@ class PublicationConfig(StrictModel):
 
 class GlobalConfig(StrictModel):
     schema_version: Literal["1.0"]
-    azure: AzureConfig
+    huggingface: HuggingFaceConfig
     paths: PathsConfig
     topics: TopicsConfig
     downsampling: DownsamplingConfig
@@ -771,7 +743,7 @@ class GlobalConfig(StrictModel):
                         location not in _PATH_FIELD_LOCATIONS
                         and _looks_like_opaque_bearer_token(text)
                     )
-                    or _AZURE_ACCOUNT_KEY_PATTERN.search(text) is not None
+                    or _BASE64_SECRET_PATTERN.search(text) is not None
                     or _JWT_PATTERN.search(text) is not None
                     or re.fullmatch(r"sk-[A-Za-z0-9_-]{20,}", text) is not None
                     or "-----begin private key-----" in lowered
@@ -816,7 +788,6 @@ def load_config(path: Path) -> GlobalConfig:
     if isinstance(quarantine_data, dict):
         quarantine_data.setdefault("directory", "quarantine")
     for section, field in (
-        ("azure", "blob_list"),
         ("paths", "work_dir"),
         ("paths", "cache_dir"),
         ("paths", "output_dir"),

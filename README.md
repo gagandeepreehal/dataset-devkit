@@ -1,9 +1,8 @@
 # dataset-devkit
 
-`dataset-devkit` is a Python 3.12 package for building deterministic robotics datasets
-from MCAP recordings in Azure Blob Storage. This foundation release defines the public
-configuration, CLI, and Python API boundaries. Azure acquisition is implemented as a focused,
-injectable service. Native MCAP/protobuf extraction, persistent HEVC decode, deterministic camera
+`dataset-devkit` is a Python 3.12 package for building deterministic robotics datasets directly
+from MCAP recordings in a Hugging Face dataset repository. A commit-pinned repository manifest
+is the single input contract. Native MCAP/protobuf extraction, persistent HEVC decode, deterministic camera
 selection, GNSS interpolation, and verified JPEG staging are a separate focused service. Typed
 validity/sanity policy, safe quarantine reports, independent-recording partial-export gating,
 deterministic automatic/annotation/hybrid scene graphs, real-timestamp features and tags,
@@ -23,7 +22,6 @@ Copy the example files, then validate their paths and policies in code:
 
 ```bash
 cp examples/dataset_config.json dataset_config.json
-cp examples/mcap_blobs.txt mcap_blobs.txt
 cp examples/annotations.jsonl annotations.jsonl
 python -c 'from pathlib import Path; from dataset_devkit.config import load_config; print(load_config(Path("dataset_config.json")))'
 ```
@@ -73,24 +71,13 @@ the registry does not retain descriptors per recording; a cleanup that cannot re
 recorded path/device/inode blocks publication and leaves evidence for operator recovery. Artifacts
 explicitly reported as preserved quarantine evidence also remain in place.
 
-## Azure acquisition
+## Hugging Face acquisition
 
-Blob-list entries must be exact container-relative paths under `mcap-h265/` ending in `.mcap`.
-The acquisition service uses `DefaultAzureCredential`; it never accepts embedded keys, SAS
-tokens, or connection strings. Verified downloads are cached by the exact account, container,
-blob path, ETag, and size. Compatible `.partial` downloads can resume, while incompatible
-partials restart. Each finalized recording has a canonical provenance manifest recording its
-source fingerprint, local SHA-256 and size, Azure MD5 verification when available (or the
-size-and-stable-ETag fallback), result status, and requested extraction-config hash. That request
-hash is not proof that extraction ran. Extraction reuse becomes valid only when the extraction
-stage calls `AzureBlobAcquirer.record_extraction_complete(source, config_hash)`. Reuse decisions
-must use `AzureBlobAcquirer.extraction_cache_reusable(source, config_hash)`. These source-keyed
-methods record and read the separate completion manifest under the same trusted cache traversal
-and per-recording lock as acquisition; they do not accept caller-supplied manifest paths.
-Acquisition cache hits never create that proof.
-
-See [configuration.md](docs/configuration.md#managed-identity-smoke-check) for authentication and
-an optional one-blob smoke check.
+Configuration names one Hugging Face dataset repository, a full lowercase 40-character commit,
+and a repository manifest. Each manifest row supplies an exact `data/...mcap` repository path,
+positive byte size, and lowercase SHA-256. Files are downloaded with `huggingface_hub`, verified
+locally, and atomically promoted into the trusted cache. Authentication, when required, comes
+from the standard Hugging Face login or environment; tokens are never configuration fields.
 
 See [extraction.md](docs/extraction.md) for the exact source schema, timestamp, interpolation,
 staging, and structural-failure contract.
@@ -114,11 +101,7 @@ failure at those stages is quarantined and blocks publication by default. Settin
 `execution.allow_partial_export` to `true` permits successful recordings only when every failure
 report was durably quarantined and `cleanup_complete` is `true`. Cleanup debt blocks publication
 and authorizes zero recordings regardless of the partial-export setting. An authorized partial
-build explicitly reports `partial: true` and the failed blob names. Managed identity is always
-supplied by `DefaultAzureCredential`; secrets,
-SAS URLs, account keys, and connection strings are prohibited in configuration. The optional
-one-blob Azure smoke procedure is documented in
-[configuration.md](docs/configuration.md#managed-identity-smoke-check).
+build explicitly reports `partial: true` and the failed repository paths.
 
 ## Scene-level train/test split
 
@@ -151,8 +134,8 @@ front = dataset.camera(samples[0]["token"], "CAM_FRONT")
 pose = dataset.ego_pose(front["token"])
 ```
 
-See [configuration.md](docs/configuration.md) for the complete configuration contract and
-authentication rules. The generated schema is checked in at
+See [configuration.md](docs/configuration.md) for the complete configuration and source contract.
+The generated schema is checked in at
 `schema/dataset_config.schema.json`.
 
 ## Quality checks

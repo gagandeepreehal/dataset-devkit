@@ -11,13 +11,13 @@ from pathlib import Path, PurePosixPath
 from uuid import UUID, uuid5
 
 from dataset_devkit.annotations import ParsedAnnotation, parse_annotations
-from dataset_devkit.blob_list import BlobListError, validate_blob_path
 from dataset_devkit.config import GlobalConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import ExtractedCameraSample
 from dataset_devkit.extraction.staging import verify_staged_image_identity
 from dataset_devkit.identifiers import validate_safe_segment
 from dataset_devkit.provenance import SourceFingerprint, canonical_json
+from dataset_devkit.repository_paths import RepositoryPathError, validate_repo_mcap_path
 from dataset_devkit.scene_models import (
     AnnotationMatch,
     AnnotationRecord,
@@ -93,10 +93,10 @@ def _validate_input(
     report: ValidityReport, source: SourceFingerprint
 ) -> tuple[LogicalSampleAudit, ...]:
     try:
-        validate_blob_path(source.blob_path)
-    except BlobListError as error:
+        validate_repo_mcap_path(source.repo_path)
+    except RepositoryPathError as error:
         raise StructuralExtractionError(
-            "source fingerprint has an invalid exact blob path"
+            "source fingerprint has an invalid repository MCAP path"
         ) from error
     samples = report.final_candidates
     timestamps = tuple(item.grid_target_timestamp_ns for item in samples)
@@ -194,8 +194,8 @@ def _validate_input(
                 )
                 if not all(math.isfinite(value) for value in calibration_numbers):
                     raise StructuralExtractionError("sample calibration contains non-finite values")
-    if report.source_path.name and not source.blob_path:
-        raise StructuralExtractionError("source fingerprint lacks exact blob path")
+    if report.source_path.name and not source.repo_path:
+        raise StructuralExtractionError("source fingerprint lacks exact repository path")
     return samples
 
 
@@ -275,10 +275,10 @@ def _annotation_state(
             _token(
                 namespace,
                 "annotation",
-                [source_identity, item.line_number, item.blob_path, item.timestamp_ns, item.labels],
+                [source_identity, item.line_number, item.repo_path, item.timestamp_ns, item.labels],
             ),
             item.line_number,
-            item.blob_path,
+            item.repo_path,
             item.timestamp_ns,
             item.labels,
         )
@@ -287,7 +287,7 @@ def _annotation_state(
     matches: list[AnnotationMatch] = []
     candidates: list[_WindowCandidate] = []
     for parsed_item, record in zip(parsed, records, strict=True):
-        if parsed_item.blob_path != source.blob_path:
+        if parsed_item.repo_path != source.repo_path:
             matches.append(
                 AnnotationMatch(
                     record.token, record.line_number, False, None, None, None, "different_recording"
@@ -654,7 +654,7 @@ def _materialize(
                 candidate.labels,
                 candidate.annotation_refs,
                 candidate.window_token,
-                source.blob_path,
+                source.repo_path,
             )
         )
     return tuple(scenes), tuple(samples), tuple(sample_data)
@@ -960,7 +960,7 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             [
                 result.source.to_dict(),
                 annotation.line_number,
-                annotation.blob_path,
+                annotation.repo_path,
                 annotation.timestamp_ns,
                 annotation.labels,
             ],
@@ -987,7 +987,7 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         expected_match: tuple[bool, int | None, int | None, int | None, str]
         if match.line_number != annotation.line_number:
             raise StructuralExtractionError("annotation match line identity is inconsistent")
-        if annotation.blob_path != result.source.blob_path:
+        if annotation.repo_path != result.source.repo_path:
             expected_match = (False, None, None, None, "different_recording")
         elif not timestamp_values:
             expected_match = (False, None, None, None, "no_valid_samples")
@@ -1178,8 +1178,8 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         zip(result.scenes, expected_partitions, strict=True)
     ):
         members = samples_by_scene.get(scene.token, [])
-        if scene.source_blob_path != result.source.blob_path:
-            raise StructuralExtractionError("scene source blob path is inconsistent")
+        if scene.source_repo_path != result.source.repo_path:
+            raise StructuralExtractionError("scene source repository path is inconsistent")
         expected_scene_token = _token(
             result.dataset_namespace,
             "scene",

@@ -33,7 +33,7 @@ class SceneFeatures:
     scene_token: str
     scene_name: str
     source: SourceFingerprint
-    source_blob_path: str
+    source_repo_path: str
     human_labels: tuple[str, ...]
     computed_tags: tuple[str, ...]
     reference_camera_requested: str | None
@@ -283,7 +283,7 @@ def _compute_scene(
         scene.token,
         scene.name,
         result.source,
-        scene.source_blob_path,
+        scene.source_repo_path,
         tuple(scene.labels),
         derive_computed_tags(
             config,

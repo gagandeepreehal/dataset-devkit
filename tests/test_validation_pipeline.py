@@ -12,6 +12,7 @@ from dataclasses import replace
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -19,7 +20,6 @@ import pytest
 from conftest import FeatureFactory
 from dataset_devkit import publication as publication_module
 from dataset_devkit import validation as validation_module
-from dataset_devkit.acquisition import AcquisitionResult
 from dataset_devkit.config import (
     FiltersConfig,
     GlobalConfig,
@@ -39,10 +39,11 @@ from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import RecordingExtractionResult
 from dataset_devkit.extraction.service import OwnedRecordingExtraction, RecordingExtractor
 from dataset_devkit.features import RecordingFeatureResult, compute_recording_features
+from dataset_devkit.huggingface_acquisition import AcquisitionResult
+from dataset_devkit.huggingface_manifest import ManifestEntry
 from dataset_devkit.provenance import (
     AcquisitionManifest,
     ArtifactIdentity,
-    IntegrityVerification,
     SourceFingerprint,
     extraction_config_hash,
 )
@@ -80,16 +81,25 @@ class _FakeAcquirer:
         self.completed: set[tuple[str, str]] = set()
         self.lock = threading.Lock()
 
-    def acquire(self, blob_path: str) -> AcquisitionResult:
-        value = self.artifacts[blob_path]
+    def load_entries(self) -> tuple[ManifestEntry, ...]:
+        entries = []
+        for repo_path, value in self.artifacts.items():
+            content = b"failed" if isinstance(value, Exception) else value.read_bytes()
+            entries.append(
+                ManifestEntry(repo_path, len(content), hashlib.sha256(content).hexdigest())
+            )
+        return tuple(entries)
+
+    def acquire(self, entry: ManifestEntry) -> AcquisitionResult:
+        value = self.artifacts[entry.repo_path]
         if isinstance(value, Exception):
             raise value
         content = value.read_bytes()
         source = SourceFingerprint(
-            "https://example.blob.core.windows.net",
-            "recordings",
-            blob_path,
-            f'"{hashlib.sha256(content).hexdigest()[:16]}"',
+            "owner/dataset",
+            "a" * 40,
+            entry.repo_path,
+            hashlib.sha256(content).hexdigest(),
             len(content),
         )
         digest = hashlib.sha256(content).hexdigest()
@@ -97,7 +107,6 @@ class _FakeAcquirer:
             source,
             "downloaded",
             ArtifactIdentity(value.name, len(content), digest),
-            IntegrityVerification("size_etag", True, None),
             "0" * 64,
         )
         return AcquisitionResult(
@@ -124,12 +133,10 @@ class _FakeAcquirer:
 def _pipeline_config(
     base: GlobalConfig,
     tmp_path: Path,
-    blobs: tuple[str, ...],
+    repo_paths: tuple[str, ...],
     *,
     partial: bool,
 ) -> GlobalConfig:
-    blob_list = tmp_path / "mcap_blobs.txt"
-    blob_list.write_text("".join(f"{blob}\n" for blob in blobs))
     annotations = tmp_path / "annotations.jsonl"
     annotations.write_text("")
     paths = base.paths.model_copy(
@@ -158,7 +165,6 @@ def _pipeline_config(
     )
     return base.model_copy(
         update={
-            "azure": base.azure.model_copy(update={"blob_list": blob_list}),
             "paths": paths,
             "annotations": base.annotations.model_copy(update={"path": annotations}),
             "scenes": scenes,
@@ -616,7 +622,7 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
             for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
         ),
     )
-    blob = "mcap-h265/recording.mcap"
+    blob = "data/recording.mcap"
     config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
     acquirer = _FakeAcquirer({blob: recording})
     decoder_creations = 0
@@ -638,7 +644,7 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     first_decoder_creations = decoder_creations
     assert first_decoder_creations > 0
     assert Dataset(first.dataroot).validation_report()["succeeded"] is True
-    source = acquirer.acquire(blob).manifest.source
+    source = acquirer.acquire(acquirer.load_entries()[0]).manifest.source
     extraction_hash = extraction_config_hash(config)
     extraction_cache = ExtractionResultCache(config.paths.cache_dir)
     assert extraction_cache.contains(source, extraction_hash)
@@ -697,6 +703,25 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     assert json.loads(capsys.readouterr().out)["dataroot"] == str(third.dataroot)
 
 
+def test_build_rejects_manifest_that_exceeds_available_cache_space(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = tmp_path / "recording.mcap"
+    recording.write_bytes(b"mcap")
+    repo_path = "data/recording.mcap"
+    config = _pipeline_config(config_factory(), tmp_path, (repo_path,), partial=False)
+    runtime = BuildRuntime(acquirer_factory=lambda _config: _FakeAcquirer({repo_path: recording}))
+    monkeypatch.setattr(
+        "dataset_devkit.services.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=recording.stat().st_size - 1),
+    )
+
+    with pytest.raises(BuildOperationalError, match="insufficient cache space"):
+        build_dataset(config, runtime=runtime)
+
+
 def test_true_pyav_multicamera_build_is_officially_loadable_and_repeatable(
     tmp_path: Path,
     config_factory: Callable[[], GlobalConfig],
@@ -728,7 +753,7 @@ def test_true_pyav_multicamera_build_is_officially_loadable_and_repeatable(
             for index, timestamp in enumerate(timestamps)
         ),
     )
-    blob = "mcap-h265/true-pyav.mcap"
+    blob = "data/true-pyav.mcap"
     config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
     acquirer = _FakeAcquirer({blob: recording})
 
@@ -790,8 +815,8 @@ def test_stage_injected_partial_failure_requires_persisted_quarantine(
             for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
         ),
     )
-    good = "mcap-h265/good.mcap"
-    bad = "mcap-h265/bad.mcap"
+    good = "data/good.mcap"
+    bad = "data/bad.mcap"
     config = _pipeline_config(config_factory(), tmp_path, (good, bad), partial=False)
     acquirer = _FakeAcquirer({good: recording, bad: RuntimeError("transport failed")})
     runtime = BuildRuntime(
@@ -840,8 +865,8 @@ def test_feature_failure_blocks_default_and_partial_export_keeps_good_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     good_path, bad_path = _two_pipeline_recordings(tmp_path)
-    good_blob = "mcap-h265/good.mcap"
-    bad_blob = "mcap-h265/bad.mcap"
+    good_blob = "data/good.mcap"
+    bad_blob = "data/bad.mcap"
     config = _pipeline_config(
         config_factory(), tmp_path, (good_blob, bad_blob), partial=False
     )
@@ -857,7 +882,7 @@ def test_feature_failure_blocks_default_and_partial_export_keeps_good_source(
     def fail_bad_feature(
         graph: RecordingSceneResult, tags: TagsConfig
     ) -> RecordingFeatureResult:
-        if graph.source.blob_path == bad_blob:
+        if graph.source.repo_path == bad_blob:
             raise StructuralExtractionError("injected per-source feature failure")
         return original_compute(graph, tags)
 
@@ -896,8 +921,8 @@ def test_export_preflight_failure_blocks_default_and_partial_keeps_good_source(
     failure_kind: str,
 ) -> None:
     good_path, bad_path = _two_pipeline_recordings(tmp_path)
-    good_blob = "mcap-h265/good.mcap"
-    bad_blob = "mcap-h265/bad.mcap"
+    good_blob = "data/good.mcap"
+    bad_blob = "data/bad.mcap"
     config = _pipeline_config(
         config_factory(), tmp_path, (good_blob, bad_blob), partial=False
     )
@@ -910,7 +935,7 @@ def test_export_preflight_failure_blocks_default_and_partial_keeps_good_source(
     )
 
     def fail_bad_preflight(graph: RecordingSceneResult) -> None:
-        if graph.source.blob_path != bad_blob:
+        if graph.source.repo_path != bad_blob:
             preflight_recording_export(graph)
             return
         if failure_kind == "image":
@@ -967,7 +992,7 @@ def test_build_never_publishes_or_deletes_a_replacement_staging_entry(
             for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
         ),
     )
-    blob = "mcap-h265/recording.mcap"
+    blob = "data/recording.mcap"
     config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
     runtime = BuildRuntime(
         acquirer_factory=lambda _config: _FakeAcquirer({blob: recording}),
@@ -1055,10 +1080,10 @@ def test_extraction_result_cache_is_materialized_and_tamper_evident(
         decoder_factory=DeterministicDecoder,
     ).extract(recording)
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/recording.mcap",
-        '"etag"',
+        "owner/dataset",
+        "a" * 40,
+        "data/recording.mcap",
+        "b" * 64,
         recording.stat().st_size,
     )
     config_hash = "a" * 64
@@ -1089,7 +1114,7 @@ def test_extraction_result_cache_is_materialized_and_tamper_evident(
         stored_path.read_bytes()
     ).hexdigest()
     assert not cache.contains(source, "b" * 64)
-    changed_source = replace(source, etag='"changed"')
+    changed_source = replace(source, sha256="c" * 64)
     assert not cache.contains(changed_source, config_hash)
 
     assert stored_path.stat().st_mode & 0o222 == 0
@@ -1117,10 +1142,10 @@ def _cache_security_case(
         decoder_factory=DeterministicDecoder,
     ).extract(recording)
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/security-recording.mcap",
-        '"etag"',
+        "owner/dataset",
+        "a" * 40,
+        "data/security-recording.mcap",
+        "b" * 64,
         recording.stat().st_size,
     )
     return recording, extracted, source
@@ -1325,7 +1350,7 @@ def test_failed_cache_completion_cleans_owned_working_extraction(
             camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
         ),
     )
-    blob = "mcap-h265/recording.mcap"
+    blob = "data/recording.mcap"
     config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
     acquirer = _FakeAcquirer({blob: recording})
     cache = ExtractionResultCache(config.paths.cache_dir)
@@ -1364,7 +1389,7 @@ def test_failed_cache_completion_reports_uncleaned_owned_working_tree(
             camera_message(1_000_000_000, (1_000_000_010, 1_000_000_020)),
         ),
     )
-    blob = "mcap-h265/recording.mcap"
+    blob = "data/recording.mcap"
     config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
     acquirer = _FakeAcquirer({blob: recording})
     cache = ExtractionResultCache(config.paths.cache_dir)
@@ -1420,8 +1445,8 @@ def test_partial_pipeline_never_publishes_after_owned_cleanup_failure(
     )
     write_mcap(good_recording, camera_payloads=payloads)
     write_mcap(bad_recording, camera_payloads=payloads)
-    good_blob = "mcap-h265/good.mcap"
-    bad_blob = "mcap-h265/bad.mcap"
+    good_blob = "data/good.mcap"
+    bad_blob = "data/bad.mcap"
     config = _pipeline_config(
         config_factory(), tmp_path, (good_blob, bad_blob), partial=True
     )
@@ -1430,8 +1455,9 @@ def test_partial_pipeline_never_publishes_after_owned_cleanup_failure(
     )
     extraction_hash = extraction_config_hash(config)
     for blob in (good_blob, bad_blob):
+        entry = next(item for item in acquirer.load_entries() if item.repo_path == blob)
         acquirer.record_extraction_complete(
-            acquirer.acquire(blob).manifest.source, extraction_hash
+            acquirer.acquire(entry).manifest.source, extraction_hash
         )
     good_extraction = RecordingExtractor(
         camera_topic=config.topics.camera,
@@ -1455,7 +1481,7 @@ def test_partial_pipeline_never_publishes_after_owned_cleanup_failure(
             _working_root: Path,
             _recording_id: str,
         ) -> MaterializedExtraction:
-            if source.blob_path == bad_blob:
+            if source.repo_path == bad_blob:
                 original = ValueError("injected cache materialization failure")
                 cleanup = OwnedDirectoryCleanupError(
                     (failed_authority.cleanup_failure(),)
@@ -1511,8 +1537,8 @@ def test_partial_pipeline_blocks_fresh_extraction_rollback_failure(
     )
     write_mcap(good_recording, camera_payloads=payloads)
     write_mcap(bad_recording, camera_payloads=payloads)
-    good_blob = "mcap-h265/good-fresh.mcap"
-    bad_blob = "mcap-h265/bad-fresh.mcap"
+    good_blob = "data/good-fresh.mcap"
+    bad_blob = "data/bad-fresh.mcap"
     config = _pipeline_config(
         config_factory(), tmp_path, (good_blob, bad_blob), partial=True
     )
@@ -1584,8 +1610,8 @@ def test_partial_pipeline_blocks_failed_authority_handoff(
     )
     write_mcap(good_recording, camera_payloads=payloads)
     write_mcap(bad_recording, camera_payloads=payloads)
-    good_blob = "mcap-h265/good-handoff.mcap"
-    bad_blob = "mcap-h265/bad-handoff.mcap"
+    good_blob = "data/good-handoff.mcap"
+    bad_blob = "data/bad-handoff.mcap"
     config = _pipeline_config(
         config_factory(), tmp_path, (good_blob, bad_blob), partial=True
     )
@@ -1653,8 +1679,8 @@ def test_partial_pipeline_blocks_unpinned_fresh_invocation(
     )
     write_mcap(good_recording, camera_payloads=payloads)
     write_mcap(bad_recording, camera_payloads=payloads)
-    good_blob = "mcap-h265/good-preauthority.mcap"
-    bad_blob = "mcap-h265/bad-preauthority.mcap"
+    good_blob = "data/good-preauthority.mcap"
+    bad_blob = "data/bad-preauthority.mcap"
     config = _pipeline_config(
         config_factory(), tmp_path, (good_blob, bad_blob), partial=True
     )
@@ -1721,8 +1747,8 @@ def test_partial_pipeline_blocks_first_stat_invocation_replacement(
     )
     write_mcap(good_recording, camera_payloads=payloads)
     write_mcap(bad_recording, camera_payloads=payloads)
-    good_blob = "mcap-h265/good-first-stat.mcap"
-    bad_blob = "mcap-h265/bad-first-stat.mcap"
+    good_blob = "data/good-first-stat.mcap"
+    bad_blob = "data/bad-first-stat.mcap"
     config = _pipeline_config(
         config_factory(), tmp_path, (good_blob, bad_blob), partial=True
     )
@@ -1797,7 +1823,7 @@ def test_post_export_working_cleanup_failure_blocks_publication(
             for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
         ),
     )
-    blob = "mcap-h265/recording.mcap"
+    blob = "data/recording.mcap"
     config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
     runtime = BuildRuntime(
         acquirer_factory=lambda _config: _FakeAcquirer({blob: recording}),
@@ -1831,7 +1857,7 @@ def test_global_failure_surfaces_working_cleanup_failure_with_original_cause(
             for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
         ),
     )
-    blob = "mcap-h265/recording.mcap"
+    blob = "data/recording.mcap"
     config = _pipeline_config(config_factory(), tmp_path, (blob,), partial=False)
     runtime = BuildRuntime(
         acquirer_factory=lambda _config: _FakeAcquirer({blob: recording}),
@@ -1934,10 +1960,10 @@ def test_extraction_result_cache_force_refresh_replaces_an_existing_generation(
     )
     extracted = extractor.extract(recording)
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/recording.mcap",
-        '"etag"',
+        "owner/dataset",
+        "a" * 40,
+        "data/recording.mcap",
+        "b" * 64,
         recording.stat().st_size,
     )
     config_hash = "a" * 64
@@ -1972,10 +1998,10 @@ def test_extraction_result_cache_interrupted_refresh_preserves_previous_generati
         decoder_factory=DeterministicDecoder,
     ).extract(recording)
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/recording.mcap",
-        '"etag"',
+        "owner/dataset",
+        "a" * 40,
+        "data/recording.mcap",
+        "b" * 64,
         recording.stat().st_size,
     )
     config_hash = "a" * 64
@@ -2014,10 +2040,10 @@ def test_extraction_result_cache_refresh_cleanup_preserves_replacement_directory
         decoder_factory=DeterministicDecoder,
     ).extract(recording)
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/recording.mcap",
-        '"etag"',
+        "owner/dataset",
+        "a" * 40,
+        "data/recording.mcap",
+        "b" * 64,
         recording.stat().st_size,
     )
     config_hash = "a" * 64
@@ -2075,10 +2101,10 @@ def test_extraction_result_cache_post_exchange_failure_never_cleans_new_final(
         decoder_factory=DeterministicDecoder,
     ).extract(recording)
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/recording.mcap",
-        '"etag"',
+        "owner/dataset",
+        "a" * 40,
+        "data/recording.mcap",
+        "b" * 64,
         recording.stat().st_size,
     )
     config_hash = "a" * 64
@@ -2119,10 +2145,10 @@ def test_extraction_result_cache_concurrent_refreshes_publish_complete_generatio
         decoder_factory=DeterministicDecoder,
     ).extract(recording)
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/recording.mcap",
-        '"etag"',
+        "owner/dataset",
+        "a" * 40,
+        "data/recording.mcap",
+        "b" * 64,
         recording.stat().st_size,
     )
     config_hash = "a" * 64

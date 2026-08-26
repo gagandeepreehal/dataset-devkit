@@ -480,7 +480,7 @@ def _validate_pipeline_audit(
     pipeline_audit: object,
     config: GlobalConfig | None,
     scene_to_source: dict[str, str],
-    source_blob_paths: dict[str, str],
+    source_repo_paths: dict[str, str],
     split: object,
     findings: list[ValidationFinding],
 ) -> list[dict[str, Any]] | None:
@@ -493,8 +493,8 @@ def _validate_pipeline_audit(
         fail("pipeline audit report is malformed")
         return None
     expected_keys = {"schema_version", "filter", "selection", "graph_scene_sequence"}
-    if "blob_order" in pipeline_audit or "failed_recordings" in pipeline_audit:
-        expected_keys.update({"blob_order", "failed_recordings"})
+    if "source_order" in pipeline_audit or "failed_recordings" in pipeline_audit:
+        expected_keys.update({"source_order", "failed_recordings"})
     filter_audit = pipeline_audit.get("filter")
     selection = pipeline_audit.get("selection")
     sequence = pipeline_audit.get("graph_scene_sequence")
@@ -583,7 +583,7 @@ def _validate_pipeline_audit(
         return None
     sequence_keys = {
         "source_digest",
-        "source_blob_path",
+        "source_repo_path",
         "scene_token",
         "ordinal",
         "first_timestamp_ns",
@@ -593,7 +593,7 @@ def _validate_pipeline_audit(
         not isinstance(item, dict)
         or set(item) != sequence_keys
         or not isinstance(item.get("source_digest"), str)
-        or not isinstance(item.get("source_blob_path"), str)
+        or not isinstance(item.get("source_repo_path"), str)
         or not isinstance(item.get("scene_token"), str)
         or not isinstance(item.get("ordinal"), int)
         or isinstance(item.get("ordinal"), bool)
@@ -662,7 +662,7 @@ def _validate_pipeline_audit(
         or selected_ids != published_ids
         or selected_ids != split_ids
         or any(
-            source_blob_paths.get(item["source_digest"]) != item["source_blob_path"]
+            source_repo_paths.get(item["source_digest"]) != item["source_repo_path"]
             for item in typed_sequence
         )
         or any(
@@ -695,7 +695,7 @@ def _validate_split_extension(
     config: GlobalConfig | None,
     tables: dict[str, list[dict[str, Any]]],
     scene_to_source: dict[str, str],
-    source_blob_paths: dict[str, str],
+    source_repo_paths: dict[str, str],
     pipeline_audit: object,
     findings: list[ValidationFinding],
 ) -> None:
@@ -999,7 +999,7 @@ def _validate_split_extension(
     )
     sequence_fields = {
         "source_digest",
-        "source_blob_path",
+        "source_repo_path",
         "scene_token",
         "ordinal",
         "first_timestamp_ns",
@@ -1034,7 +1034,7 @@ def _validate_split_extension(
             expected_pairs.append(
                 {
                     "source_digest": source,
-                    "source_blob_path": source_blob_paths.get(source),
+                    "source_repo_path": source_repo_paths.get(source),
                     "earlier_scene_token": earlier_token,
                     "later_scene_token": later_token,
                     "earlier_last_timestamp_ns": earlier["last_timestamp_ns"],
@@ -1052,7 +1052,7 @@ def _validate_split_extension(
                 set(actual)
                 != {
                     "source_digest",
-                    "source_blob_path",
+                    "source_repo_path",
                     "earlier_scene_token",
                     "later_scene_token",
                     "earlier_last_timestamp_ns",
@@ -1061,7 +1061,7 @@ def _validate_split_extension(
                     "later_split",
                 }
                 or actual.get("source_digest") != expected["source_digest"]
-                or actual.get("source_blob_path") != expected["source_blob_path"]
+                or actual.get("source_repo_path") != expected["source_repo_path"]
                 or actual.get("earlier_scene_token") != expected["earlier_scene_token"]
                 or actual.get("later_scene_token") != expected["later_scene_token"]
                 or actual.get("earlier_split") != expected["earlier_split"]
@@ -1121,10 +1121,10 @@ def _extensions(
     }
     recording_sources: set[str] = set()
     log_to_source: dict[str, str] = {}
-    source_blob_paths: dict[str, str] = {}
+    source_repo_paths: dict[str, str] = {}
     channels_by_source: dict[str, dict[str, str]] = {}
     recording_keys = {"source", "source_digest", "log_token", "channels"}
-    source_keys = {"account_url", "container", "blob_path", "etag", "size"}
+    source_keys = {"repo_id", "revision", "repo_path", "sha256", "size"}
     channel_keys = {"original", "normalized"}
     if isinstance(recordings, list) and all(
         isinstance(item, dict) and set(item) == recording_keys for item in recordings
@@ -1152,7 +1152,7 @@ def _extensions(
             recording_sources.add(source)
             log_to_source[log_token] = source
             source_value = item.get("source")
-            blob_path = source_value.get("blob_path") if isinstance(source_value, dict) else None
+            repo_path = source_value.get("repo_path") if isinstance(source_value, dict) else None
             channels = item.get("channels")
             channel_rows = (
                 cast(list[dict[str, Any]], channels) if isinstance(channels, list) else []
@@ -1161,8 +1161,8 @@ def _extensions(
             if (
                 not isinstance(source_value, dict)
                 or set(source_value) != source_keys
-                or not isinstance(blob_path, str)
-                or source in source_blob_paths
+                or not isinstance(repo_path, str)
+                or source in source_repo_paths
                 or not isinstance(channels, list)
                 or any(not isinstance(row, dict) or set(row) != channel_keys for row in channels)
                 or any(
@@ -1181,7 +1181,7 @@ def _extensions(
                     )
                 )
             else:
-                source_blob_paths[source] = blob_path
+                source_repo_paths[source] = repo_path
                 channels_by_source[source] = {
                     cast(str, row["normalized"]): cast(str, row["original"])
                     for row in channel_rows
@@ -1957,7 +1957,7 @@ def _extensions(
             "source_digest",
             "token",
             "line_number",
-            "blob_path",
+            "repo_path",
             "timestamp_ns",
             "labels",
         }
@@ -2013,8 +2013,8 @@ def _extensions(
         }
         malformed_annotations = malformed_annotations or any(
             item.get("source_digest") not in recording_sources
-            or source_blob_paths.get(cast(str, item.get("source_digest")))
-            != item.get("blob_path")
+            or source_repo_paths.get(cast(str, item.get("source_digest")))
+            != item.get("repo_path")
             for item in records_typed
         )
         malformed_annotations = malformed_annotations or any(
@@ -2066,7 +2066,7 @@ def _extensions(
         pipeline_audit,
         config,
         scene_to_source,
-        source_blob_paths,
+        source_repo_paths,
         split,
         findings,
     )
@@ -2075,7 +2075,7 @@ def _extensions(
         config,
         tables,
         scene_to_source,
-        source_blob_paths,
+        source_repo_paths,
         pipeline_audit,
         findings,
     )

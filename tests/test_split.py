@@ -34,10 +34,10 @@ def _graph(
     tmp_path: Path, config: GlobalConfig, name: str, count: int = 4
 ) -> RecordingSceneResult:
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        f"mcap-h265/{name}.mcap",
-        f'"{name}"',
+        "owner/dataset",
+        "a" * 40,
+        f"data/{name}.mcap",
+        "b" * 64,
         count,
     )
     timestamps = tuple(
@@ -66,7 +66,7 @@ def _selection(
             scene_token=scene.token,
             scene_name=scene.name,
             source=graph.source,
-            source_blob_path=graph.source.blob_path,
+            source_repo_path=graph.source.repo_path,
         )
         for graph, scene in pairs
     )
@@ -259,7 +259,7 @@ def test_rejects_missing_foreign_duplicate_and_mutated_evidence(
             ),
         )
     elif mutation == "graph":
-        first = replace(first, source=replace(first.source, etag='"changed"'))
+        first = replace(first, source=replace(first.source, sha256="c" * 64))
         graphs = (first,)
     with pytest.raises(ValueError):
         _split(selection, graphs, SplitConfig(test_fraction=0.5, seed=1, stratify=False))

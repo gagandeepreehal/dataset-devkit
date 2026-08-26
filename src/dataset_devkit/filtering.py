@@ -16,7 +16,7 @@ class RejectionReason:
     threshold: object
     scene_token: str
     source_digest: str
-    source_blob_path: str
+    source_repo_path: str
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ class _CompiledFilter:
     excluded_labels: frozenset[str]
     blacklisted_scene_tokens: frozenset[str]
     blacklisted_source_digests: frozenset[str]
-    blacklisted_blob_paths: frozenset[str]
+    blacklisted_repo_paths: frozenset[str]
 
 
 def _compile_filter(config: FiltersConfig) -> _CompiledFilter:
@@ -58,7 +58,7 @@ def _compile_filter(config: FiltersConfig) -> _CompiledFilter:
         frozenset(config.excluded_labels),
         frozenset(config.blacklisted_scene_tokens),
         frozenset(config.blacklisted_source_digests),
-        frozenset(config.blacklisted_blob_paths),
+        frozenset(config.blacklisted_repo_paths),
     )
 
 
@@ -76,7 +76,7 @@ def _evaluate(
                 threshold,
                 feature.scene_token,
                 feature.source.digest,
-                feature.source_blob_path,
+                feature.source_repo_path,
             )
         )
 
@@ -179,12 +179,12 @@ def _evaluate(
             "not in",
             tuple(config.blacklisted_source_digests),
         )
-    if feature.source_blob_path in compiled.blacklisted_blob_paths:
+    if feature.source_repo_path in compiled.blacklisted_repo_paths:
         reject(
-            "blob_path_blacklisted",
-            feature.source_blob_path,
+            "repo_path_blacklisted",
+            feature.source_repo_path,
             "not in",
-            tuple(config.blacklisted_blob_paths),
+            tuple(config.blacklisted_repo_paths),
         )
     return tuple(reasons)
 

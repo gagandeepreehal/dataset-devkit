@@ -60,10 +60,10 @@ recording records for each scene.
 
 An empty `filters` object accepts everything. Duration, scene-valid and source-GNSS-valid ratios,
 overall/per-channel camera coverage, maximum synchronization error (milliseconds), distance, tags, human labels, and
-exact scene-token/source-digest/blob-path blacklists are independent criteria. Every configured
+exact scene-token/source-digest/repository-path blacklists are independent criteria. Every configured
 criterion is evaluated, so one rejected scene may carry multiple stable `RejectionReason` records.
 Each reason contains its code, measured value, operator, threshold or expected set, scene token,
-source digest, and exact blob path. Accepted and rejected outputs preserve input order.
+source digest, and exact repository path. Accepted and rejected outputs preserve input order.
 Predicate and blacklist sets are compiled once for each `filter_scenes` call and reused for every
 feature in that call.
 

@@ -71,10 +71,10 @@ def _evidence(
             )
             report = replace(report, sample_audits=audits, final_candidates=audits)
         source = SourceFingerprint(
-            "https://example.blob.core.windows.net",
-            "recordings",
-            f"mcap-h265/recording-{index}.mcap",
-            f'"recording-{index}"',
+            "owner/dataset",
+            "a" * 40,
+            f"data/recording-{index}.mcap",
+            "b" * 64,
             4,
         )
         graphs_list.append(
@@ -116,17 +116,17 @@ def _annotated_evidence(
     feature_factory: FeatureFactory,
 ) -> ExportEvidence:
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/annotated.mcap",
-        '"annotated"',
+        "owner/dataset",
+        "a" * 40,
+        "data/annotated.mcap",
+        "b" * 64,
         2,
     )
     annotation_path = _annotations(
         tmp_path / "annotations.jsonl",
         [
             {
-                "blob_path": source.blob_path,
+                "repo_path": source.repo_path,
                 "timestamp_ns": 0,
                 "labels": ["merge"],
             }
@@ -151,7 +151,7 @@ def _annotated_evidence(
             scene_token=scene.token,
             scene_name=scene.name,
             source=source,
-            source_blob_path=source.blob_path,
+            source_repo_path=source.repo_path,
             human_labels=scene.labels,
             computed_tags=("road",),
         ),

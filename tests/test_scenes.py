@@ -47,10 +47,10 @@ from dataset_devkit.validity import (
 from mcap_fixture import camera_message, write_mcap
 
 SOURCE = SourceFingerprint(
-    "https://example.blob.core.windows.net",
-    "recordings",
-    "mcap-h265/day/a.mcap",
-    '"etag"',
+    "owner/dataset",
+    "a" * 40,
+    "data/day/a.mcap",
+    "b" * 64,
     123,
 )
 
@@ -379,9 +379,9 @@ def test_nearest_annotation_match_uses_earlier_tie_and_exact_tolerance(
     annotation_path = _annotations(
         tmp_path / "annotations.jsonl",
         [
-            {"blob_path": SOURCE.blob_path, "timestamp_ns": 1_000_000_000, "labels": ["tie"]},
-            {"blob_path": SOURCE.blob_path, "timestamp_ns": 3_000_000_001, "labels": ["late"]},
-            {"blob_path": "mcap-h265/day/other.mcap", "timestamp_ns": 0, "labels": ["other"]},
+            {"repo_path": SOURCE.repo_path, "timestamp_ns": 1_000_000_000, "labels": ["tie"]},
+            {"repo_path": SOURCE.repo_path, "timestamp_ns": 3_000_000_001, "labels": ["late"]},
+            {"repo_path": "data/day/other.mcap", "timestamp_ns": 0, "labels": ["other"]},
         ],
     )
     config = _annotation_config(
@@ -423,16 +423,16 @@ def test_annotation_windows_clip_to_runs_and_merge_overlap_with_lineage(
         tmp_path / "annotations.jsonl",
         [
             {
-                "blob_path": SOURCE.blob_path,
+                "repo_path": SOURCE.repo_path,
                 "timestamp_ns": 1_000_000_000,
                 "labels": ["turn", "rain"],
             },
             {
-                "blob_path": SOURCE.blob_path,
+                "repo_path": SOURCE.repo_path,
                 "timestamp_ns": 2_000_000_000,
                 "labels": ["rain", "pedestrian"],
             },
-            {"blob_path": SOURCE.blob_path, "timestamp_ns": 5_000_000_000, "labels": ["later"]},
+            {"repo_path": SOURCE.repo_path, "timestamp_ns": 5_000_000_000, "labels": ["later"]},
         ],
     )
     config = _annotation_config(
@@ -467,12 +467,12 @@ def test_merged_annotation_lineage_and_labels_follow_source_lines_not_time(
         tmp_path / "reverse-annotations.jsonl",
         [
             {
-                "blob_path": SOURCE.blob_path,
+                "repo_path": SOURCE.repo_path,
                 "timestamp_ns": 2_000_000_000,
                 "labels": ["zebra", "alpha"],
             },
             {
-                "blob_path": SOURCE.blob_path,
+                "repo_path": SOURCE.repo_path,
                 "timestamp_ns": 1_000_000_000,
                 "labels": ["alpha", "beta"],
             },
@@ -504,8 +504,8 @@ def test_merged_window_uses_minimum_exact_boundary_when_index_ranges_tie(
     annotation_path = _annotations(
         tmp_path / "sparse-boundaries.jsonl",
         [
-            {"blob_path": SOURCE.blob_path, "timestamp_ns": 101, "labels": ["first-line"]},
-            {"blob_path": SOURCE.blob_path, "timestamp_ns": 100, "labels": ["second-line"]},
+            {"repo_path": SOURCE.repo_path, "timestamp_ns": 101, "labels": ["first-line"]},
+            {"repo_path": SOURCE.repo_path, "timestamp_ns": 100, "labels": ["second-line"]},
         ],
     )
     config = _annotation_config(
@@ -535,7 +535,7 @@ def test_hybrid_annotation_range_splits_automatic_runs_without_sample_reuse(
 ) -> None:
     annotation_path = _annotations(
         tmp_path / "annotations.jsonl",
-        [{"blob_path": SOURCE.blob_path, "timestamp_ns": 2_000_000_000, "labels": ["event"]}],
+        [{"repo_path": SOURCE.repo_path, "timestamp_ns": 2_000_000_000, "labels": ["event"]}],
     )
     config = _annotation_config(
         config_factory(),
@@ -579,7 +579,7 @@ def test_annotation_only_and_automatic_have_explicit_opposite_coverage(
 ) -> None:
     annotation_path = _annotations(
         tmp_path / "annotations.jsonl",
-        [{"blob_path": SOURCE.blob_path, "timestamp_ns": 1_000_000_000, "labels": ["human"]}],
+        [{"repo_path": SOURCE.repo_path, "timestamp_ns": 1_000_000_000, "labels": ["human"]}],
     )
     report = _report(tmp_path, (0, 1_000_000_000, 2_000_000_000))
     annotation_only = _annotation_config(
@@ -636,7 +636,7 @@ def test_uuid_tokens_change_for_namespace_source_and_scene_config_not_local_stag
     changed_config = config.model_copy(
         update={"scenes": config.scenes.model_copy(update={"max_duration_s": Decimal("3")})}
     )
-    changed_source = replace(SOURCE, etag='"other"')
+    changed_source = replace(SOURCE, sha256="c" * 64)
 
     assert [scene.token for scene in base.scenes] == [scene.token for scene in same.scenes]
     assert (
@@ -852,7 +852,7 @@ def test_validator_seals_annotation_matches_windows_and_build_config(
 ) -> None:
     annotation_path = _annotations(
         tmp_path / "sealed.jsonl",
-        [{"blob_path": SOURCE.blob_path, "timestamp_ns": 0, "labels": ["sealed"]}],
+        [{"repo_path": SOURCE.repo_path, "timestamp_ns": 0, "labels": ["sealed"]}],
     )
     config = _annotation_config(
         config_factory(), mode="annotation_only", tolerance_ms=0, before_s=0, after_s=0
@@ -882,7 +882,7 @@ def test_validator_seals_annotation_uuid_scene_source_and_sample_batch_timestamp
 ) -> None:
     annotation_path = _annotations(
         tmp_path / "identity-seals.jsonl",
-        [{"blob_path": SOURCE.blob_path, "timestamp_ns": 0, "labels": ["original"]}],
+        [{"repo_path": SOURCE.repo_path, "timestamp_ns": 0, "labels": ["original"]}],
     )
     config = _annotation_config(
         config_factory(), mode="annotation_only", tolerance_ms=0, before_s=0, after_s=0
@@ -901,11 +901,11 @@ def test_validator_seals_annotation_uuid_scene_source_and_sample_batch_timestamp
                 annotations=(replace(result.annotations[0], labels=("mutated",)),),
             )
         )
-    with pytest.raises(StructuralExtractionError, match="source.*blob"):
+    with pytest.raises(StructuralExtractionError, match="source.*repository"):
         validate_scene_graph(
             replace(
                 result,
-                scenes=(replace(result.scenes[0], source_blob_path="mcap-h265/other.mcap"),),
+                scenes=(replace(result.scenes[0], source_repo_path="data/other.mcap"),),
             )
         )
     with pytest.raises(StructuralExtractionError, match="batch timestamp"):
@@ -935,7 +935,7 @@ def test_annotation_index_is_precomputed_and_large_matching_is_stable(
     parsed = tuple(
         ParsedAnnotation(
             line_number + 1,
-            SOURCE.blob_path,
+            SOURCE.repo_path,
             line_number * 10,
             ("event",),
         )
@@ -961,7 +961,7 @@ def test_fully_overlapping_broad_windows_materialize_one_sample_tuple(
     parsed = tuple(
         ParsedAnnotation(
             line_number + 1,
-            SOURCE.blob_path,
+            SOURCE.repo_path,
             line_number * 10,
             (f"event-{line_number}",),
         )
@@ -1007,7 +1007,7 @@ def test_validator_preindexes_source_runs_once_for_thousands_of_annotations(
         tmp_path / "many-overlapping.jsonl",
         [
             {
-                "blob_path": SOURCE.blob_path,
+                "repo_path": SOURCE.repo_path,
                 "timestamp_ns": 0,
                 "labels": [f"event-{index}"],
             }

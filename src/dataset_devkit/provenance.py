@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
 from dataset_devkit.config import GlobalConfig
+from dataset_devkit.repository_paths import RepositoryPathError, validate_repo_mcap_path
 
-DownloadStatus = Literal["downloaded", "resumed", "cache_hit"]
-IntegrityMethod = Literal["content_md5", "size_etag"]
+DownloadStatus = Literal["downloaded", "cache_hit"]
 
 
 def canonical_json(value: object) -> str:
@@ -37,11 +36,34 @@ def canonical_hash(value: object) -> str:
 
 @dataclass(frozen=True)
 class SourceFingerprint:
-    account_url: str
-    container: str
-    blob_path: str
-    etag: str
+    repo_id: str
+    revision: str
+    repo_path: str
+    sha256: str
     size: int
+
+    def __post_init__(self) -> None:
+        invalid = (
+            re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*",
+                self.repo_id,
+            )
+            is None
+            or len(self.revision) != 40
+            or any(character not in "0123456789abcdef" for character in self.revision)
+            or not self.repo_path
+            or len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+            or not isinstance(self.size, int)
+            or isinstance(self.size, bool)
+            or self.size <= 0
+        )
+        try:
+            validate_repo_mcap_path(self.repo_path)
+        except RepositoryPathError:
+            invalid = True
+        if invalid:
+            raise ValueError("invalid source fingerprint values")
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -49,29 +71,31 @@ class SourceFingerprint:
     @classmethod
     def from_dict(cls, value: object) -> SourceFingerprint:
         if not isinstance(value, dict) or set(value) != {
-            "account_url",
-            "container",
-            "blob_path",
-            "etag",
+            "repo_id",
+            "revision",
+            "repo_path",
+            "sha256",
             "size",
         }:
             raise ValueError("invalid source fingerprint")
-        account_url = value["account_url"]
-        container = value["container"]
-        blob_path = value["blob_path"]
-        etag = value["etag"]
+        repo_id = value["repo_id"]
+        revision = value["revision"]
+        repo_path = value["repo_path"]
+        sha256 = value["sha256"]
         size = value["size"]
         if (
-            not isinstance(account_url, str)
-            or not isinstance(container, str)
-            or not isinstance(blob_path, str)
-            or not isinstance(etag, str)
+            not isinstance(repo_id, str)
+            or not isinstance(revision, str)
+            or len(revision) != 40
+            or not isinstance(repo_path, str)
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
             or not isinstance(size, int)
             or isinstance(size, bool)
-            or size < 0
+            or size <= 0
         ):
             raise ValueError("invalid source fingerprint values")
-        return cls(account_url, container, blob_path, etag, size)
+        return cls(repo_id, revision, repo_path, sha256, size)
 
     @property
     def digest(self) -> str:
@@ -88,6 +112,20 @@ class ArtifactIdentity:
     size: int
     sha256: str
 
+    def __post_init__(self) -> None:
+        path = PurePosixPath(self.cache_relative_path)
+        if (
+            path.is_absolute()
+            or path.as_posix() != self.cache_relative_path
+            or any(part in {"", ".", ".."} for part in self.cache_relative_path.split("/"))
+            or not isinstance(self.size, int)
+            or isinstance(self.size, bool)
+            or self.size <= 0
+            or len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+        ):
+            raise ValueError("invalid artifact identity values")
+
     @classmethod
     def from_dict(cls, value: object) -> ArtifactIdentity:
         if not isinstance(value, dict) or set(value) != {"cache_relative_path", "size", "sha256"}:
@@ -99,7 +137,7 @@ class ArtifactIdentity:
             not isinstance(relative_path, str)
             or not isinstance(size, int)
             or isinstance(size, bool)
-            or size < 0
+            or size <= 0
             or not isinstance(sha256, str)
             or len(sha256) != 64
         ):
@@ -108,52 +146,16 @@ class ArtifactIdentity:
 
 
 @dataclass(frozen=True)
-class IntegrityVerification:
-    method: IntegrityMethod
-    verified: bool
-    content_md5: str | None
-
-    @classmethod
-    def from_dict(cls, value: object) -> IntegrityVerification:
-        if not isinstance(value, dict) or set(value) != {"method", "verified", "content_md5"}:
-            raise ValueError("invalid integrity verification")
-        method = value["method"]
-        verified = value["verified"]
-        content_md5 = value["content_md5"]
-        if (
-            method not in {"content_md5", "size_etag"}
-            or not isinstance(verified, bool)
-            or (content_md5 is not None and not isinstance(content_md5, str))
-        ):
-            raise ValueError("invalid integrity verification values")
-        if not verified:
-            raise ValueError("integrity verification must be successful")
-        if method == "size_etag":
-            if content_md5 is not None:
-                raise ValueError("size_etag integrity cannot claim content MD5")
-        else:
-            if not isinstance(content_md5, str):
-                raise ValueError("content_md5 integrity requires an MD5 value")
-            try:
-                decoded_md5 = base64.b64decode(content_md5, validate=True)
-            except (binascii.Error, ValueError) as error:
-                raise ValueError("invalid content_md5 integrity value") from error
-            if (
-                len(decoded_md5) != 16
-                or base64.b64encode(decoded_md5).decode("ascii") != content_md5
-            ):
-                raise ValueError("invalid content_md5 integrity value")
-        return cls(cast(IntegrityMethod, method), verified, content_md5)
-
-
-@dataclass(frozen=True)
 class AcquisitionManifest:
     source: SourceFingerprint
     status: DownloadStatus
     artifact: ArtifactIdentity
-    integrity: IntegrityVerification
     requested_extraction_config_hash: str
-    manifest_version: Literal[2] = 2
+    manifest_version: Literal[1] = 1
+
+    def __post_init__(self) -> None:
+        if self.artifact.size != self.source.size or self.artifact.sha256 != self.source.sha256:
+            raise ValueError("artifact identity does not match source fingerprint")
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -165,13 +167,11 @@ class AcquisitionManifest:
             "source",
             "status",
             "artifact",
-            "integrity",
             "requested_extraction_config_hash",
         }:
             raise ValueError("invalid acquisition manifest")
-        if value["manifest_version"] != 2 or value["status"] not in {
+        if value["manifest_version"] != 1 or value["status"] not in {
             "downloaded",
-            "resumed",
             "cache_hit",
         }:
             raise ValueError("unsupported acquisition manifest")
@@ -182,7 +182,6 @@ class AcquisitionManifest:
             source=SourceFingerprint.from_dict(value["source"]),
             status=cast(DownloadStatus, value["status"]),
             artifact=ArtifactIdentity.from_dict(value["artifact"]),
-            integrity=IntegrityVerification.from_dict(value["integrity"]),
             requested_extraction_config_hash=config_hash,
         )
 
@@ -272,5 +271,14 @@ def load_manifest(path: Path) -> AcquisitionManifest | None:
     try:
         value = _load_manifest_value(path)
         return AcquisitionManifest.from_dict(value)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
+def load_extraction_manifest(path: Path) -> ExtractionManifest | None:
+    """Load trusted extraction evidence; invalid or linked files are cache misses."""
+    try:
+        value = _load_manifest_value(path)
+        return ExtractionManifest.from_dict(value)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
         return None

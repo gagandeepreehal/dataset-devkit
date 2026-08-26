@@ -301,18 +301,18 @@ def test_exact_blacklists_do_not_use_prefix_matching(feature_factory: FeatureFac
     near = FiltersConfig(
         blacklisted_scene_tokens=["scene"],
         blacklisted_source_digests=[feature.source.digest[:-1]],
-        blacklisted_blob_paths=[feature.source_blob_path + ".other"],
+        blacklisted_repo_paths=[feature.source_repo_path + ".other"],
     )
     assert filter_scenes((feature,), near).accepted == (feature,)
     exact = FiltersConfig(
         blacklisted_scene_tokens=[feature.scene_token],
         blacklisted_source_digests=[feature.source.digest],
-        blacklisted_blob_paths=[feature.source_blob_path],
+        blacklisted_repo_paths=[feature.source_repo_path],
     )
     assert {item.code for item in filter_scenes((feature,), exact).rejected[0].reasons} == {
         "scene_token_blacklisted",
         "source_digest_blacklisted",
-        "blob_path_blacklisted",
+        "repo_path_blacklisted",
     }
 
 

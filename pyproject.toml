@@ -17,8 +17,7 @@ classifiers = [
 ]
 dependencies = [
   "av>=13,<17",
-  "azure-identity>=1.19,<2",
-  "azure-storage-blob>=12.24,<13",
+  "huggingface-hub>=1.25,<2",
   "jsonschema>=4.23,<5",
   "mcap>=1.2,<2",
   "numpy>=1.26,<2",

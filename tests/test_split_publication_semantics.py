@@ -30,10 +30,10 @@ def _nonadjacent_selection_evidence(
     feature_factory: FeatureFactory,
 ) -> ExportEvidence:
     source = SourceFingerprint(
-        "https://example.blob.core.windows.net",
-        "recordings",
-        "mcap-h265/nonadjacent.mcap",
-        '"nonadjacent"',
+        "owner/dataset",
+        "a" * 40,
+        "data/nonadjacent.mcap",
+        "b" * 64,
         8,
     )
     timestamps = tuple(
@@ -51,7 +51,7 @@ def _nonadjacent_selection_evidence(
                 scene_token=scene.token,
                 scene_name=scene.name,
                 source=source,
-                source_blob_path=source.blob_path,
+                source_repo_path=source.repo_path,
             ),
             computed_tags=("selected",) if index in {0, 2} else ("other",),
         )
