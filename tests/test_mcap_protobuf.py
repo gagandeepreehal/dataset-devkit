@@ -471,6 +471,32 @@ def test_gnss_descriptor_rejects_wrong_scalar_types(
         read_recording(path, "rec_cameras", "gnss")
 
 
+def test_gnss_compatible_numeric_mode_accepts_float_hdop(tmp_path: Path) -> None:
+    descriptor_data = descriptor_with_field_change(
+        "PositionError",
+        "hdop",
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT,
+    )
+    path = tmp_path / "float-hdop.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        gnss_payloads=(gnss_message(900_000_000, 0, descriptor_data=descriptor_data),),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="position_error.hdop"):
+        read_recording(path, "rec_cameras", "gnss")
+
+    recording = read_recording(
+        path,
+        "rec_cameras",
+        "gnss",
+        compatible_gnss_numeric_types=True,
+    )
+
+    assert recording.gnss_samples[0].position_uncertainty["hdop"] == pytest.approx(1.0)
+
+
 def test_gnss_descriptor_is_validated_before_message_decode(tmp_path: Path) -> None:
     descriptor_data = descriptor_with_field_change(
         "GnssFix",

@@ -413,7 +413,9 @@ def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
         ) from error
 
 
-def _validate_gnss_schema(descriptor: Descriptor) -> None:
+def _validate_gnss_schema(
+    descriptor: Descriptor, *, compatible_numeric_types: bool = False
+) -> None:
     for name in ("timestamp", "rec_timestamp"):
         _require_descriptor_field(
             descriptor,
@@ -443,12 +445,23 @@ def _validate_gnss_schema(descriptor: Descriptor) -> None:
         )
         nested = cast(Descriptor, parent.message_type)
         for child_name in child_names:
+            child = nested.fields_by_name.get(child_name)
+            accepted_types = (
+                {FieldDescriptor.TYPE_DOUBLE, FieldDescriptor.TYPE_FLOAT}
+                if compatible_numeric_types
+                else {FieldDescriptor.TYPE_DOUBLE}
+            )
+            if child is None or child.type not in accepted_types:
+                raise StructuralExtractionError(
+                    f"GNSS schema field {f'{parent_name}.{child_name}'!r} "
+                    "has the wrong number, type, or cardinality"
+                )
             _require_descriptor_field(
                 nested,
                 context="GNSS",
                 path=f"{parent_name}.{child_name}",
                 name=child_name,
-                field_type=FieldDescriptor.TYPE_DOUBLE,
+                field_type=child.type,
                 repeated=False,
             )
     orientation_error = _require_descriptor_field(
@@ -688,8 +701,19 @@ def _assert_source_identity(path: Path, expected: SourceIdentity) -> None:
         )
 
 
-def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecording:
-    """Index configured topics without retaining compressed camera payload bytes."""
+def read_recording(
+    path: Path,
+    camera_topic: str,
+    gnss_topic: str,
+    *,
+    compatible_gnss_numeric_types: bool = False,
+) -> RawRecording:
+    """Index configured topics without retaining compressed camera payload bytes.
+
+    The opt-in compatibility mode accepts protobuf ``float`` or ``double`` for
+    required nested GNSS numeric fields. All other descriptor and value checks
+    remain unchanged, and strict ``double`` validation stays the default.
+    """
     camera_batches: list[RawCameraBatch] = []
     gnss_samples: list[GnssSample] = []
     camera_seen = False
@@ -737,7 +761,10 @@ def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecordi
                     camera_batches.append(batch)
                 elif channel.topic == gnss_topic:
                     gnss_seen = True
-                    _validate_gnss_schema(cast(Descriptor, message_type.DESCRIPTOR))
+                    _validate_gnss_schema(
+                        cast(Descriptor, message_type.DESCRIPTOR),
+                        compatible_numeric_types=compatible_gnss_numeric_types,
+                    )
                     gnss_samples.append(
                         _parse_gnss(_parse_message(message_type, record.data, "GNSS"))
                     )

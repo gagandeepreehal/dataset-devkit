@@ -261,8 +261,13 @@ def camera_message(
     return bytes(message.SerializeToString())
 
 
-def gnss_message(timestamp_ns: int, longitude: float) -> bytes:
-    _, gnss_type = message_classes()
+def gnss_message(
+    timestamp_ns: int,
+    longitude: float,
+    *,
+    descriptor_data: bytes | None = None,
+) -> bytes:
+    _, gnss_type = message_classes(descriptor_data)
     message = gnss_type(is_valid=True, receiver_id="rx-1")
     _timestamp(message.timestamp, timestamp_ns)
     _timestamp(message.rec_timestamp, timestamp_ns + 1)
