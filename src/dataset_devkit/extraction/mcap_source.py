@@ -142,7 +142,13 @@ def build_message_classes(data: bytes) -> dict[str, type[Message]]:
     return classes
 
 
-def _timestamp_ns(message: Message, field_name: str, context: str) -> int:
+def _timestamp_ns(
+    message: Message,
+    field_name: str,
+    context: str,
+    *,
+    missing_fallback_ns: int | None = None,
+) -> int:
     descriptor = message.DESCRIPTOR.fields_by_name.get(field_name)
     if (
         descriptor is None
@@ -150,9 +156,17 @@ def _timestamp_ns(message: Message, field_name: str, context: str) -> int:
         or descriptor.message_type.full_name != "google.protobuf.Timestamp"
     ):
         raise StructuralExtractionError(f"{context} lacks required Timestamp field {field_name!r}")
+    if not message.HasField(field_name):
+        if missing_fallback_ns is None:
+            raise StructuralExtractionError(
+                f"{context} has no value for Timestamp {field_name!r}"
+            )
+        if not 0 <= missing_fallback_ns <= (2**63 - 1):
+            raise StructuralExtractionError(
+                f"{context} fallback for Timestamp {field_name!r} is outside int64 nanoseconds"
+            )
+        return missing_fallback_ns
     try:
-        if not message.HasField(field_name):
-            raise StructuralExtractionError(f"{context} has no value for Timestamp {field_name!r}")
         value: Any = getattr(message, field_name)
         timestamp = Timestamp(seconds=int(value.seconds), nanos=int(value.nanos))
         return timestamp.ToNanoseconds()
@@ -565,7 +579,9 @@ def _message_dict(message: Message, *, root_path: str) -> dict[str, Any]:
     return dict(cast(dict[str, Any], frozen))
 
 
-def _parse_gnss(message: Message) -> GnssSample:
+def _parse_gnss(
+    message: Message, *, rec_timestamp_fallback_ns: int | None = None
+) -> GnssSample:
     dynamic: Any = message
     try:
         for field_name in (
@@ -615,6 +631,14 @@ def _parse_gnss(message: Message) -> GnssSample:
             "orientation_error",
         ):
             raw.pop(known, None)
+        if (
+            rec_timestamp_fallback_ns is not None
+            and not message.HasField("rec_timestamp")
+        ):
+            raw["dataset_devkit_rec_timestamp_fallback"] = {
+                "source": "mcap_log_time",
+                "timestamp_ns": rec_timestamp_fallback_ns,
+            }
         _validate_orientation_error_values(
             cast(Message, dynamic.orientation_error), path="orientation_error"
         )
@@ -623,7 +647,12 @@ def _parse_gnss(message: Message) -> GnssSample:
         )
         return GnssSample(
             timestamp_ns=_timestamp_ns(message, "timestamp", "GNSS message"),
-            rec_timestamp_ns=_timestamp_ns(message, "rec_timestamp", "GNSS message"),
+            rec_timestamp_ns=_timestamp_ns(
+                message,
+                "rec_timestamp",
+                "GNSS message",
+                missing_fallback_ns=rec_timestamp_fallback_ns,
+            ),
             is_valid=bool(dynamic.is_valid),
             latitude_deg=numeric_values[0],
             longitude_deg=numeric_values[1],
@@ -707,12 +736,15 @@ def read_recording(
     gnss_topic: str,
     *,
     compatible_gnss_numeric_types: bool = False,
+    allow_gnss_rec_timestamp_log_time_fallback: bool = False,
 ) -> RawRecording:
     """Index configured topics without retaining compressed camera payload bytes.
 
-    The opt-in compatibility mode accepts protobuf ``float`` or ``double`` for
-    required nested GNSS numeric fields. All other descriptor and value checks
-    remain unchanged, and strict ``double`` validation stays the default.
+    The opt-in numeric compatibility mode accepts protobuf ``float`` or
+    ``double`` for required nested GNSS numeric fields. A separate opt-in uses
+    the MCAP record ``log_time`` when a GNSS message omits ``rec_timestamp`` and
+    records that substitution in ``raw_identifiers``. Strict validation remains
+    the default for both behaviors.
     """
     camera_batches: list[RawCameraBatch] = []
     gnss_samples: list[GnssSample] = []
@@ -766,7 +798,14 @@ def read_recording(
                         compatible_numeric_types=compatible_gnss_numeric_types,
                     )
                     gnss_samples.append(
-                        _parse_gnss(_parse_message(message_type, record.data, "GNSS"))
+                        _parse_gnss(
+                            _parse_message(message_type, record.data, "GNSS"),
+                            rec_timestamp_fallback_ns=(
+                                int(record.log_time)
+                                if allow_gnss_rec_timestamp_log_time_fallback
+                                else None
+                            ),
+                        )
                     )
             if _source_identity(os.fstat(stream.fileno())) != source_identity:
                 raise StructuralExtractionError("recording changed while building extraction index")

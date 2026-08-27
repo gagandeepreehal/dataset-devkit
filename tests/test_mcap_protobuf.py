@@ -497,6 +497,36 @@ def test_gnss_compatible_numeric_mode_accepts_float_hdop(tmp_path: Path) -> None
     assert recording.gnss_samples[0].position_uncertainty["hdop"] == pytest.approx(1.0)
 
 
+def test_missing_gnss_rec_timestamp_log_time_fallback_is_opt_in_and_auditable(
+    tmp_path: Path,
+) -> None:
+    _, gnss_type = message_classes()
+    message = gnss_type.FromString(gnss_message(900_000_000, 0))
+    message.ClearField("rec_timestamp")
+    path = tmp_path / "missing-gnss-rec-timestamp.mcap"
+    write_mcap(path, gnss_payloads=(bytes(message.SerializeToString()),))
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match="has no value for Timestamp 'rec_timestamp'",
+    ):
+        read_recording(path, "rec_cameras", "gnss")
+
+    recording = read_recording(
+        path,
+        "rec_cameras",
+        "gnss",
+        allow_gnss_rec_timestamp_log_time_fallback=True,
+    )
+
+    sample = recording.gnss_samples[0]
+    assert sample.rec_timestamp_ns == 50
+    assert sample.raw_identifiers["dataset_devkit_rec_timestamp_fallback"] == {
+        "source": "mcap_log_time",
+        "timestamp_ns": 50,
+    }
+
+
 def test_gnss_descriptor_is_validated_before_message_decode(tmp_path: Path) -> None:
     descriptor_data = descriptor_with_field_change(
         "GnssFix",
