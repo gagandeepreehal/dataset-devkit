@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Deterministic native pipeline for robotics dataset generation"
 readme = "README.md"
 license = {file = "LICENSE.md"}
+license-files = ["LICENSE.md", "NOTICE"]
 requires-python = ">=3.12"
 authors = [{name = "mz-datagen maintainers"}]
 classifiers = [

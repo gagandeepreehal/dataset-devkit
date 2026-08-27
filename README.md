@@ -275,7 +275,7 @@ python -m build --wheel --no-isolation
 The software is source-available under the
 [PolyForm Noncommercial License 1.0.0](LICENSE.md). It may be used, copied, modified, and
 distributed for noncommercial purposes under those terms. Commercial use requires a separate
-license from the licensor.
+license from the licensor. See the project [copyright notice](NOTICE).
 
 Because commercial use is restricted, this is not an OSI-approved open-source license. Each Minus
 Zero dataset release remains governed separately by the license stated on its dataset card.
