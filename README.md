@@ -57,7 +57,7 @@ The pipeline provides:
 - commit-pinned and checksum-verified MCAP acquisition from Hugging Face;
 - deterministic camera-frame downsampling and GNSS interpolation;
 - automatic, annotation-driven, or hybrid scene construction;
-- scene tagging, quality filtering, and exact scenario quotas;
+- scene tagging, quality filtering, and deterministic scenario quotas;
 - deterministic scene-level train/test splitting;
 - validated nuScenes-compatible tables and camera assets; and
 - provenance, audit, quarantine, and content-manifest extensions.
@@ -158,7 +158,8 @@ Subsampling is explicit and reproducible. It happens in several stages:
 3. **Scene construction** groups valid samples into bounded driving scenes.
 4. **Feature and tag generation** describes motion such as straight driving, curvature, turns,
    stopping, and stationary behavior.
-5. **Scenario rules** select exact seeded quotas from the eligible scenes.
+5. **Scenario rules** use seeded ranking to select the requested quota. With the default
+   `strict_quotas: true`, a deficit fails the build; non-strict rules select up to the quota.
 6. **Scene-level splitting** assigns every selected scene to one train or test partition without
    splitting its camera chains.
 
@@ -232,7 +233,7 @@ publication. Minus Zero extension files remain specific to this project.
 | [Extraction](docs/extraction.md) | MCAP schema, HEVC decoding, timestamps, GNSS interpolation, and staging |
 | [Validity](docs/validity.md) | Quality rules, sanity checks, quarantine, and partial publication |
 | [Scenes](docs/scenes.md) | Automatic, annotation-only, and hybrid scene construction |
-| [Selection](docs/selection.md) | Features, filters, exact scenario quotas, and deterministic splitting |
+| [Selection](docs/selection.md) | Features, filters, scenario quotas, and deterministic splitting |
 | [Export](docs/export.md) | Tables, extensions, validation, SDK behavior, and publication guarantees |
 
 ## Known limitations
