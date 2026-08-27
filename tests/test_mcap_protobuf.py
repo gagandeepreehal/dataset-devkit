@@ -74,6 +74,21 @@ def descriptor_with_optional_numeric(message_name: str, field_name: str) -> byte
     raise AssertionError(f"message {message_name!r} not found")
 
 
+def descriptor_without_field(message_name: str, field_name: str) -> bytes:
+    file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
+    for file_proto in file_set.file:
+        for message in iter_descriptor_messages(file_proto.message_type):
+            if message.name != message_name:
+                continue
+            retained = [field for field in message.field if field.name != field_name]
+            if len(retained) == len(message.field):
+                raise AssertionError(f"field {message_name}.{field_name} not found")
+            message.ClearField("field")
+            message.field.extend(retained)
+            return file_set.SerializeToString()
+    raise AssertionError(f"message {message_name!r} not found")
+
+
 def descriptor_with_nested_orientation_variances() -> bytes:
     file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
     calibration = next(file for file in file_set.file if file.name == "calibration.proto")
@@ -454,6 +469,41 @@ def test_camera_descriptor_rejects_top_level_calibration_types(
 
     with pytest.raises(StructuralExtractionError, match="camera schema field.*camera_intrinsic"):
         read_recording(path, "rec_cameras", "gnss")
+
+
+def test_missing_per_camera_timestamps_use_auditable_batch_fallback(
+    tmp_path: Path,
+) -> None:
+    descriptor_data = descriptor_without_field("CompressedVideos", "camera_timestamp")
+    path = tmp_path / "missing-camera-timestamps.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        camera_payloads=(camera_message(descriptor_data=descriptor_data),),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="camera_timestamp"):
+        read_recording(path, "rec_cameras", "gnss")
+
+    recording = read_recording(
+        path,
+        "rec_cameras",
+        "gnss",
+        allow_camera_timestamp_batch_fallback=True,
+    )
+    access_units = tuple(
+        iter_camera_access_units(
+            path,
+            "rec_cameras",
+            recording,
+            allow_camera_timestamp_batch_fallback=True,
+        )
+    )
+
+    frames = recording.camera_batches[0].frames
+    assert {frame.camera_timestamp_source for frame in frames} == {"batch_timestamp"}
+    assert {frame.camera_timestamp_ns for frame in frames} == {1_000_000_005}
+    assert len(access_units) == 2
 
 
 def test_camera_native_calibration_resolution_mode_is_opt_in_and_uniform(

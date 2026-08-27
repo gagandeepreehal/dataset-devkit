@@ -105,6 +105,11 @@ def validate_camera_batch(
     for expected_index, frame in enumerate(batch.frames):
         if frame.camera_index != expected_index:
             raise StructuralExtractionError("camera arrays are not index aligned")
+        if frame.camera_timestamp_source not in {
+            "camera_timestamp",
+            "batch_timestamp",
+        }:
+            raise StructuralExtractionError("camera timestamp source is unsupported")
         intrinsic = frame.calibration.intrinsic
         extrinsic = frame.calibration.extrinsic
         intrinsic_values = (

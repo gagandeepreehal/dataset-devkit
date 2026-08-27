@@ -246,7 +246,8 @@ def camera_message(
     for index, timestamp_ns in enumerate(camera_timestamps_ns):
         message.data.append(frame_payloads[index])
         message.name.append(f"cam_{index}" if camera_names is None else camera_names[index])
-        _timestamp(message.camera_timestamp.add(), timestamp_ns)
+        if hasattr(message, "camera_timestamp"):
+            _timestamp(message.camera_timestamp.add(), timestamp_ns)
         calibration_dimensions = intrinsic_dimensions or dimensions
         intrinsic = message.camera_intrinsic.add(
             focal_length_x=1,

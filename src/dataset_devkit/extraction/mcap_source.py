@@ -215,7 +215,9 @@ def _require_descriptor_field(
     return cast(FieldDescriptor, field)
 
 
-def _validate_camera_schema(descriptor: Descriptor) -> None:
+def _validate_camera_schema(
+    descriptor: Descriptor, *, allow_camera_timestamp_batch_fallback: bool = False
+) -> None:
     scalar_specs = (
         ("rec_frame_id", 1, FieldDescriptor.TYPE_INT64),
         ("format", 4, FieldDescriptor.TYPE_STRING),
@@ -258,16 +260,20 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
             repeated=True,
             number=number,
         )
-    _require_descriptor_field(
-        descriptor,
-        context="camera",
-        path="camera_timestamp",
-        name="camera_timestamp",
-        field_type=FieldDescriptor.TYPE_MESSAGE,
-        repeated=True,
-        number=14,
-        message_type="google.protobuf.Timestamp",
-    )
+    if (
+        "camera_timestamp" in descriptor.fields_by_name
+        or not allow_camera_timestamp_batch_fallback
+    ):
+        _require_descriptor_field(
+            descriptor,
+            context="camera",
+            path="camera_timestamp",
+            name="camera_timestamp",
+            field_type=FieldDescriptor.TYPE_MESSAGE,
+            repeated=True,
+            number=14,
+            message_type="google.protobuf.Timestamp",
+        )
     intrinsic_field = _require_descriptor_field(
         descriptor,
         context="camera",
@@ -338,19 +344,28 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
         )
 
 
-def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
+def _parse_camera(
+    message: Message, *, allow_camera_timestamp_batch_fallback: bool = False
+) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
     dynamic: Any = message
     try:
         number_of_cameras = int(dynamic.number_of_cameras)
         if number_of_cameras <= 0:
             raise StructuralExtractionError("number_of_cameras must be greater than zero")
+        recorded_timestamp_ns = _timestamp_ns(message, "timestamp", "camera message")
         arrays = {
             "data": dynamic.data,
             "name": dynamic.name,
-            "camera_timestamp": dynamic.camera_timestamp,
             "camera_intrinsic": dynamic.camera_intrinsic,
             "camera_extrinsic": dynamic.camera_extrinsic,
         }
+        has_camera_timestamps = "camera_timestamp" in message.DESCRIPTOR.fields_by_name
+        if has_camera_timestamps:
+            arrays["camera_timestamp"] = dynamic.camera_timestamp
+        elif not allow_camera_timestamp_batch_fallback:
+            raise StructuralExtractionError(
+                "camera message has no per-camera timestamps"
+            )
         mismatched = [name for name, values in arrays.items() if len(values) != number_of_cameras]
         if mismatched:
             raise StructuralExtractionError(
@@ -359,16 +374,22 @@ def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
         frames: list[RawCameraFrame] = []
         payloads: list[bytes] = []
         for index in range(number_of_cameras):
-            timestamp_holder = dynamic.camera_timestamp[index]
-            timestamp = Timestamp(
-                seconds=int(timestamp_holder.seconds), nanos=int(timestamp_holder.nanos)
-            )
-            try:
-                camera_timestamp_ns = timestamp.ToNanoseconds()
-            except ValueError as error:
-                raise StructuralExtractionError(
-                    f"camera[{index}] has invalid protobuf Timestamp camera_timestamp"
-                ) from error
+            if has_camera_timestamps:
+                timestamp_holder = dynamic.camera_timestamp[index]
+                timestamp = Timestamp(
+                    seconds=int(timestamp_holder.seconds),
+                    nanos=int(timestamp_holder.nanos),
+                )
+                try:
+                    camera_timestamp_ns = timestamp.ToNanoseconds()
+                except ValueError as error:
+                    raise StructuralExtractionError(
+                        f"camera[{index}] has invalid protobuf Timestamp camera_timestamp"
+                    ) from error
+                camera_timestamp_source = "camera_timestamp"
+            else:
+                camera_timestamp_ns = recorded_timestamp_ns
+                camera_timestamp_source = "batch_timestamp"
             intrinsic = dynamic.camera_intrinsic[index]
             extrinsic = dynamic.camera_extrinsic[index]
             calibration = CameraCalibration(
@@ -401,6 +422,7 @@ def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
                     camera_name,
                     camera_timestamp_ns,
                     calibration,
+                    camera_timestamp_source,
                 )
             )
             payload = bytes(dynamic.data[index])
@@ -409,7 +431,7 @@ def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
         return (
             RawCameraBatch(
                 rec_timestamp_ns=_timestamp_ns(message, "rec_timestamp", "camera message"),
-                recorded_timestamp_ns=_timestamp_ns(message, "timestamp", "camera message"),
+                recorded_timestamp_ns=recorded_timestamp_ns,
                 frame_id=int(dynamic.frame_id),
                 rec_frame_id=int(dynamic.rec_frame_id),
                 format=str(dynamic.format),
@@ -738,6 +760,7 @@ def read_recording(
     compatible_gnss_numeric_types: bool = False,
     allow_gnss_rec_timestamp_log_time_fallback: bool = False,
     allow_native_camera_calibration_resolution: bool = False,
+    allow_camera_timestamp_batch_fallback: bool = False,
 ) -> RawRecording:
     """Index configured topics without retaining compressed camera payload bytes.
 
@@ -786,9 +809,17 @@ def read_recording(
                 schema_name, message_type = cached
                 if channel.topic == camera_topic:
                     camera_seen = True
-                    _validate_camera_schema(cast(Descriptor, message_type.DESCRIPTOR))
+                    _validate_camera_schema(
+                        cast(Descriptor, message_type.DESCRIPTOR),
+                        allow_camera_timestamp_batch_fallback=(
+                            allow_camera_timestamp_batch_fallback
+                        ),
+                    )
                     batch, _ = _parse_camera(
-                        _parse_message(message_type, record.data, "camera")
+                        _parse_message(message_type, record.data, "camera"),
+                        allow_camera_timestamp_batch_fallback=(
+                            allow_camera_timestamp_batch_fallback
+                        ),
                     )
                     camera_state = validate_camera_batch(
                         batch,
@@ -841,6 +872,7 @@ def iter_camera_access_units(
     recording: RawRecording,
     *,
     allow_native_camera_calibration_resolution: bool = False,
+    allow_camera_timestamp_batch_fallback: bool = False,
 ) -> Iterator[CameraAccessUnit]:
     """Reopen and stream structurally verified camera AUs for the decode pass."""
     _assert_source_identity(path, recording.source_identity)
@@ -876,10 +908,18 @@ def iter_camera_access_units(
                         raise StructuralExtractionError(
                             f"embedded descriptor does not define MCAP schema {schema.name!r}"
                         )
-                    _validate_camera_schema(cast(Descriptor, message_type.DESCRIPTOR))
+                    _validate_camera_schema(
+                        cast(Descriptor, message_type.DESCRIPTOR),
+                        allow_camera_timestamp_batch_fallback=(
+                            allow_camera_timestamp_batch_fallback
+                        ),
+                    )
                     schema_cache[schema.id] = message_type
                 batch, payloads = _parse_camera(
-                    _parse_message(message_type, record.data, "camera")
+                    _parse_message(message_type, record.data, "camera"),
+                    allow_camera_timestamp_batch_fallback=(
+                        allow_camera_timestamp_batch_fallback
+                    ),
                 )
                 camera_state = validate_camera_batch(
                     batch,
