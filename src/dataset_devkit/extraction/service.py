@@ -73,6 +73,10 @@ class RecordingExtractor:
         tolerance_ns: int,
         staging_root: Path,
         decoder_factory: Callable[[], HevcDecoder] = PyAvHevcDecoder,
+        compatible_gnss_numeric_types: bool = False,
+        allow_gnss_rec_timestamp_log_time_fallback: bool = False,
+        allow_native_camera_calibration_resolution: bool = False,
+        allow_camera_timestamp_batch_fallback: bool = False,
     ) -> None:
         self.camera_topic = camera_topic
         self.gnss_topic = gnss_topic
@@ -86,13 +90,37 @@ class RecordingExtractor:
         self.tolerance_ns = tolerance_ns
         self.staging_root = staging_root
         self.decoder_factory = decoder_factory
+        self.compatible_gnss_numeric_types = compatible_gnss_numeric_types
+        self.allow_gnss_rec_timestamp_log_time_fallback = (
+            allow_gnss_rec_timestamp_log_time_fallback
+        )
+        self.allow_native_camera_calibration_resolution = (
+            allow_native_camera_calibration_resolution
+        )
+        self.allow_camera_timestamp_batch_fallback = (
+            allow_camera_timestamp_batch_fallback
+        )
 
     def extract(self, path: Path) -> RecordingExtractionResult:
         return self.extract_owned(path).result
 
     def extract_owned(self, path: Path) -> OwnedRecordingExtraction:
         """Extract and retain the invocation authority for transactional handoff."""
-        recording = read_recording(path, self.camera_topic, self.gnss_topic)
+        recording = read_recording(
+            path,
+            self.camera_topic,
+            self.gnss_topic,
+            compatible_gnss_numeric_types=self.compatible_gnss_numeric_types,
+            allow_gnss_rec_timestamp_log_time_fallback=(
+                self.allow_gnss_rec_timestamp_log_time_fallback
+            ),
+            allow_native_camera_calibration_resolution=(
+                self.allow_native_camera_calibration_resolution
+            ),
+            allow_camera_timestamp_batch_fallback=(
+                self.allow_camera_timestamp_batch_fallback
+            ),
+        )
         selection = select_camera_grid(
             [batch.rec_timestamp_ns for batch in recording.camera_batches],
             self.target_fps,
@@ -179,7 +207,17 @@ class RecordingExtractor:
 
         try:
             with CameraDecoderSet(len(first_batch.frames), self.decoder_factory) as decoders:
-                for access in iter_camera_access_units(path, self.camera_topic, recording):
+                for access in iter_camera_access_units(
+                    path,
+                    self.camera_topic,
+                    recording,
+                    allow_native_camera_calibration_resolution=(
+                        self.allow_native_camera_calibration_resolution
+                    ),
+                    allow_camera_timestamp_batch_fallback=(
+                        self.allow_camera_timestamp_batch_fallback
+                    ),
+                ):
                     metadata = _SubmissionMetadata(
                         access.batch_ordinal,
                         access.batch.rec_timestamp_ns,

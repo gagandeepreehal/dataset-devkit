@@ -595,6 +595,33 @@
       "title": "InvalidationRulesConfig",
       "type": "object"
     },
+    "McapCompatibilityConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_camera_timestamp_batch_fallback": {
+          "default": false,
+          "title": "Allow Camera Timestamp Batch Fallback",
+          "type": "boolean"
+        },
+        "allow_gnss_rec_timestamp_log_time_fallback": {
+          "default": false,
+          "title": "Allow Gnss Rec Timestamp Log Time Fallback",
+          "type": "boolean"
+        },
+        "allow_native_camera_calibration_resolution": {
+          "default": false,
+          "title": "Allow Native Camera Calibration Resolution",
+          "type": "boolean"
+        },
+        "compatible_gnss_numeric_types": {
+          "default": false,
+          "title": "Compatible Gnss Numeric Types",
+          "type": "boolean"
+        }
+      },
+      "title": "McapCompatibilityConfig",
+      "type": "object"
+    },
     "PathsConfig": {
       "additionalProperties": false,
       "properties": {
@@ -1110,6 +1137,9 @@
     },
     "image": {
       "$ref": "#/$defs/ImageConfig"
+    },
+    "mcap_compatibility": {
+      "$ref": "#/$defs/McapCompatibilityConfig"
     },
     "paths": {
       "$ref": "#/$defs/PathsConfig"

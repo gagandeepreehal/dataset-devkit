@@ -86,7 +86,10 @@ def _finite(values: tuple[float, ...]) -> bool:
 
 
 def validate_camera_batch(
-    batch: RawCameraBatch, prior_state: CameraStructure | None = None
+    batch: RawCameraBatch,
+    prior_state: CameraStructure | None = None,
+    *,
+    allow_native_calibration_resolution: bool = False,
 ) -> CameraStructure:
     """Validate structural camera invariants and recording-level stability."""
     if batch.format != "h265":
@@ -102,10 +105,13 @@ def validate_camera_batch(
     for expected_index, frame in enumerate(batch.frames):
         if frame.camera_index != expected_index:
             raise StructuralExtractionError("camera arrays are not index aligned")
+        if frame.camera_timestamp_source not in {
+            "camera_timestamp",
+            "batch_timestamp",
+        }:
+            raise StructuralExtractionError("camera timestamp source is unsupported")
         intrinsic = frame.calibration.intrinsic
         extrinsic = frame.calibration.extrinsic
-        if intrinsic.width != batch.width or intrinsic.height != batch.height:
-            raise StructuralExtractionError("camera intrinsic dimensions differ from batch")
         intrinsic_values = (
             intrinsic.focal_length_x,
             intrinsic.focal_length_y,
@@ -114,9 +120,27 @@ def validate_camera_batch(
             intrinsic.rmse,
             intrinsic.skew,
             *intrinsic.distortion_coeffs,
+            intrinsic.width,
+            intrinsic.height,
         )
         if not _finite(intrinsic_values):
             raise StructuralExtractionError("camera intrinsic values must be finite")
+        if intrinsic.width <= 0 or intrinsic.height <= 0:
+            raise StructuralExtractionError("camera intrinsic dimensions must be positive")
+        if intrinsic.width != batch.width or intrinsic.height != batch.height:
+            if not allow_native_calibration_resolution:
+                raise StructuralExtractionError(
+                    "camera intrinsic dimensions differ from batch"
+                )
+            if not math.isclose(
+                intrinsic.width * batch.height,
+                intrinsic.height * batch.width,
+                rel_tol=1e-6,
+                abs_tol=1e-6,
+            ):
+                raise StructuralExtractionError(
+                    "camera intrinsic and batch dimensions have different aspect ratios"
+                )
         if len(extrinsic.rotation_vector) != 3 or len(extrinsic.translation_vector) != 3:
             raise StructuralExtractionError("camera extrinsic vectors must each have length three")
         if not _finite(extrinsic.rotation_vector + extrinsic.translation_vector):

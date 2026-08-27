@@ -23,11 +23,16 @@ The camera schema name is exactly `autonome.CompressedVideos`. The extractor req
 `format == "h265"`, positive shared dimensions, a positive `number_of_cameras`, and index-aligned
 `data`, `name`, `camera_timestamp`, `camera_intrinsic`, and `camera_extrinsic` arrays. Names are
 unique and nonblank; dimensions, index identity, and calibration remain stable for the recording.
-Calibration stability uses exact decoded protobuf-value equality; extraction applies no numeric
-tolerance to intrinsic or extrinsic changes. Each payload is one Annex-B HEVC access unit with no
+Calibration stability uses exact normalized-value equality. By default, intrinsic dimensions must
+equal the batch dimensions. The native-calibration compatibility option accepts only positive,
+same-aspect-ratio dimensions and scales focal lengths, optical centers, skew, RMSE, width, and
+height into batch-image coordinates before downstream use. Each payload is one Annex-B HEVC access unit with no
 bytes before its first start code, no empty NAL units, valid two-byte HEVC headers, and at least one
 VCL NAL unit. The indexed
-`camera_timestamp` is mandatory: it is never replaced by the batch or grid timestamp.
+`camera_timestamp` is mandatory by default. The explicit batch-timestamp compatibility option
+accepts a descriptor without that field, uses the batch `timestamp`, and records
+`camera_timestamp_source="batch_timestamp"` on every affected raw frame. Grid time is never used
+as a source timestamp.
 
 The GNSS protobuf type name may vary. Its descriptor must expose `timestamp`, `rec_timestamp`,
 `is_valid`, `lat_lon_ht`, `orientation`, `position_error`, and `orientation_error` with the required
@@ -36,7 +41,12 @@ ambiguous. Unknown top-level identifiers and dynamically shaped numeric orientat
 remain serializable in the result. GNSS scalar and nested descriptor types are validated before
 payload decoding. Orientation-uncertainty descriptors may contain scalar, repeated, or nested
 numeric fields; nonnumeric/recursive shapes and any present nonfinite numeric value are structural
-failures. Every message must contain both timestamps and all four required nested messages; a
+failures. All descriptor-known `position_error` fields remain in position uncertainty, and every
+present numeric leaf must be finite. Required GNSS nested numerics are protobuf `double` by default;
+the numeric compatibility option accepts `float` or `double`. Every message must contain both
+timestamps and all four required nested messages by default; the receive-timestamp compatibility
+option uses MCAP `log_time` only when `rec_timestamp` is absent and records that substitution in
+`raw_identifiers`. A
 nested numeric value is also required when its protobuf descriptor exposes field presence.
 
 All uncertainty descriptor, protobuf-value, interpolation, immutable-copy, and policy traversals
@@ -99,7 +109,8 @@ Fresh extraction and cache materialization pass this pre-established authority t
 registry, so neither performs a late path-based authority capture after producing images.
 
 Every staged candidate keeps three distinct times: grid target, chosen batch `rec_timestamp`, and
-its real camera timestamp. Ego poses are keyed by the real camera timestamp. GNSS values are
+its effective camera timestamp. The raw frame records whether that value came from the per-camera
+field or the explicit batch-timestamp fallback. Ego poses are keyed by the effective camera timestamp. GNSS values are
 bracketed without extrapolation; outside-range results are explicit and unavailable. Available
 poses linearly interpolate geodetic position/height and numeric uncertainty. Uncertainty
 interpolation recursively preserves compatible mappings and equal-length sequences. Finite numeric

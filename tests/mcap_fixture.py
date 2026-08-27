@@ -201,6 +201,18 @@ def descriptor_set_bytes() -> bytes:
     return file_set.SerializeToString()
 
 
+def descriptor_without_camera_timestamp() -> bytes:
+    file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
+    telemetry = next(file for file in file_set.file if file.name == "telemetry.proto")
+    camera = next(
+        message for message in telemetry.message_type if message.name == "CompressedVideos"
+    )
+    retained = [field for field in camera.field if field.name != "camera_timestamp"]
+    camera.ClearField("field")
+    camera.field.extend(retained)
+    return file_set.SerializeToString()
+
+
 def message_classes(descriptor_data: bytes | None = None) -> tuple[type[Any], type[Any]]:
     files = descriptor_pb2.FileDescriptorSet.FromString(descriptor_data or descriptor_set_bytes())
     pool = descriptor_pool.DescriptorPool()
@@ -229,6 +241,7 @@ def camera_message(
     format_name: str = "h265",
     payloads: tuple[bytes, ...] | None = None,
     dimensions: tuple[int, int] = (4, 3),
+    intrinsic_dimensions: tuple[int, int] | None = None,
     descriptor_data: bytes | None = None,
     camera_names: tuple[str, ...] | None = None,
 ) -> bytes:
@@ -245,14 +258,16 @@ def camera_message(
     for index, timestamp_ns in enumerate(camera_timestamps_ns):
         message.data.append(frame_payloads[index])
         message.name.append(f"cam_{index}" if camera_names is None else camera_names[index])
-        _timestamp(message.camera_timestamp.add(), timestamp_ns)
+        if hasattr(message, "camera_timestamp"):
+            _timestamp(message.camera_timestamp.add(), timestamp_ns)
+        calibration_dimensions = intrinsic_dimensions or dimensions
         intrinsic = message.camera_intrinsic.add(
             focal_length_x=1,
             focal_length_y=1,
             optical_center_x=2,
             optical_center_y=2,
-            width=dimensions[0],
-            height=dimensions[1],
+            width=calibration_dimensions[0],
+            height=calibration_dimensions[1],
         )
         intrinsic.distortion_coeffs.extend([0.1, 0.2])
         extrinsic = message.camera_extrinsic.add()
@@ -261,8 +276,13 @@ def camera_message(
     return bytes(message.SerializeToString())
 
 
-def gnss_message(timestamp_ns: int, longitude: float) -> bytes:
-    _, gnss_type = message_classes()
+def gnss_message(
+    timestamp_ns: int,
+    longitude: float,
+    *,
+    descriptor_data: bytes | None = None,
+) -> bytes:
+    _, gnss_type = message_classes(descriptor_data)
     message = gnss_type(is_valid=True, receiver_id="rx-1")
     _timestamp(message.timestamp, timestamp_ns)
     _timestamp(message.rec_timestamp, timestamp_ns + 1)

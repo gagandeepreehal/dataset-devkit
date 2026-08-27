@@ -59,10 +59,18 @@ def test_extraction_config_hash_is_deterministic_and_scoped(
     extraction_changed = config.model_copy(
         update={"image": config.image.model_copy(update={"jpeg_quality": 80})}
     )
+    compatibility_changed = config.model_copy(
+        update={
+            "mcap_compatibility": config.mcap_compatibility.model_copy(
+                update={"compatible_gnss_numeric_types": False}
+            )
+        }
+    )
 
     assert extraction_config_hash(config) == extraction_config_hash(same)
     assert extraction_config_hash(config) == extraction_config_hash(execution_changed)
     assert extraction_config_hash(config) != extraction_config_hash(extraction_changed)
+    assert extraction_config_hash(config) != extraction_config_hash(compatibility_changed)
 
 
 def _manifest(tmp_path: Path) -> AcquisitionManifest:

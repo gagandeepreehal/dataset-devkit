@@ -114,6 +114,30 @@ def test_load_config_is_strict_and_resolves_relative_paths(tmp_path: Path) -> No
         load_config(invalid_path)
 
 
+def test_mcap_compatibility_defaults_strict_and_accepts_explicit_opt_ins(
+    tmp_path: Path,
+) -> None:
+    strict = load_config(write_config(tmp_path / "strict", minimal_config()))
+
+    assert strict.mcap_compatibility.model_dump() == {
+        "compatible_gnss_numeric_types": False,
+        "allow_gnss_rec_timestamp_log_time_fallback": False,
+        "allow_native_camera_calibration_resolution": False,
+        "allow_camera_timestamp_batch_fallback": False,
+    }
+
+    enabled_data = minimal_config()
+    enabled_data["mcap_compatibility"] = {
+        "compatible_gnss_numeric_types": True,
+        "allow_gnss_rec_timestamp_log_time_fallback": True,
+        "allow_native_camera_calibration_resolution": True,
+        "allow_camera_timestamp_batch_fallback": True,
+    }
+    enabled = load_config(write_config(tmp_path / "enabled", enabled_data))
+
+    assert all(enabled.mcap_compatibility.model_dump().values())
+
+
 @pytest.mark.parametrize("quality", [0, 101])
 def test_jpeg_quality_must_be_in_valid_range(tmp_path: Path, quality: int) -> None:
     data = minimal_config()

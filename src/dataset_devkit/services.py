@@ -227,6 +227,18 @@ def _build_evidence_owned(
         target_fps=Fraction(str(config.downsampling.target_fps)),
         tolerance_ns=int(config.downsampling.tolerance_ms * 1_000_000),
         staging_root=config.paths.work_dir,
+        compatible_gnss_numeric_types=(
+            config.mcap_compatibility.compatible_gnss_numeric_types
+        ),
+        allow_gnss_rec_timestamp_log_time_fallback=(
+            config.mcap_compatibility.allow_gnss_rec_timestamp_log_time_fallback
+        ),
+        allow_native_camera_calibration_resolution=(
+            config.mcap_compatibility.allow_native_camera_calibration_resolution
+        ),
+        allow_camera_timestamp_batch_fallback=(
+            config.mcap_compatibility.allow_camera_timestamp_batch_fallback
+        ),
         **extractor_kwargs,  # type: ignore[arg-type]
     )
 

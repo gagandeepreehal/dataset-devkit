@@ -17,6 +17,7 @@ def test_shipped_example_configuration_is_valid() -> None:
     )
     assert config.huggingface.revision == "b13c3bd3a049c73b560910ef5dbc60cbd28c441b"
     assert config.huggingface.manifest_path == "manifest.jsonl"
+    assert all(config.mcap_compatibility.model_dump().values())
 
 
 def test_shipped_annotation_jsonl_is_strict_and_parseable() -> None:
