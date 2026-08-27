@@ -344,8 +344,50 @@ def _validate_camera_schema(
         )
 
 
+def _normalize_camera_intrinsic(
+    intrinsic: CameraIntrinsic,
+    *,
+    batch_width: int,
+    batch_height: int,
+    enabled: bool,
+) -> CameraIntrinsic:
+    if (
+        not enabled
+        or (intrinsic.width == batch_width and intrinsic.height == batch_height)
+        or not math.isfinite(intrinsic.width)
+        or not math.isfinite(intrinsic.height)
+        or intrinsic.width <= 0
+        or intrinsic.height <= 0
+        or batch_width <= 0
+        or batch_height <= 0
+        or not math.isclose(
+            intrinsic.width * batch_height,
+            intrinsic.height * batch_width,
+            rel_tol=1e-6,
+            abs_tol=1e-6,
+        )
+    ):
+        return intrinsic
+    scale_x = batch_width / intrinsic.width
+    scale_y = batch_height / intrinsic.height
+    return CameraIntrinsic(
+        focal_length_x=intrinsic.focal_length_x * scale_x,
+        focal_length_y=intrinsic.focal_length_y * scale_y,
+        optical_center_x=intrinsic.optical_center_x * scale_x,
+        optical_center_y=intrinsic.optical_center_y * scale_y,
+        rmse=intrinsic.rmse * scale_x,
+        skew=intrinsic.skew * scale_x,
+        distortion_coeffs=intrinsic.distortion_coeffs,
+        width=float(batch_width),
+        height=float(batch_height),
+    )
+
+
 def _parse_camera(
-    message: Message, *, allow_camera_timestamp_batch_fallback: bool = False
+    message: Message,
+    *,
+    allow_camera_timestamp_batch_fallback: bool = False,
+    allow_native_camera_calibration_resolution: bool = False,
 ) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
     dynamic: Any = message
     try:
@@ -360,6 +402,8 @@ def _parse_camera(
             "camera_extrinsic": dynamic.camera_extrinsic,
         }
         has_camera_timestamps = "camera_timestamp" in message.DESCRIPTOR.fields_by_name
+        batch_width = int(dynamic.width)
+        batch_height = int(dynamic.height)
         if has_camera_timestamps:
             arrays["camera_timestamp"] = dynamic.camera_timestamp
         elif not allow_camera_timestamp_batch_fallback:
@@ -392,17 +436,23 @@ def _parse_camera(
                 camera_timestamp_source = "batch_timestamp"
             intrinsic = dynamic.camera_intrinsic[index]
             extrinsic = dynamic.camera_extrinsic[index]
+            parsed_intrinsic = CameraIntrinsic(
+                float(intrinsic.focal_length_x),
+                float(intrinsic.focal_length_y),
+                float(intrinsic.optical_center_x),
+                float(intrinsic.optical_center_y),
+                float(intrinsic.rmse),
+                float(intrinsic.skew),
+                tuple(float(value) for value in intrinsic.distortion_coeffs),
+                float(intrinsic.width),
+                float(intrinsic.height),
+            )
             calibration = CameraCalibration(
-                CameraIntrinsic(
-                    float(intrinsic.focal_length_x),
-                    float(intrinsic.focal_length_y),
-                    float(intrinsic.optical_center_x),
-                    float(intrinsic.optical_center_y),
-                    float(intrinsic.rmse),
-                    float(intrinsic.skew),
-                    tuple(float(value) for value in intrinsic.distortion_coeffs),
-                    float(intrinsic.width),
-                    float(intrinsic.height),
+                _normalize_camera_intrinsic(
+                    parsed_intrinsic,
+                    batch_width=batch_width,
+                    batch_height=batch_height,
+                    enabled=allow_native_camera_calibration_resolution,
                 ),
                 CameraExtrinsic(
                     tuple(float(value) for value in extrinsic.rotation_vector),
@@ -435,8 +485,8 @@ def _parse_camera(
                 frame_id=int(dynamic.frame_id),
                 rec_frame_id=int(dynamic.rec_frame_id),
                 format=str(dynamic.format),
-                width=int(dynamic.width),
-                height=int(dynamic.height),
+                width=batch_width,
+                height=batch_height,
                 frames=tuple(frames),
             ),
             tuple(payloads),
@@ -556,7 +606,7 @@ def _validate_orientation_error_schema(
             )
 
 
-def _validate_orientation_error_values(
+def _validate_numeric_message_values(
     message: Message,
     *,
     path: str,
@@ -571,12 +621,14 @@ def _validate_orientation_error_values(
         values = value if field.is_repeated else (value,)
         if field.type == FieldDescriptor.TYPE_MESSAGE:
             for nested in values:
-                _validate_orientation_error_values(
+                _validate_numeric_message_values(
                     cast(Message, nested),
                     path=field_path,
                     depth=depth + 1,
                     budget=active_budget,
                 )
+            continue
+        if field.type not in _PROTOBUF_NUMERIC_TYPES:
             continue
         for index, numeric in enumerate(values):
             numeric_path = f"{field_path}[{index}]" if field.is_repeated else field_path
@@ -661,7 +713,10 @@ def _parse_gnss(
                 "source": "mcap_log_time",
                 "timestamp_ns": rec_timestamp_fallback_ns,
             }
-        _validate_orientation_error_values(
+        _validate_numeric_message_values(
+            cast(Message, dynamic.position_error), path="position_error"
+        )
+        _validate_numeric_message_values(
             cast(Message, dynamic.orientation_error), path="orientation_error"
         )
         orientation_uncertainty = _message_dict(
@@ -818,6 +873,9 @@ def read_recording(
                         allow_camera_timestamp_batch_fallback=(
                             allow_camera_timestamp_batch_fallback
                         ),
+                        allow_native_camera_calibration_resolution=(
+                            allow_native_camera_calibration_resolution
+                        ),
                     )
                     camera_state = validate_camera_batch(
                         batch,
@@ -917,6 +975,9 @@ def iter_camera_access_units(
                     _parse_message(message_type, record.data, "camera"),
                     allow_camera_timestamp_batch_fallback=(
                         allow_camera_timestamp_batch_fallback
+                    ),
+                    allow_native_camera_calibration_resolution=(
+                        allow_native_camera_calibration_resolution
                     ),
                 )
                 camera_state = validate_camera_batch(

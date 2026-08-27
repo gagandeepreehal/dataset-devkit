@@ -201,6 +201,18 @@ def descriptor_set_bytes() -> bytes:
     return file_set.SerializeToString()
 
 
+def descriptor_without_camera_timestamp() -> bytes:
+    file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
+    telemetry = next(file for file in file_set.file if file.name == "telemetry.proto")
+    camera = next(
+        message for message in telemetry.message_type if message.name == "CompressedVideos"
+    )
+    retained = [field for field in camera.field if field.name != "camera_timestamp"]
+    camera.ClearField("field")
+    camera.field.extend(retained)
+    return file_set.SerializeToString()
+
+
 def message_classes(descriptor_data: bytes | None = None) -> tuple[type[Any], type[Any]]:
     files = descriptor_pb2.FileDescriptorSet.FromString(descriptor_data or descriptor_set_bytes())
     pool = descriptor_pool.DescriptorPool()

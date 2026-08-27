@@ -223,6 +223,7 @@ def extraction_config_hash(config: GlobalConfig) -> str:
     extraction_config = {
         "schema_version": config.schema_version,
         "topics": config.topics.model_dump(mode="json"),
+        "mcap_compatibility": config.mcap_compatibility.model_dump(mode="json"),
         "downsampling": config.downsampling.model_dump(mode="json"),
         "image": config.image.model_dump(mode="json"),
         "gnss": config.gnss.model_dump(mode="json"),

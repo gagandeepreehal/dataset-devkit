@@ -526,7 +526,7 @@ def test_missing_per_camera_timestamps_use_auditable_batch_fallback(
     assert len(access_units) == 2
 
 
-def test_camera_native_calibration_resolution_mode_is_opt_in_and_uniform(
+def test_camera_native_calibration_resolution_mode_normalizes_both_passes(
     tmp_path: Path,
 ) -> None:
     payload = camera_message(
@@ -555,7 +555,15 @@ def test_camera_native_calibration_resolution_mode_is_opt_in_and_uniform(
     )
 
     assert len(access_units) == 2
-    assert recording.camera_batches[0].frames[0].calibration.intrinsic.width == 1920
+    indexed = recording.camera_batches[0].frames[0].calibration.intrinsic
+    streamed = access_units[0].frame.calibration.intrinsic
+    for intrinsic in (indexed, streamed):
+        assert intrinsic.width == 1280
+        assert intrinsic.height == 720
+        assert intrinsic.focal_length_x == pytest.approx(2 / 3)
+        assert intrinsic.focal_length_y == pytest.approx(2 / 3)
+        assert intrinsic.optical_center_x == pytest.approx(4 / 3)
+        assert intrinsic.optical_center_y == pytest.approx(4 / 3)
 
 
 def test_camera_native_calibration_resolution_rejects_aspect_ratio_change(
@@ -569,6 +577,30 @@ def test_camera_native_calibration_resolution_rejects_aspect_ratio_change(
     write_mcap(path, camera_payloads=(payload,))
 
     with pytest.raises(StructuralExtractionError, match="aspect ratio"):
+        read_recording(
+            path,
+            "rec_cameras",
+            "gnss",
+            allow_native_camera_calibration_resolution=True,
+        )
+
+
+def test_camera_native_calibration_resolution_rejects_nonfinite_dimensions(
+    tmp_path: Path,
+) -> None:
+    camera_type, _ = message_classes()
+    message = camera_type.FromString(
+        camera_message(
+            dimensions=(1280, 720),
+            intrinsic_dimensions=(1920, 1080),
+        )
+    )
+    message.camera_intrinsic[0].width = float("inf")
+    message.camera_intrinsic[0].height = float("inf")
+    path = tmp_path / "nonfinite-native-resolution-calibration.mcap"
+    write_mcap(path, camera_payloads=(bytes(message.SerializeToString()),))
+
+    with pytest.raises(StructuralExtractionError, match="intrinsic values must be finite"):
         read_recording(
             path,
             "rec_cameras",
@@ -651,6 +683,30 @@ def test_gnss_preserves_descriptor_known_position_error_fields(tmp_path: Path) -
         "vdop": pytest.approx(1.25),
         "covariance_en": pytest.approx(-0.02),
     }
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_gnss_rejects_nonfinite_extended_position_error_fields(
+    tmp_path: Path, value: float
+) -> None:
+    descriptor_data = descriptor_with_extra_position_error_fields()
+    _, gnss_type = message_classes(descriptor_data)
+    message = gnss_type.FromString(
+        gnss_message(900_000_000, 0, descriptor_data=descriptor_data)
+    )
+    message.position_error.position_rms = value
+    path = tmp_path / "nonfinite-extended-position-error.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        gnss_payloads=(bytes(message.SerializeToString()),),
+    )
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match="position_error.position_rms.*finite",
+    ):
+        read_recording(path, "rec_cameras", "gnss")
 
 
 def test_missing_gnss_rec_timestamp_log_time_fallback_is_opt_in_and_auditable(

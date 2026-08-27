@@ -69,7 +69,12 @@ from dataset_devkit.validation import (
     validate_dataset,
 )
 from dataset_devkit.validity import evaluate_validity
-from mcap_fixture import camera_message, encode_hevc_access_units, write_mcap
+from mcap_fixture import (
+    camera_message,
+    descriptor_without_camera_timestamp,
+    encode_hevc_access_units,
+    write_mcap,
+)
 from test_export_dataset import _evidence
 from test_extraction_service import DeterministicDecoder
 
@@ -700,6 +705,48 @@ def test_complete_stage_injected_build_is_repeatable_and_cli_loadable(
     monkeypatch.setattr("dataset_devkit.cli.build_dataset", lambda _config: third)
     assert main(["build", "--config", "examples/dataset_config.json"]) == 0
     assert json.loads(capsys.readouterr().out)["dataroot"] == str(third.dataroot)
+
+
+def test_build_pipeline_applies_configured_mcap_compatibility(
+    tmp_path: Path,
+    config_factory: Callable[[], GlobalConfig],
+) -> None:
+    descriptor_data = descriptor_without_camera_timestamp()
+    recording = tmp_path / "legacy-camera-timestamps.mcap"
+    write_mcap(
+        recording,
+        descriptor_data=descriptor_data,
+        camera_payloads=tuple(
+            camera_message(
+                timestamp,
+                (timestamp + 10, timestamp + 20),
+                camera_names=("front", "rear"),
+                descriptor_data=descriptor_data,
+            )
+            for timestamp in (1_000_000_000, 1_500_000_000, 2_000_000_000)
+        ),
+    )
+    repo_path = "data/legacy-camera-timestamps.mcap"
+    config = _pipeline_config(config_factory(), tmp_path, (repo_path,), partial=False)
+    config = config.model_copy(
+        update={
+            "mcap_compatibility": config.mcap_compatibility.model_copy(
+                update={"allow_camera_timestamp_batch_fallback": True}
+            )
+        }
+    )
+    acquirer = _FakeAcquirer({repo_path: recording})
+    runtime = BuildRuntime(
+        acquirer_factory=lambda _config: acquirer,
+        decoder_factory=DeterministicDecoder,
+        official_smoke=False,
+    )
+
+    result = build_dataset(config, runtime=runtime)
+
+    assert result.failed_recordings == ()
+    assert result.sample_count > 0
+    assert Dataset(result.dataroot).validation_report()["succeeded"] is True
 
 
 def test_true_pyav_multicamera_build_is_officially_loadable_and_repeatable(
