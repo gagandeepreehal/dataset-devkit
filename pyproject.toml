@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dataset-devkit"
+version = "0.1.0"
+description = "Deterministic native pipeline for robotics dataset generation"
+readme = "README.md"
+license = {file = "LICENSE.md"}
+license-files = ["LICENSE.md", "NOTICE"]
+requires-python = ">=3.12"
+authors = [{name = "mz-datagen maintainers"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+dependencies = [
+  "av>=13,<17",
+  "huggingface-hub>=1.25,<2",
+  "jsonschema>=4.23,<5",
+  "mcap>=1.2,<2",
+  "numpy>=1.26,<2",
+  "nuscenes-devkit>=1.1.11,<2",
+  "pillow>=11,<13",
+  "protobuf>=5,<7",
+  "pydantic>=2.10,<3",
+  "pyproj>=3.7,<4",
+  "scikit-learn>=1.6,<2",
+  "scipy>=1.15,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "mypy>=1.14,<2",
+  "pytest>=8,<10",
+  "ruff>=0.9,<1",
+  "types-protobuf>=6,<7",
+  "types-jsonschema>=4.23,<5",
+]
+
+[project.scripts]
+dataset-devkit = "dataset_devkit.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dataset_devkit"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = ["src", "tests"]
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+warn_required_dynamic_aliases = true
+
+[[tool.mypy.overrides]]
+module = ["mcap", "mcap.*"]
+follow_imports = "skip"

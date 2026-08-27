@@ -1,0 +1,1071 @@
+from __future__ import annotations
+
+import os
+from collections.abc import Callable, Iterator
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+import dataset_devkit.extraction.staging as staging_module
+import dataset_devkit.validity as validity_module
+from dataset_devkit.config import GlobalConfig, InvalidationRulesConfig
+from dataset_devkit.extraction.errors import StructuralExtractionError
+from dataset_devkit.extraction.gnss import interpolate_gnss
+from dataset_devkit.extraction.grid import GridMiss, GridSelection, SelectedGridEntry
+from dataset_devkit.extraction.models import (
+    CameraCalibration,
+    CameraExtrinsic,
+    CameraIntrinsic,
+    EgoPose,
+    ExtractedCameraSample,
+    GnssSample,
+    RawCameraBatch,
+    RawCameraFrame,
+    RecordingExtractionResult,
+    StagedImage,
+)
+from dataset_devkit.extraction.staging import remove_owned_staged_images
+from dataset_devkit.validity import (
+    INVALIDITY_CODES,
+    InvalidityObservation,
+    evaluate_validity,
+    validate_validity_enforcement,
+)
+
+
+def _calibration() -> CameraCalibration:
+    return CameraCalibration(
+        CameraIntrinsic(1, 1, 1, 1, 0, 0, (), 4, 3),
+        CameraExtrinsic((0, 0, 0), (0, 0, 0)),
+    )
+
+
+def _gnss(timestamp: int, *, valid: bool, sigma: float, variance: float) -> GnssSample:
+    return GnssSample(
+        timestamp,
+        timestamp,
+        valid,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        {
+            "east_sigma_m": sigma,
+            "north_sigma_m": sigma - 0.1,
+            "up_sigma_m": sigma - 0.2,
+        },
+        {"roll_variance": variance - 0.2, "pitch_variance": variance - 0.1,
+         "yaw_variance": variance, "label": "preserved"},
+    )
+
+
+def _result(tmp_path: Path) -> RecordingExtractionResult:
+    staging = tmp_path / "staging" / "recording-owned"
+    staging.mkdir(parents=True)
+    calibration = _calibration()
+    batches = (
+        RawCameraBatch(
+            100, 100, 1, 1, "hevc", 4, 3,
+            (
+                RawCameraFrame(0, "front", 100, calibration),
+                RawCameraFrame(1, "rear", 100, calibration),
+            ),
+        ),
+        RawCameraBatch(
+            2_000_000_100, 2_000_000_100, 2, 2, "hevc", 4, 3,
+            (
+                RawCameraFrame(0, "front", 100, calibration),
+                RawCameraFrame(1, "rear", 2_000_000_100, calibration),
+                RawCameraFrame(2, "extra", 2_000_000_100, calibration),
+            ),
+        ),
+    )
+    gnss = (
+        _gnss(0, valid=False, sigma=1.2, variance=0.5),
+        _gnss(4_000_000_000, valid=True, sigma=1.2, variance=0.5),
+    )
+    samples: list[ExtractedCameraSample] = []
+    poses: dict[int, EgoPose] = {}
+    for index, name, timestamp in ((0, "front", 100), (1, "rear", 2_000_000_100),
+                                   (2, "extra", 2_000_000_100)):
+        interpolation = interpolate_gnss(gnss, timestamp)
+        pose = EgoPose(
+            timestamp,
+            True,
+            (interpolation.projected_x_m or 0, interpolation.projected_y_m or 0,
+             interpolation.height_m or 0),
+            interpolation.quaternion_wxyz,
+            interpolation,
+        )
+        image_path = staging / f"{index}-{name}.jpg"
+        image_path.write_bytes(b"owned")
+        image_stat = image_path.stat()
+        staged = StagedImage(index, name, timestamp, image_path, 4, 3,
+                             image_stat.st_dev, image_stat.st_ino)
+        samples.append(
+            ExtractedCameraSample(2_000_000_000, 2_000_000_100, timestamp,
+                                  index, name, staged, pose)
+        )
+        poses[timestamp] = pose
+    return RecordingExtractionResult(
+        tmp_path / "recording.mcap",
+        staging,
+        batches,
+        gnss,
+        GridSelection(
+            (SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),),
+            (GridMiss(3_000_000_000),),
+            (100,),
+        ),
+        tuple(samples),
+        poses,
+        (),
+    )
+
+
+def _configured(config: GlobalConfig, **toggles: bool) -> GlobalConfig:
+    rules: dict[str, bool] = {code: False for code in INVALIDITY_CODES}
+    rules.update(toggles)
+    return config.model_copy(
+        update={
+            "frame_validity": config.frame_validity.model_copy(
+                update={
+                    "required_cameras": ["front", "rear", "side"],
+                    "invalidate_on": InvalidationRulesConfig.model_validate(rules),
+                }
+            )
+        }
+    )
+
+
+def test_observation_first_engine_retains_every_reason_and_raw_measurement(
+    tmp_path: Path, config_factory: object
+) -> None:
+    base = config_factory()  # type: ignore[operator]
+    config = base.model_copy(
+        update={
+            "frame_validity": base.frame_validity.model_copy(
+                update={"required_cameras": ["front", "rear", "side"]}
+            )
+        }
+    )
+    result = _result(tmp_path)
+    report = evaluate_validity(result, config)
+
+    assert {observation.code for observation in report.observations} == set(INVALIDITY_CODES)
+    assert all(observation.enabled_as_invalidator for observation in report.observations)
+    assert len(report.sample_audits) == 1
+    audit = report.sample_audits[0]
+    assert audit.grid_target_timestamp_ns == 2_000_000_000
+    assert audit.batch_timestamp_ns == 2_000_000_100
+    assert audit.camera_timestamps == (
+        ("front", 100), ("rear", 2_000_000_100), ("extra", 2_000_000_100)
+    )
+    assert not audit.valid
+    assert audit.samples[2].camera_name == "extra"
+    sigma = next(item for item in report.observations if item.code == "position_sigma_exceeded")
+    assert sigma.measured_values == {
+        "east_sigma_m": pytest.approx(1.2),
+        "north_sigma_m": pytest.approx(1.1),
+        "up_sigma_m": pytest.approx(1.0),
+    }
+    assert sigma.threshold == 0.5
+    assert sigma.details["before_position_uncertainty"] == pytest.approx(
+        {"east_sigma_m": 1.2, "north_sigma_m": 1.1, "up_sigma_m": 1.0}
+    )
+    assert sigma.details["after_position_uncertainty"] == sigma.details[
+        "before_position_uncertainty"
+    ]
+    assert sigma.details["interpolated_position_uncertainty"] == sigma.measured_values
+    assert sigma.camera_timestamp_ns is not None
+    assert sigma.details["interpolation_fraction"] == pytest.approx(
+        sigma.camera_timestamp_ns / 4_000_000_000
+    )
+    assert sigma.details["sync_gap_before_ns"] == sigma.camera_timestamp_ns
+    assert sigma.details["sync_gap_after_ns"] == 4_000_000_000 - sigma.camera_timestamp_ns
+    orientation = next(
+        item for item in report.observations if item.code == "orientation_variance_exceeded"
+    )
+    assert orientation.measured_values["maximum_variance"] == pytest.approx(0.5)
+    assert orientation.details["orientation_uncertainty"]["label"] == "preserved"
+    assert orientation.details["before_orientation_uncertainty"]["label"] == "preserved"
+    assert orientation.details["after_orientation_uncertainty"]["label"] == "preserved"
+    assert orientation.camera_timestamp_ns is not None
+    assert orientation.details["interpolation_fraction"] == pytest.approx(
+        orientation.camera_timestamp_ns / 4_000_000_000
+    )
+    assert orientation.details["sync_gap_before_ns"] == orientation.camera_timestamp_ns
+    assert orientation.details["sync_gap_after_ns"] == (
+        4_000_000_000 - orientation.camera_timestamp_ns
+    )
+    sync = next(item for item in report.observations if item.code == "gnss_sync_gap_exceeded")
+    assert sync.measured_values["maximum_endpoint_gap_ns"] == 3_999_999_900
+    assert not report.final_candidates
+    assert report.audit_only_samples == report.sample_audits
+    assert all(sample.staged_image.path.is_file() for sample in result.samples)
+    assert len(report.grid_audits) == 2
+    assert report.grid_audits[1].batch_timestamp_ns is None
+    validate_validity_enforcement(result, report, config)
+
+
+def test_enforcement_rejects_invalid_audit_in_final_candidates(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _configured(config_factory(), missing_required_camera=True)
+    result = _result(tmp_path)
+    report = evaluate_validity(result, config)
+    invalid = report.sample_audits[0]
+
+    with pytest.raises(StructuralExtractionError, match="final candidates"):
+        validate_validity_enforcement(
+            result,
+            replace(report, final_candidates=(invalid,)),
+            config,
+        )
+
+
+def test_enforcement_blocks_enabled_recording_scope_observation(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _configured(config_factory(), grid_miss=True)
+    result = _result(tmp_path)
+    report = evaluate_validity(result, config)
+    recording_observation = InvalidityObservation(
+        "grid_miss",
+        "recording",
+        enabled_as_invalidator=True,
+    )
+
+    with pytest.raises(StructuralExtractionError, match="recording-scope"):
+        validate_validity_enforcement(
+            result,
+            replace(
+                report,
+                observations=(*report.observations, recording_observation),
+                valid=False,
+            ),
+            config,
+        )
+
+
+def test_unselected_camera_timeline_violations_remain_in_recording_audit(
+    tmp_path: Path, config_factory: object
+) -> None:
+    result = _result(tmp_path)
+    calibration = _calibration()
+    unselected_timestamp = 3_000_000_100
+    unselected = RawCameraBatch(
+        unselected_timestamp,
+        unselected_timestamp,
+        3,
+        3,
+        "hevc",
+        4,
+        3,
+        (
+            RawCameraFrame(0, "front", 50, calibration),
+            RawCameraFrame(1, "rear", 5_000_000_100, calibration),
+            RawCameraFrame(2, "extra", 2_000_000_200, calibration),
+        ),
+    )
+    result = replace(
+        result,
+        camera_batches=(*result.camera_batches, unselected),
+        selected_grid=replace(
+            result.selected_grid,
+            unused_batch_timestamps_ns=(100, unselected_timestamp),
+        ),
+    )
+
+    report = evaluate_validity(result, config_factory())  # type: ignore[operator]
+
+    unselected_observations = tuple(
+        item for item in report.observations
+        if item.batch_timestamp_ns == unselected_timestamp
+    )
+    assert [item.code for item in unselected_observations] == [
+        "camera_timestamp_non_monotonic",
+        "camera_timestamp_gap_exceeded",
+    ]
+    assert all(item.scope == "camera" for item in unselected_observations)
+    assert all(item.grid_target_timestamp_ns is None for item in unselected_observations)
+    assert not any(
+        item.batch_timestamp_ns == unselected_timestamp
+        for item in report.sample_audits[0].observations
+    )
+
+
+@pytest.mark.parametrize("enabled_code", INVALIDITY_CODES)
+def test_each_invalidator_toggle_is_independent(
+    tmp_path: Path, config_factory: object, enabled_code: str
+) -> None:
+    config = _configured(config_factory(), **{enabled_code: True})  # type: ignore[operator]
+    report = evaluate_validity(_result(tmp_path / enabled_code), config)
+
+    assert {
+        observation.code
+        for observation in report.observations
+        if observation.enabled_as_invalidator
+    } == {enabled_code}
+    assert {observation.code for observation in report.observations} == set(INVALIDITY_CODES)
+
+
+@pytest.mark.parametrize(
+    ("sigma", "variance", "gap_ns", "expected"),
+    [
+        (0.5, 0.1, 30_000_000, set()),
+        (0.500001, 0.100001, 30_000_001,
+         {"position_sigma_exceeded", "orientation_variance_exceeded",
+          "gnss_sync_gap_exceeded"}),
+    ],
+)
+def test_thresholds_use_strict_exceed_not_equality(
+    tmp_path: Path,
+    config_factory: object,
+    sigma: float,
+    variance: float,
+    gap_ns: int,
+    expected: set[str],
+) -> None:
+    result = _result(tmp_path)
+    before = _gnss(100 - gap_ns, valid=True, sigma=sigma, variance=variance)
+    after = _gnss(100 + gap_ns, valid=True, sigma=sigma, variance=variance)
+    interpolation = interpolate_gnss((before, after), 100)
+    pose = replace(result.samples[0].ego_pose, interpolation=interpolation)
+    sample = replace(result.samples[0], ego_pose=pose)
+    second_batch = replace(result.camera_batches[1], frames=(result.camera_batches[1].frames[0],))
+    result = replace(
+        result,
+        camera_batches=(result.camera_batches[0], second_batch),
+        samples=(sample,),
+        ego_poses_by_timestamp={100: pose},
+        gnss_samples=(before, after),
+    )
+    config = _configured(
+        config_factory(),  # type: ignore[operator]
+        position_sigma_exceeded=True,
+        orientation_variance_exceeded=True,
+        gnss_sync_gap_exceeded=True,
+    )
+
+    observed = {item.code for item in evaluate_validity(result, config).observations}
+
+    assert observed & {
+        "position_sigma_exceeded", "orientation_variance_exceeded",
+        "gnss_sync_gap_exceeded"
+    } == expected
+
+
+def test_drop_removes_only_owned_invalid_images_and_retains_audit_reasons(
+    tmp_path: Path, config_factory: object
+) -> None:
+    result = _result(tmp_path)
+    external = tmp_path / "external.jpg"
+    external.write_bytes(b"external")
+    prior = result.staging_root / "prior.jpg"
+    prior.write_bytes(b"prior")
+    config = config_factory().model_copy(  # type: ignore[operator]
+        update={
+            "frame_validity": config_factory().frame_validity.model_copy(  # type: ignore[operator]
+                update={"invalid_sample_policy": "drop"}
+            )
+        }
+    )
+
+    report = evaluate_validity(result, config)
+
+    assert not report.audit_only_samples
+    assert all(not audit.samples for audit in report.sample_audits if not audit.valid)
+    assert report.observations
+    assert all(not sample.staged_image.path.exists() for sample in result.samples)
+    assert external.read_bytes() == b"external"
+    assert prior.read_bytes() == b"prior"
+
+
+def test_inconsistent_final_reference_is_mandatory_structural_failure(
+    tmp_path: Path, config_factory: object
+) -> None:
+    result = _result(tmp_path)
+    wrong = replace(result.samples[0].staged_image, camera_name="not-front")
+    result = replace(
+        result,
+        samples=(replace(result.samples[0], staged_image=wrong), *result.samples[1:]),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="reference|inconsistent"):
+        evaluate_validity(result, config_factory())  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    ("selection", "message"),
+    [
+        (
+            GridSelection(
+                (SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),),
+                (GridMiss(3_000_000_000), GridMiss(3_000_000_000)),
+                (100,),
+            ),
+            "duplicate.*target",
+        ),
+        (
+            GridSelection(
+                (SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),),
+                (GridMiss(2_000_000_000),),
+                (100,),
+            ),
+            "entry.*miss|disjoint",
+        ),
+        (
+            GridSelection(
+                (SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),),
+                (GridMiss(3_000_000_000), GridMiss(2_500_000_000)),
+                (100,),
+            ),
+            "ordered",
+        ),
+        (
+            GridSelection(
+                (SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),),
+                (GridMiss(3_000_000_000),),
+                (),
+            ),
+            "unused",
+        ),
+        (
+            GridSelection(
+                (
+                    SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 100),
+                    SelectedGridEntry(2_500_000_000, 2_000_000_100, -499_999_900, 499_999_900),
+                ),
+                (GridMiss(3_000_000_000),),
+                (100,),
+            ),
+            "duplicate batch",
+        ),
+    ],
+)
+def test_grid_selection_partition_contradictions_are_structural(
+    tmp_path: Path,
+    config_factory: object,
+    selection: GridSelection,
+    message: str,
+) -> None:
+    result = replace(_result(tmp_path), selected_grid=selection)
+
+    with pytest.raises(StructuralExtractionError, match=message):
+        evaluate_validity(result, config_factory())  # type: ignore[operator]
+
+
+def test_grid_audits_are_emitted_in_combined_target_order(
+    tmp_path: Path, config_factory: object
+) -> None:
+    result = _result(tmp_path)
+    result = replace(
+        result,
+        selected_grid=GridSelection(
+            result.selected_grid.entries,
+            (GridMiss(1_000_000_000), GridMiss(3_000_000_000)),
+            result.selected_grid.unused_batch_timestamps_ns,
+        ),
+    )
+
+    report = evaluate_validity(result, _configured(config_factory()))  # type: ignore[operator]
+
+    assert tuple(item.grid_target_timestamp_ns for item in report.grid_audits) == (
+        1_000_000_000,
+        2_000_000_000,
+        3_000_000_000,
+    )
+
+
+class _CountingTuple(tuple[object, ...]):
+    yielded = 0
+    maximum_yields = 20_000
+
+    def __iter__(self) -> Iterator[object]:
+        for item in super().__iter__():
+            type(self).yielded += 1
+            if type(self).yielded > type(self).maximum_yields:
+                raise AssertionError("camera batch sequence was scanned quadratically")
+            yield item
+
+
+def test_large_result_validation_builds_batch_indexes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _result(tmp_path)
+    count = 2_000
+    template_batch = base.camera_batches[0]
+    template_sample = base.samples[0]
+    batches: list[RawCameraBatch] = []
+    entries: list[SelectedGridEntry] = []
+    samples: list[ExtractedCameraSample] = []
+    poses: dict[int, EgoPose] = {}
+    for timestamp in range(1, count + 1):
+        frame = replace(
+            template_batch.frames[0],
+            camera_timestamp_ns=timestamp,
+        )
+        batch = replace(
+            template_batch,
+            rec_timestamp_ns=timestamp,
+            recorded_timestamp_ns=timestamp,
+            frame_id=timestamp,
+            rec_frame_id=timestamp,
+            frames=(frame,),
+        )
+        interpolation = replace(
+            template_sample.ego_pose.interpolation,
+            timestamp_ns=timestamp,
+        )
+        pose = replace(
+            template_sample.ego_pose,
+            timestamp_ns=timestamp,
+            interpolation=interpolation,
+        )
+        staged = replace(
+            template_sample.staged_image,
+            camera_index=frame.camera_index,
+            camera_name=frame.camera_name,
+            timestamp_ns=timestamp,
+            path=base.staging_root / f"{timestamp}.jpg",
+            inode=timestamp,
+        )
+        sample = replace(
+            template_sample,
+            grid_target_timestamp_ns=timestamp,
+            batch_timestamp_ns=timestamp,
+            camera_timestamp_ns=timestamp,
+            camera_index=frame.camera_index,
+            camera_name=frame.camera_name,
+            staged_image=staged,
+            ego_pose=pose,
+        )
+        batches.append(batch)
+        entries.append(SelectedGridEntry(timestamp, timestamp, 0, 0))
+        samples.append(sample)
+        poses[timestamp] = pose
+    result = replace(
+        base,
+        camera_batches=tuple(batches),
+        selected_grid=GridSelection(tuple(entries), (), ()),
+        samples=tuple(samples),
+        ego_poses_by_timestamp=poses,
+    )
+    counting = _CountingTuple(result.camera_batches)
+    _CountingTuple.yielded = 0
+    object.__setattr__(result, "camera_batches", counting)
+    monkeypatch.setattr(validity_module, "verify_owned_staged_images", lambda *_: None)
+
+    validity_module._validate_result(result)
+
+    assert _CountingTuple.yielded <= count * 3
+
+
+def test_drop_refuses_ancestor_symlink_without_deleting_owned_inodes(
+    tmp_path: Path, config_factory: object
+) -> None:
+    result = _result(tmp_path)
+    original_paths = tuple(sample.staged_image.path for sample in result.samples)
+    moved_root = tmp_path / "moved-staging"
+    (tmp_path / "staging").rename(moved_root)
+    (tmp_path / "staging").symlink_to(moved_root, target_is_directory=True)
+    config = config_factory()  # type: ignore[operator]
+    config = config.model_copy(
+        update={
+            "frame_validity": config.frame_validity.model_copy(
+                update={"invalid_sample_policy": "drop"}
+            )
+        }
+    )
+
+    with pytest.raises(StructuralExtractionError, match="ancestor|symlink"):
+        evaluate_validity(result, config)
+
+    assert all(
+        (moved_root / "recording-owned" / path.name).is_file()
+        for path in original_paths
+    )
+
+
+def test_transactional_drop_rolls_back_after_first_tombstone_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_link = os.link
+    calls = 0
+
+    def fail_second_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second move")
+        original_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.link", fail_second_link)
+
+    with pytest.raises(StructuralExtractionError, match="tombstone|transaction"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+    assert not list(result.staging_root.glob(".*.drop-*"))
+
+
+def test_transactional_drop_rolls_back_when_commit_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_first_fsync(file_descriptor: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected commit fsync")
+        original_fsync(file_descriptor)
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.fsync", fail_first_fsync)
+
+    with pytest.raises(StructuralExtractionError, match="transaction|commit"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+    assert not list(result.staging_root.glob(".*.drop-*"))
+
+
+def test_transactional_drop_rolls_back_when_post_move_identity_check_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_stat = os.stat
+    failed = False
+
+    def fail_first_tombstone_stat(
+        path: str,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal failed
+        value = original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if not failed and ".drop-" in path:
+            failed = True
+            raise OSError("injected post-move stat")
+        return value
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.stat", fail_first_tombstone_stat)
+
+    with pytest.raises(StructuralExtractionError, match="transaction"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+    assert not list(result.staging_root.glob(".*.drop-*"))
+
+
+def test_post_commit_tombstone_cleanup_failure_is_explicit_and_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    external = result.staging_root / "external.jpg"
+    external.write_bytes(b"external")
+    original_unlink = os.unlink
+    failed = False
+
+    def fail_first_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        if not failed and ".drop-" in path:
+            failed = True
+            raise OSError("injected tombstone cleanup")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.unlink", fail_first_unlink)
+
+    with pytest.raises(StructuralExtractionError) as caught:
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert "cleanup" in str(caught.value)
+    tombstones = caught.value.tombstones  # type: ignore[attr-defined]
+    assert tombstones
+    first = tombstones[0]
+    assert first.invocation_root == result.staging_root
+    assert first.tombstone_name.startswith(".")
+    assert first.original_name == images[0].path.name
+    assert first.device == images[0].device
+    assert first.inode == images[0].inode
+    assert first.expected_regular and first.expected_single_link
+    assert all((item.invocation_root / item.tombstone_name).is_file() for item in tombstones)
+    assert all(not image.path.exists() for image in images)
+    assert external.read_bytes() == b"external"
+
+
+def _committed_cleanup_error(
+    result: RecordingExtractionResult,
+    monkeypatch: pytest.MonkeyPatch,
+) -> StructuralExtractionError:
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_unlink = os.unlink
+    failed = False
+
+    def fail_first_tombstone(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        if not failed and ".drop-" in path:
+            failed = True
+            raise OSError("injected cleanup retry state")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.staging.os.unlink", fail_first_tombstone
+    )
+    with pytest.raises(StructuralExtractionError) as caught:
+        remove_owned_staged_images(result.staging_root, images)
+    assert hasattr(caught.value, "tombstones")
+    return caught.value
+
+
+def test_retry_owned_tombstone_cleanup_succeeds_when_identity_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = _committed_cleanup_error(_result(tmp_path), monkeypatch)
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(error.tombstones)  # type: ignore[attr-defined]
+
+    assert outcome.cleaned == error.tombstones  # type: ignore[attr-defined]
+    assert outcome.remaining == ()
+    assert outcome.mismatched == ()
+    assert outcome.directory_fsynced
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "hardlink", "different_inode"])
+def test_retry_never_deletes_replaced_or_linked_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    result = _result(tmp_path)
+    error = _committed_cleanup_error(result, monkeypatch)
+    records = error.tombstones  # type: ignore[attr-defined]
+    record = records[0]
+    tombstone = record.invocation_root / record.tombstone_name
+    external = tmp_path / f"external-{replacement}"
+    external.write_bytes(b"external")
+    if replacement == "symlink":
+        tombstone.unlink()
+        tombstone.symlink_to(external)
+    elif replacement == "hardlink":
+        os.link(tombstone, external.with_suffix(".link"))
+    else:
+        tombstone.unlink()
+        tombstone.write_bytes(b"replacement")
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(records)
+
+    assert record in outcome.remaining
+    assert record in outcome.mismatched
+    assert tombstone.exists() or tombstone.is_symlink()
+    assert external.read_bytes() == b"external"
+
+
+def test_retry_is_safe_when_invocation_ancestor_is_swapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    error = _committed_cleanup_error(result, monkeypatch)
+    records = error.tombstones  # type: ignore[attr-defined]
+    moved_parent = tmp_path / "moved-staging"
+    result.staging_root.parent.rename(moved_parent)
+    replacement_root = result.staging_root
+    replacement_root.mkdir(parents=True)
+    replacement = replacement_root / records[0].tombstone_name
+    replacement.write_bytes(b"unowned")
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(records)
+
+    assert outcome.cleaned == ()
+    assert outcome.remaining == records
+    assert outcome.mismatched == records
+    assert replacement.read_bytes() == b"unowned"
+    assert all(
+        (moved_parent / result.staging_root.name / item.tombstone_name).is_file()
+        for item in records
+    )
+
+
+def test_retry_rejects_same_invocation_inode_moved_under_new_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    error = _committed_cleanup_error(result, monkeypatch)
+    records = error.tombstones  # type: ignore[attr-defined]
+    original_parent = result.staging_root.parent
+    moved_parent = tmp_path / "moved-parent"
+    original_parent.rename(moved_parent)
+    original_parent.mkdir()
+    (moved_parent / result.staging_root.name).rename(result.staging_root)
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(records)
+
+    assert outcome.cleaned == ()
+    assert outcome.remaining == records
+    assert outcome.mismatched == records
+    assert all(
+        (result.staging_root / item.tombstone_name).is_file() for item in records
+    )
+
+
+def test_retry_partial_state_is_deterministic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = _committed_cleanup_error(_result(tmp_path), monkeypatch)
+    records = error.tombstones  # type: ignore[attr-defined]
+    first = records[0]
+    first_path = first.invocation_root / first.tombstone_name
+    first_path.unlink()
+    first_path.write_bytes(b"replacement")
+    retry = getattr(staging_module, "retry_owned_tombstone_cleanup", None)
+    assert callable(retry)
+
+    outcome = retry(records)
+
+    assert outcome.cleaned == records[1:]
+    assert outcome.remaining == (first,)
+    assert outcome.mismatched == (first,)
+
+
+def test_tombstone_destination_race_does_not_clobber_or_drop_originals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_link = os.link
+    racing_path: Path | None = None
+
+    def race_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal racing_path
+        if ".drop-" in destination and racing_path is None:
+            racing_path = result.staging_root / destination
+            racing_path.write_bytes(b"racing-unowned")
+        original_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr("dataset_devkit.extraction.staging.os.link", race_link)
+
+    with pytest.raises(StructuralExtractionError, match="transaction"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert racing_path is not None
+    assert racing_path.read_bytes() == b"racing-unowned"
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+
+
+def test_failure_after_tombstone_link_rolls_back_without_partial_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result(tmp_path)
+    images = tuple(sample.staged_image for sample in result.samples)
+    original_unlink = os.unlink
+    failed = False
+
+    def fail_first_source_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        if not failed and ".drop-" not in path:
+            failed = True
+            raise OSError("injected source unlink")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        "dataset_devkit.extraction.staging.os.unlink", fail_first_source_unlink
+    )
+
+    with pytest.raises(StructuralExtractionError, match="transaction"):
+        remove_owned_staged_images(result.staging_root, images)
+
+    assert all(image.path.read_bytes() == b"owned" for image in images)
+    assert not list(result.staging_root.glob(".*.drop-*"))
+
+
+def _nested_orientation_result(tmp_path: Path) -> RecordingExtractionResult:
+    result = _result(tmp_path)
+    before = replace(
+        result.gnss_samples[0],
+        is_valid=True,
+        position_uncertainty={
+            "east_sigma_m": 0.1,
+            "north_sigma_m": 0.1,
+            "up_sigma_m": 0.1,
+        },
+        orientation_uncertainty={
+            "nested": {"z_variance": 3.0, "a_variance": 3.0},
+            "repeated": [0.4, "2"],
+            "boolean": True,
+            "decimal_prose": "99.5",
+        },
+    )
+    after = replace(before, timestamp_ns=4_000_000_000, rec_timestamp_ns=4_000_000_000)
+    interpolation = interpolate_gnss((before, after), 100)
+    pose = replace(result.samples[0].ego_pose, interpolation=interpolation)
+    sample = replace(result.samples[0], ego_pose=pose)
+    second_batch = replace(result.camera_batches[1], frames=(result.camera_batches[1].frames[0],))
+    return replace(
+        result,
+        camera_batches=(result.camera_batches[0], second_batch),
+        samples=(sample,),
+        ego_poses_by_timestamp={100: pose},
+        gnss_samples=(before, after),
+    )
+
+
+@pytest.mark.parametrize(
+    ("threshold", "enabled", "expected_observation"),
+    [(3.0, True, False), (2.9, True, True), (2.9, False, True)],
+)
+def test_orientation_policy_recurses_all_numeric_leaves_with_deterministic_max(
+    tmp_path: Path,
+    config_factory: object,
+    threshold: float,
+    enabled: bool,
+    expected_observation: bool,
+) -> None:
+    base = config_factory()  # type: ignore[operator]
+    toggles: dict[str, bool] = {code: False for code in INVALIDITY_CODES}
+    toggles["orientation_variance_exceeded"] = enabled
+    config = base.model_copy(
+        update={
+            "gnss": base.gnss.model_copy(
+                update={"orientation_variance_max": threshold}
+            ),
+            "frame_validity": base.frame_validity.model_copy(
+                update={
+                    "required_cameras": [],
+                    "invalidate_on": InvalidationRulesConfig.model_validate(toggles),
+                }
+            ),
+        }
+    )
+
+    report = evaluate_validity(
+        _nested_orientation_result(tmp_path / f"{threshold}-{enabled}"), config
+    )
+    observations = tuple(
+        item for item in report.observations
+        if item.code == "orientation_variance_exceeded"
+    )
+
+    assert bool(observations) is expected_observation
+    if not observations:
+        return
+    observation = observations[0]
+    assert observation.enabled_as_invalidator is enabled
+    assert observation.measured_values == {
+        "nested.a_variance": 3.0,
+        "nested.z_variance": 3.0,
+        "repeated[0]": pytest.approx(0.4),
+        "repeated[1]": 2.0,
+        "maximum_variance": 3.0,
+    }
+    assert observation.details["maximum_variance_path"] == "nested.a_variance"
+    assert observation.details["numeric_orientation_paths"] == (
+        "nested.a_variance",
+        "nested.z_variance",
+        "repeated[0]",
+        "repeated[1]",
+    )
+    assert observation.details["before_orientation_uncertainty"]["nested"] == {
+        "z_variance": 3.0,
+        "a_variance": 3.0,
+    }
+    assert observation.details["before_orientation_uncertainty"]["repeated"] == (
+        0.4,
+        "2",
+    )
+    assert observation.details["after_orientation_uncertainty"] == observation.details[
+        "before_orientation_uncertainty"
+    ]
+
+
+def test_invalidity_observation_details_use_bounded_cycle_detection() -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match=r"details\.self.*cycle",
+    ):
+        InvalidityObservation("grid_miss", "grid", details=cyclic)
+
+
+def test_invalidity_observation_details_use_shared_depth_limit() -> None:
+    root: dict[str, object] = {}
+    current = root
+    for _ in range(33):
+        child: dict[str, object] = {}
+        current["nested"] = child
+        current = child
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match=r"details(?:\.nested)+.*maximum depth 32",
+    ):
+        InvalidityObservation("grid_miss", "grid", details=root)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        SelectedGridEntry(2_000_000_000, 2_000_000_100, 99, 100),
+        SelectedGridEntry(2_000_000_000, 2_000_000_100, 100, 99),
+    ],
+)
+def test_grid_selection_rejects_inconsistent_sync_error_fields(
+    tmp_path: Path,
+    config_factory: object,
+    entry: SelectedGridEntry,
+) -> None:
+    result = _result(tmp_path)
+    result = replace(
+        result,
+        selected_grid=replace(result.selected_grid, entries=(entry,)),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="sync error"):
+        evaluate_validity(result, config_factory())  # type: ignore[operator]

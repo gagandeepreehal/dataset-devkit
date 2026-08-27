@@ -1,0 +1,687 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from dataset_devkit.config import GlobalConfig, load_config
+
+
+def minimal_config() -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "huggingface": {
+            "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-monocam",
+            "revision": "a" * 40,
+            "manifest_path": "manifest.jsonl",
+        },
+        "paths": {
+            "work_dir": "../work",
+            "cache_dir": "../cache",
+            "output_dir": "../output/dataset",
+        },
+        "topics": {"camera": "rec_cameras", "gnss": "gnss"},
+        "downsampling": {"target_fps": 2.0, "tolerance_ms": 100.0},
+        "image": {"jpeg_quality": 95},
+        "gnss": {
+            "position_sigma_max_m": 0.5,
+            "orientation_variance_max": 0.1,
+            "sync_gap_max_ms": 30.0,
+        },
+        "frame_validity": {
+            "invalid_sample_policy": "retain_for_audit",
+            "required_cameras": [],
+            "camera_timestamp_gap_max_ms": 1000.0,
+            "invalidate_on": {},
+        },
+        "sanity_checks": {},
+        "scenes": {
+            "mode": "hybrid",
+            "dataset_namespace": "8d55f58b-4a7b-5a9a-a95a-a3989610795b",
+            "min_duration_s": 10.0,
+            "max_duration_s": 40.0,
+            "min_samples": 20,
+            "max_sample_gap_ms": 650.0,
+            "skip_between_scenes_s": 0.0,
+        },
+        "annotations": {
+            "path": "annotations.jsonl",
+            "match_tolerance_ms": 500.0,
+            "before_s": 20.0,
+            "after_s": 20.0,
+        },
+        "tags": {
+            "reference_camera_channel": "front",
+            "reference_camera_policy": "require",
+            "stationary_speed_mps": 0.2,
+            "minimum_movement_m": 0.1,
+            "straight_max_heading_change_deg": 5.0,
+            "curvature_min_heading_change_deg": 10.0,
+            "turn_min_heading_change_deg": 45.0,
+        },
+        "filters": {},
+        "scenarios": {"seed": 42, "strict_quotas": True, "rules": []},
+        "split": {"test_fraction": 0.2, "seed": 42, "stratify": True},
+        "execution": {"workers": 2, "allow_partial_export": False},
+        "publication": {"version": "v1.0-trainval", "refuse_overwrite": True},
+    }
+
+
+def write_config(tmp_path: Path, data: dict[str, object]) -> Path:
+    config_path = tmp_path / "config" / "dataset_config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps(data), encoding="utf-8")
+    return config_path
+
+
+def test_load_config_requires_top_level_json_object(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="top-level JSON object"):
+        load_config(config_path)
+
+
+def set_nested(data: dict[str, object], dotted_key: str, value: object) -> None:
+    target: dict[str, Any] = data
+    parts = dotted_key.split(".")
+    for part in parts[:-1]:
+        target = target[part]
+    target[parts[-1]] = value
+
+
+def test_load_config_is_strict_and_resolves_relative_paths(tmp_path: Path) -> None:
+    config_path = write_config(tmp_path, minimal_config())
+
+    config = load_config(config_path)
+
+    assert isinstance(config, GlobalConfig)
+    assert config.huggingface.repo_id == (
+        "gagandeepreehal/minuszero-indian-autonomous-driving-monocam"
+    )
+    assert config.huggingface.revision == "a" * 40
+    assert config.huggingface.manifest_path == "manifest.jsonl"
+    assert config.paths.work_dir == (config_path.parent / "../work").resolve()
+    assert config.annotations.path == (config_path.parent / "annotations.jsonl").resolve()
+
+    invalid = minimal_config()
+    invalid["unexpected"] = True
+    invalid_path = write_config(tmp_path / "invalid", invalid)
+    with pytest.raises(ValidationError, match="unexpected"):
+        load_config(invalid_path)
+
+
+@pytest.mark.parametrize("quality", [0, 101])
+def test_jpeg_quality_must_be_in_valid_range(tmp_path: Path, quality: int) -> None:
+    data = minimal_config()
+    data["image"]["jpeg_quality"] = quality  # type: ignore[index]
+
+    with pytest.raises(ValidationError, match="jpeg_quality"):
+        load_config(write_config(tmp_path / str(quality), data))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("downsampling.target_fps", 0),
+        ("downsampling.tolerance_ms", -1),
+        ("gnss.position_sigma_max_m", -1),
+        ("gnss.orientation_variance_max", -1),
+        ("gnss.sync_gap_max_ms", -1),
+        ("scenes.min_duration_s", 0),
+        ("scenes.min_samples", 0),
+        ("scenes.max_sample_gap_ms", -1),
+        ("scenes.skip_between_scenes_s", -1),
+        ("annotations.match_tolerance_ms", -1),
+        ("annotations.before_s", -1),
+        ("annotations.after_s", -1),
+        ("tags.stationary_speed_mps", -1),
+        ("tags.turn_min_heading_change_deg", 181),
+        ("filters.min_scene_valid_ratio", -0.1),
+        ("filters.min_scene_valid_ratio", 1.1),
+        ("filters.min_source_gnss_valid_ratio", -0.1),
+        ("filters.max_source_gnss_valid_ratio", 1.1),
+        ("split.test_fraction", 0),
+        ("split.test_fraction", 1),
+        ("execution.workers", 0),
+    ],
+)
+def test_invalid_numeric_thresholds_are_rejected(tmp_path: Path, field: str, value: object) -> None:
+    data = minimal_config()
+    set_nested(data, field, value)
+
+    with pytest.raises(ValidationError, match=field.rsplit(".", 1)[-1]):
+        load_config(write_config(tmp_path / field.replace(".", "_"), data))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("execution.workers", "2"),
+        ("execution.workers", 2.0),
+        ("execution.workers", True),
+        ("downsampling.target_fps", "2.0"),
+        ("downsampling.target_fps", True),
+        ("execution.allow_partial_export", "false"),
+        ("execution.allow_partial_export", 0),
+        ("topics.camera", 123),
+    ],
+)
+def test_runtime_primitives_are_not_coerced(tmp_path: Path, field: str, value: object) -> None:
+    data = minimal_config()
+    set_nested(data, field, value)
+
+    with pytest.raises(ValidationError, match=field.rsplit(".", 1)[-1]):
+        load_config(write_config(tmp_path / field.replace(".", "_"), data))
+
+
+def test_scene_max_duration_cannot_be_less_than_minimum(tmp_path: Path) -> None:
+    data = minimal_config()
+    set_nested(data, "scenes.min_duration_s", 30)
+    set_nested(data, "scenes.max_duration_s", 20)
+
+    with pytest.raises(ValidationError, match="max_duration_s"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "first_value", "second_value"),
+    [
+        ("work_dir", "cache_dir", "../runtime", "../runtime"),
+        ("work_dir", "cache_dir", "../runtime", "../runtime/cache"),
+        ("cache_dir", "work_dir", "../runtime", "../runtime/work"),
+        ("work_dir", "output_dir", "../runtime", "../runtime/export"),
+        ("output_dir", "cache_dir", "../runtime", "../runtime/cache"),
+    ],
+)
+def test_work_cache_and_output_paths_must_not_overlap(
+    tmp_path: Path,
+    first: str,
+    second: str,
+    first_value: str,
+    second_value: str,
+) -> None:
+    data = minimal_config()
+    paths: dict[str, object] = data["paths"]  # type: ignore[assignment]
+    paths[first] = first_value
+    paths[second] = second_value
+
+    with pytest.raises(ValidationError, match="overlap"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "directory",
+    ["../work", "../cache/rejected", "../output", "../output/dataset/quarantine"],
+)
+def test_enabled_quarantine_directory_must_not_overlap_destructive_paths(
+    tmp_path: Path, directory: str
+) -> None:
+    data = minimal_config()
+    data["quarantine"] = {
+        "enabled": True,
+        "directory": directory,
+        "manifest_name": "rejected.jsonl",
+    }
+
+    with pytest.raises(ValidationError, match="quarantine.*overlap|overlap.*quarantine"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_quarantine_cannot_be_disabled(tmp_path: Path) -> None:
+    data = minimal_config()
+    data["quarantine"] = {
+        "enabled": False,
+        "directory": "../output/dataset",
+        "manifest_name": "rejected.jsonl",
+    }
+
+    with pytest.raises(ValidationError, match="quarantine.*enabled|enabled"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_ordinary_urls_and_secret_named_paths_are_allowed(tmp_path: Path) -> None:
+    data = minimal_config()
+    set_nested(data, "annotations.path", "secret-camera/annotations.jsonl")
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.huggingface.repo_id.endswith("/minuszero-indian-autonomous-driving-monocam")
+    assert config.annotations.path.name == "annotations.jsonl"
+
+
+def test_non_bearer_credentials_remain_rejected_in_path_fields(tmp_path: Path) -> None:
+    data = minimal_config()
+    set_nested(data, "annotations.path", "AccountKey=embedded/annotations.jsonl")
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "repo_id",
+    [
+        "owner",
+        "/dataset",
+        "owner/",
+        "owner/dataset/extra",
+        "owner dataset/name",
+        "https://huggingface.co/datasets/owner/dataset",
+    ],
+)
+def test_huggingface_repo_id_must_be_owner_and_name(tmp_path: Path, repo_id: str) -> None:
+    data = minimal_config()
+    set_nested(data, "huggingface.repo_id", repo_id)
+
+    with pytest.raises(ValidationError, match="repo_id"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "main",
+        "A" * 40,
+        "a" * 39,
+        "g" * 40,
+    ],
+)
+def test_huggingface_revision_requires_full_lowercase_commit(
+    tmp_path: Path, revision: str
+) -> None:
+    data = minimal_config()
+    set_nested(data, "huggingface.revision", revision)
+
+    with pytest.raises(ValidationError, match="revision"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "manifest_path",
+    ["/manifest.jsonl", "../manifest.jsonl", "a/../manifest.jsonl", r"a\manifest.jsonl", "a%2fb"],
+)
+def test_huggingface_manifest_path_is_safe_relative_posix(
+    tmp_path: Path, manifest_path: str
+) -> None:
+    data = minimal_config()
+    set_nested(data, "huggingface.manifest_path", manifest_path)
+
+    with pytest.raises(ValidationError, match="manifest_path"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("field", ["topics.camera", "topics.gnss"])
+@pytest.mark.parametrize("value", ["", "   ", "\t"])
+def test_topic_names_must_be_nonblank(tmp_path: Path, field: str, value: str) -> None:
+    data = minimal_config()
+    set_nested(data, field, value)
+
+    with pytest.raises(ValidationError, match=field.rsplit(".", 1)[-1]):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "A" * 86 + "==",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl",
+    ],
+)
+def test_raw_base64_secrets_and_jwts_are_rejected_in_values(tmp_path: Path, secret: str) -> None:
+    data = minimal_config()
+    set_nested(data, "publication.version", secret)
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "credential_field",
+    [
+        "auth",
+        "password",
+        "secret",
+        "account_key",
+        "hf_token",
+        "access_token",
+    ],
+)
+def test_explicit_credential_field_names_are_rejected(
+    tmp_path: Path, credential_field: str
+) -> None:
+    data = minimal_config()
+    huggingface: dict[str, object] = data["huggingface"]  # type: ignore[assignment]
+    huggingface[credential_field] = "embedded-value"
+
+    with pytest.raises(ValidationError, match="credential key"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_bearer_prefixed_ordinary_strings_and_paths_are_allowed(tmp_path: Path) -> None:
+    data = minimal_config()
+    set_nested(data, "annotations.path", "bearer archive/annotations.jsonl")
+    set_nested(data, "topics.camera", "bearer migration archive for July recordings")
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.annotations.path.name == "annotations.jsonl"
+    assert config.topics.camera == "bearer migration archive for July recordings"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("image.jpeg_quality", 94),
+        ("publication.version", "v1.0-mini"),
+        ("publication.refuse_overwrite", False),
+    ],
+)
+def test_v1_publication_contract_is_exact(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    data = minimal_config()
+    set_nested(data, field, value)
+
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER"])
+def test_opaque_bearer_tokens_are_rejected(tmp_path: Path, scheme: str) -> None:
+    data = minimal_config()
+    set_nested(
+        data,
+        "publication.version",
+        f"{scheme} abcdefghijklmnopqrstuvwxyz123456",
+    )
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "abcdefghijklmnopqrstuvwxyz123456.",
+        "abcdefghijklmnopqrstuvwxyz123456~",
+        "abcdefghijklmnopqrstuvwxyz123456+",
+        "abcdefghijklmnopqrstuvwxyz123456/",
+        "abcdefghijklmnop/qrstuvwxyzABCDEFGH",
+        "abcdefghijklmnopqrstuvwxyz123456==",
+    ],
+)
+def test_rfc6750_b64token_characters_are_rejected(tmp_path: Path, token: str) -> None:
+    data = minimal_config()
+    set_nested(data, "publication.version", f"Bearer {token}")
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_bearer_prefixed_path_with_digits_is_allowed(tmp_path: Path) -> None:
+    data = minimal_config()
+    set_nested(data, "annotations.path", "bearer archive/2026/annotations.jsonl")
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.annotations.path.name == "annotations.jsonl"
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "abcdefghijklmnopqrstuvwxyz123456.abc",
+        "abcdefghijklmnop/qrstuvwxyzABCDEFGH",
+    ],
+)
+def test_standalone_bearer_token_shapes_are_rejected(tmp_path: Path, token: str) -> None:
+    data = minimal_config()
+    set_nested(data, "publication.version", f"Bearer {token}")
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "bearer archive/2026/recording12345678901234567890",
+        "bearer /var/archive/recording12345678901234567890",
+        "bearer ../archive/recording12345678901234567890",
+        r"bearer C:\archive\recording12345678901234567890",
+    ],
+)
+def test_clearly_path_like_bearer_values_are_allowed(tmp_path: Path, value: str) -> None:
+    data = minimal_config()
+    set_nested(data, "annotations.path", value)
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.annotations.path.name == Path(value).name
+
+
+def test_multi_separator_bearer_token_is_rejected_in_non_path_field(tmp_path: Path) -> None:
+    data = minimal_config()
+    value = "Bearer abcdefghijklmno/pqrstuvwxyzABCDE/FGHIJ"
+    set_nested(data, "publication.version", value)
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("field", "url"),
+    [
+        ("publication.version", "https://example.test/data?password=embedded"),
+        (
+            "publication.version",
+            "https://example.test/data?access_token=embedded",
+        ),
+        ("publication.version", "https://example.test/data?sig=embedded"),
+    ],
+)
+def test_credential_bearing_url_queries_are_rejected(tmp_path: Path, field: str, url: str) -> None:
+    data = minimal_config()
+    set_nested(data, field, url)
+
+    with pytest.raises(ValidationError, match="credential"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> None:
+    data = minimal_config()
+    data["frame_validity"] = {
+        "invalid_sample_policy": "retain_for_audit",
+        "required_cameras": ["front"],
+        "camera_timestamp_gap_max_ms": 1000.0,
+        "invalidate_on": {
+            "missing_required_camera": True,
+            "gnss_source_invalid": True,
+            "gnss_sync_gap_exceeded": True,
+        },
+    }
+    data["sanity_checks"] = {
+        "empty_selected_grid": "error",
+        "empty_final_candidates": "error",
+        "all_gnss_sources_invalid": "warn",
+        "zero_required_camera_coverage": "error",
+    }
+    data["scenarios"] = {
+        "seed": 42,
+        "rules": [
+                {
+                    "name": "turns",
+                    "quota": 100,
+                    "required_all_tags": ["left_turn"],
+                }
+        ],
+    }
+    data["quarantine"] = {
+        "enabled": True,
+        "directory": "../quarantine",
+        "manifest_name": "rejected.jsonl",
+    }
+
+    config = load_config(write_config(tmp_path, data))
+
+    assert config.scenarios.rules[0].quota == 100
+    assert config.quarantine.directory == (tmp_path / "quarantine").resolve()
+
+
+@pytest.mark.parametrize("required_tags", [[""], [" turn "], ["turn", "turn"]])
+def test_filter_tags_must_be_nonempty_and_unique(tmp_path: Path, required_tags: list[str]) -> None:
+    data = minimal_config()
+    set_nested(data, "filters.required_all_tags", required_tags)
+
+    with pytest.raises(ValidationError, match="required_all_tags"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("required_tags", "excluded_tags"),
+    [
+        ([""], []),
+        (["turn", "turn"], []),
+        ([], ["stationary", "stationary"]),
+        (["turn"], ["turn"]),
+    ],
+)
+def test_scenario_rule_tags_are_valid_sets(
+    tmp_path: Path, required_tags: list[str], excluded_tags: list[str]
+) -> None:
+    data = minimal_config()
+    data["scenarios"] = {
+        "seed": 42,
+        "rules": [
+            {
+                "name": "turns",
+                "quota": 1,
+                "required_all_tags": required_tags,
+                "excluded_tags": excluded_tags,
+            }
+        ],
+    }
+
+    with pytest.raises(ValidationError, match="tags|overlap"):
+        load_config(write_config(tmp_path, data))
+
+
+def test_scenario_rule_names_must_be_nonblank_and_unique(tmp_path: Path) -> None:
+    data = minimal_config()
+    data["scenarios"] = {
+        "seed": 42,
+        "rules": [
+            {"name": "turns", "quota": 1},
+            {"name": "turns", "quota": 1},
+        ],
+    }
+
+    with pytest.raises(ValidationError, match="rule names"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("name", ["   ", " turns "])
+def test_scenario_rule_name_must_be_nonblank(tmp_path: Path, name: str) -> None:
+    data = minimal_config()
+    data["scenarios"] = {
+        "seed": 42,
+        "rules": [{"name": name, "quota": 1}],
+    }
+
+    with pytest.raises(ValidationError, match="name"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("quarantine.manifest_name", ""),
+        ("quarantine.manifest_name", "."),
+        ("quarantine.manifest_name", ".."),
+        ("quarantine.manifest_name", "../rejected.jsonl"),
+        ("quarantine.manifest_name", "nested/rejected.jsonl"),
+        ("quarantine.manifest_name", r"nested\rejected.jsonl"),
+        ("publication.version", ""),
+        ("publication.version", ".."),
+        ("publication.version", "versions/v1"),
+        ("publication.version", " v1 "),
+        ("publication.version", "artifact "),
+        ("publication.version", "artifact."),
+        ("publication.version", "CON"),
+        ("publication.version", "prn.txt"),
+        ("publication.version", "AUX"),
+        ("publication.version", "nul.log"),
+        ("publication.version", "COM1"),
+        ("publication.version", "com9.ext"),
+        ("publication.version", "LPT1"),
+        ("publication.version", "lpt9.data"),
+    ],
+)
+def test_manifest_and_publication_identifiers_are_safe_segments(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    data = minimal_config()
+    data["quarantine"] = {
+        "enabled": True,
+        "directory": "../quarantine",
+        "manifest_name": "rejected.jsonl",
+    }
+    set_nested(data, field, value)
+
+    with pytest.raises(ValidationError, match=field.rsplit(".", 1)[-1]):
+        load_config(write_config(tmp_path / field.replace(".", "_"), data))
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "huggingface",
+        "paths",
+        "topics",
+        "downsampling",
+        "image",
+        "gnss",
+        "frame_validity",
+        "frame_validity.invalidate_on",
+        "sanity_checks",
+        "scenes",
+        "annotations",
+        "tags",
+        "filters",
+        "scenarios",
+        "split",
+        "execution",
+        "publication",
+    ],
+)
+def test_unknown_keys_are_rejected_in_every_nested_section(tmp_path: Path, section: str) -> None:
+    data = minimal_config()
+    set_nested(data, f"{section}.unknown_key", True)
+
+    with pytest.raises(ValidationError, match="unknown_key"):
+        load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("nested", ["rule", "rule_filters", "quarantine"])
+def test_unknown_keys_are_rejected_in_extended_nested_models(tmp_path: Path, nested: str) -> None:
+    data = minimal_config()
+    rule: dict[str, object] = {
+        "name": "turns",
+        "quota": 1,
+        "required_all_tags": ["left_turn"],
+    }
+    data["scenarios"] = {"seed": 42, "rules": [rule]}
+    data["quarantine"] = {"unknown_key": True}
+    if nested == "rule":
+        rule["unknown_key"] = True
+        data["quarantine"] = {}
+    elif nested == "rule_filters":
+        rule["filters"] = {"min_distance_m": 1.0, "unknown_key": True}
+        data["quarantine"] = {}
+
+    with pytest.raises(ValidationError, match="unknown_key"):
+        load_config(write_config(tmp_path, data))

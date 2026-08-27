@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "Benchmarking.proto";
+
+package autonome;
+
+// Sanitized golden copy of the production camera descriptor contract.
+message CompressedVideos {
+  int64 rec_frame_id = 1;
+  google.protobuf.Timestamp rec_timestamp = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  string format = 4;
+  int64 frame_id = 5;
+  repeated bytes data = 6;
+  repeated string name = 7;
+  int32 width = 8;
+  int32 height = 9;
+  int32 number_of_cameras = 10;
+
+  message CameraIntrinsic {
+    float focal_length_x = 1;
+    float focal_length_y = 2;
+    float optical_center_x = 3;
+    float optical_center_y = 4;
+    float rmse = 5;
+    float skew = 6;
+    repeated double distortion_coeffs = 7;
+    float width = 8;
+    float height = 9;
+  }
+
+  repeated CameraIntrinsic camera_intrinsic = 11;
+
+  message CameraExtrinsic {
+    repeated float rotation_vector = 1;
+    repeated float translation_vector = 2;
+  }
+
+  repeated CameraExtrinsic camera_extrinsic = 12;
+  repeated Benchmarking benchmarking = 13;
+  repeated google.protobuf.Timestamp camera_timestamp = 14;
+}

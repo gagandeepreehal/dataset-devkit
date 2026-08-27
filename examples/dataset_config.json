@@ -1,0 +1,107 @@
+{
+  "schema_version": "1.0",
+  "huggingface": {
+    "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-monocam",
+    "revision": "b13c3bd3a049c73b560910ef5dbc60cbd28c441b",
+    "manifest_path": "manifest.jsonl"
+  },
+  "paths": {
+    "work_dir": "../var/work",
+    "cache_dir": "../var/cache",
+    "output_dir": "../var/datasets/nuscenes"
+  },
+  "topics": {
+    "camera": "rec_cameras",
+    "gnss": "gnss"
+  },
+  "downsampling": {
+    "target_fps": 2.0,
+    "tolerance_ms": 100.0
+  },
+  "image": {
+    "jpeg_quality": 95
+  },
+  "gnss": {
+    "position_sigma_max_m": 0.5,
+    "orientation_variance_max": 0.1,
+    "sync_gap_max_ms": 30.0
+  },
+  "frame_validity": {
+    "invalid_sample_policy": "retain_for_audit",
+    "required_cameras": ["front", "rear"],
+    "camera_timestamp_gap_max_ms": 1000.0,
+    "invalidate_on": {
+      "gnss_source_invalid": true,
+      "position_sigma_exceeded": true,
+      "orientation_variance_exceeded": true,
+      "gnss_sync_gap_exceeded": true,
+      "camera_timestamp_non_monotonic": true,
+      "camera_timestamp_gap_exceeded": true,
+      "missing_required_camera": true,
+      "grid_miss": true
+    }
+  },
+  "sanity_checks": {
+    "empty_selected_grid": "error",
+    "empty_final_candidates": "error",
+    "all_gnss_sources_invalid": "warn",
+    "zero_required_camera_coverage": "error"
+  },
+  "scenes": {
+    "mode": "hybrid",
+    "dataset_namespace": "8d55f58b-4a7b-5a9a-a95a-a3989610795b",
+    "min_duration_s": 10.0,
+    "max_duration_s": 40.0,
+    "min_samples": 20,
+    "max_sample_gap_ms": 650.0,
+    "skip_between_scenes_s": 0.0
+  },
+  "annotations": {
+    "path": "annotations.jsonl",
+    "match_tolerance_ms": 500.0,
+    "before_s": 20.0,
+    "after_s": 20.0
+  },
+  "tags": {
+    "reference_camera_channel": "front",
+    "reference_camera_policy": "require",
+    "stationary_speed_mps": 0.2,
+    "minimum_movement_m": 0.1,
+    "straight_max_heading_change_deg": 5.0,
+    "curvature_min_heading_change_deg": 10.0,
+    "turn_min_heading_change_deg": 45.0
+  },
+  "filters": {
+    "min_scene_valid_ratio": 0.95
+  },
+  "scenarios": {
+    "seed": 42,
+    "strict_quotas": true,
+    "rules": [
+      {
+        "name": "Left Turn",
+        "quota": 100,
+        "required_all_tags": ["left_turn"],
+        "excluded_tags": ["stationary"]
+      }
+    ]
+  },
+  "split": {
+    "test_fraction": 0.2,
+    "seed": 42,
+    "stratify": true
+  },
+  "execution": {
+    "workers": 4,
+    "allow_partial_export": false
+  },
+  "quarantine": {
+    "enabled": true,
+    "directory": "../var/quarantine",
+    "manifest_name": "rejected.jsonl"
+  },
+  "publication": {
+    "version": "v1.0-trainval",
+    "refuse_overwrite": true
+  }
+}
