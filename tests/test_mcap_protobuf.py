@@ -112,6 +112,26 @@ def descriptor_with_nested_orientation_variances() -> bytes:
     return file_set.SerializeToString()
 
 
+def descriptor_with_extra_position_error_fields() -> bytes:
+    file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
+    calibration = next(file for file in file_set.file if file.name == "calibration.proto")
+    position_error = next(
+        message for message in calibration.message_type if message.name == "PositionError"
+    )
+    for number, (name, field_type) in enumerate(
+        (
+            ("position_rms", descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE),
+            ("pdop", descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT),
+            ("vdop", descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT),
+            ("covariance_en", descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE),
+        ),
+        start=5,
+    ):
+        field = position_error.field.add(name=name, number=number, type=field_type)
+        field.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+    return file_set.SerializeToString()
+
+
 def descriptor_with_top_level_camera_types() -> bytes:
     file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
     telemetry = next(file for file in file_set.file if file.name == "telemetry.proto")
@@ -600,6 +620,37 @@ def test_gnss_compatible_numeric_mode_accepts_float_hdop(tmp_path: Path) -> None
     )
 
     assert recording.gnss_samples[0].position_uncertainty["hdop"] == pytest.approx(1.0)
+
+
+def test_gnss_preserves_descriptor_known_position_error_fields(tmp_path: Path) -> None:
+    descriptor_data = descriptor_with_extra_position_error_fields()
+    _, gnss_type = message_classes(descriptor_data)
+    message = gnss_type.FromString(
+        gnss_message(900_000_000, 0, descriptor_data=descriptor_data)
+    )
+    message.position_error.position_rms = 0.4
+    message.position_error.pdop = 1.5
+    message.position_error.vdop = 1.25
+    message.position_error.covariance_en = -0.02
+    path = tmp_path / "extra-position-error-fields.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        gnss_payloads=(bytes(message.SerializeToString()),),
+    )
+
+    recording = read_recording(path, "rec_cameras", "gnss")
+
+    assert recording.gnss_samples[0].position_uncertainty == {
+        "east_sigma_m": pytest.approx(0.1),
+        "north_sigma_m": pytest.approx(0.2),
+        "up_sigma_m": pytest.approx(0.3),
+        "hdop": pytest.approx(1.0),
+        "position_rms": pytest.approx(0.4),
+        "pdop": pytest.approx(1.5),
+        "vdop": pytest.approx(1.25),
+        "covariance_en": pytest.approx(-0.02),
+    }
 
 
 def test_missing_gnss_rec_timestamp_log_time_fallback_is_opt_in_and_auditable(

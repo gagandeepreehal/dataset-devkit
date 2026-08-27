@@ -667,6 +667,9 @@ def _parse_gnss(
         orientation_uncertainty = _message_dict(
             dynamic.orientation_error, root_path="orientation_error"
         )
+        position_uncertainty = _message_dict(
+            dynamic.position_error, root_path="position_error"
+        )
         return GnssSample(
             timestamp_ns=_timestamp_ns(message, "timestamp", "GNSS message"),
             rec_timestamp_ns=_timestamp_ns(
@@ -682,12 +685,7 @@ def _parse_gnss(
             roll_rad=numeric_values[3],
             pitch_rad=numeric_values[4],
             yaw_rad=numeric_values[5],
-            position_uncertainty={
-                "east_sigma_m": numeric_values[6],
-                "north_sigma_m": numeric_values[7],
-                "up_sigma_m": numeric_values[8],
-                "hdop": numeric_values[9],
-            },
+            position_uncertainty=position_uncertainty,
             orientation_uncertainty=orientation_uncertainty,
             raw_identifiers=raw,
         )
