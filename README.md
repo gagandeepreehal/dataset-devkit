@@ -3,6 +3,7 @@
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 ![Status: Alpha](https://img.shields.io/badge/status-alpha-orange)
 ![Platform: POSIX](https://img.shields.io/badge/platform-POSIX-lightgrey)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE.md)
 
 Welcome to the development kit for creating compact, reproducible, nuScenes-compatible datasets
 from the openly released Minus Zero autonomous-driving datasets.
@@ -271,6 +272,10 @@ python -m build --wheel --no-isolation
 
 ## License
 
-This repository does not yet include an open-source software license. Until one is added, the
-source is publicly visible but remains all rights reserved. Each Minus Zero dataset release is
-governed by the license stated on its own dataset card.
+The software is source-available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md). It may be used, copied, modified, and
+distributed for noncommercial purposes under those terms. Commercial use requires a separate
+license from the licensor.
+
+Because commercial use is restricted, this is not an OSI-approved open-source license. Each Minus
+Zero dataset release remains governed separately by the license stated on its dataset card.
