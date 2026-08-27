@@ -737,6 +737,7 @@ def read_recording(
     *,
     compatible_gnss_numeric_types: bool = False,
     allow_gnss_rec_timestamp_log_time_fallback: bool = False,
+    allow_native_camera_calibration_resolution: bool = False,
 ) -> RawRecording:
     """Index configured topics without retaining compressed camera payload bytes.
 
@@ -789,7 +790,13 @@ def read_recording(
                     batch, _ = _parse_camera(
                         _parse_message(message_type, record.data, "camera")
                     )
-                    camera_state = validate_camera_batch(batch, camera_state)
+                    camera_state = validate_camera_batch(
+                        batch,
+                        camera_state,
+                        allow_native_calibration_resolution=(
+                            allow_native_camera_calibration_resolution
+                        ),
+                    )
                     camera_batches.append(batch)
                 elif channel.topic == gnss_topic:
                     gnss_seen = True
@@ -832,6 +839,8 @@ def iter_camera_access_units(
     path: Path,
     camera_topic: str,
     recording: RawRecording,
+    *,
+    allow_native_camera_calibration_resolution: bool = False,
 ) -> Iterator[CameraAccessUnit]:
     """Reopen and stream structurally verified camera AUs for the decode pass."""
     _assert_source_identity(path, recording.source_identity)
@@ -872,7 +881,13 @@ def iter_camera_access_units(
                 batch, payloads = _parse_camera(
                     _parse_message(message_type, record.data, "camera")
                 )
-                camera_state = validate_camera_batch(batch, camera_state)
+                camera_state = validate_camera_batch(
+                    batch,
+                    camera_state,
+                    allow_native_calibration_resolution=(
+                        allow_native_camera_calibration_resolution
+                    ),
+                )
                 if batch_ordinal >= len(recording.camera_batches):
                     raise StructuralExtractionError(
                         "camera stream changed between extraction passes: extra batch"

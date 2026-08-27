@@ -10,7 +10,11 @@ from google.protobuf import descriptor_pb2
 
 from dataset_devkit.extraction import mcap_source
 from dataset_devkit.extraction.errors import StructuralExtractionError
-from dataset_devkit.extraction.mcap_source import build_message_classes, read_recording
+from dataset_devkit.extraction.mcap_source import (
+    build_message_classes,
+    iter_camera_access_units,
+    read_recording,
+)
 from mcap_fixture import (
     HEVC_AU,
     camera_message,
@@ -450,6 +454,57 @@ def test_camera_descriptor_rejects_top_level_calibration_types(
 
     with pytest.raises(StructuralExtractionError, match="camera schema field.*camera_intrinsic"):
         read_recording(path, "rec_cameras", "gnss")
+
+
+def test_camera_native_calibration_resolution_mode_is_opt_in_and_uniform(
+    tmp_path: Path,
+) -> None:
+    payload = camera_message(
+        dimensions=(1280, 720),
+        intrinsic_dimensions=(1920, 1080),
+    )
+    path = tmp_path / "native-resolution-calibration.mcap"
+    write_mcap(path, camera_payloads=(payload,))
+
+    with pytest.raises(StructuralExtractionError, match="dimensions differ"):
+        read_recording(path, "rec_cameras", "gnss")
+
+    recording = read_recording(
+        path,
+        "rec_cameras",
+        "gnss",
+        allow_native_camera_calibration_resolution=True,
+    )
+    access_units = tuple(
+        iter_camera_access_units(
+            path,
+            "rec_cameras",
+            recording,
+            allow_native_camera_calibration_resolution=True,
+        )
+    )
+
+    assert len(access_units) == 2
+    assert recording.camera_batches[0].frames[0].calibration.intrinsic.width == 1920
+
+
+def test_camera_native_calibration_resolution_rejects_aspect_ratio_change(
+    tmp_path: Path,
+) -> None:
+    payload = camera_message(
+        dimensions=(1280, 720),
+        intrinsic_dimensions=(1920, 1200),
+    )
+    path = tmp_path / "bad-native-resolution-calibration.mcap"
+    write_mcap(path, camera_payloads=(payload,))
+
+    with pytest.raises(StructuralExtractionError, match="aspect ratio"):
+        read_recording(
+            path,
+            "rec_cameras",
+            "gnss",
+            allow_native_camera_calibration_resolution=True,
+        )
 
 
 @pytest.mark.parametrize(

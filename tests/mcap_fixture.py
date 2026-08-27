@@ -229,6 +229,7 @@ def camera_message(
     format_name: str = "h265",
     payloads: tuple[bytes, ...] | None = None,
     dimensions: tuple[int, int] = (4, 3),
+    intrinsic_dimensions: tuple[int, int] | None = None,
     descriptor_data: bytes | None = None,
     camera_names: tuple[str, ...] | None = None,
 ) -> bytes:
@@ -246,13 +247,14 @@ def camera_message(
         message.data.append(frame_payloads[index])
         message.name.append(f"cam_{index}" if camera_names is None else camera_names[index])
         _timestamp(message.camera_timestamp.add(), timestamp_ns)
+        calibration_dimensions = intrinsic_dimensions or dimensions
         intrinsic = message.camera_intrinsic.add(
             focal_length_x=1,
             focal_length_y=1,
             optical_center_x=2,
             optical_center_y=2,
-            width=dimensions[0],
-            height=dimensions[1],
+            width=calibration_dimensions[0],
+            height=calibration_dimensions[1],
         )
         intrinsic.distortion_coeffs.extend([0.1, 0.2])
         extrinsic = message.camera_extrinsic.add()
