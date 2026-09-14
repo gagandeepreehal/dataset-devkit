@@ -489,6 +489,16 @@ def test_manifest_detects_tamper_extra_and_symlink(
             "extension_reference",
         ),
         (
+            "mz_extensions/source.json",
+            lambda value: value.update(privacy_classification="privacy_transformed"),
+            "privacy_contract",
+        ),
+        (
+            "mz_extensions/source.json",
+            lambda value: value.update(pose_frame="recording_local_enu_v1"),
+            "privacy_contract",
+        ),
+        (
             "mz_extensions/annotations.json",
             lambda value: value["scenes"].append(dict(value["scenes"][0])),
             "extension_reference",
@@ -599,6 +609,9 @@ def test_inspect_and_atomic_publication_refuses_overwrite(
     assert summary.validation_state == "succeeded"
     assert summary.scene_count > 0
     assert summary.content_hash
+    assert summary.source_type == "mcap_hf"
+    assert summary.privacy_classification == "restricted_raw"
+    assert summary.pose_frame == "web_mercator_v1"
     with pytest.raises(FileExistsError, match="overwrite"):
         publish_staging(tmp_path / "other", final)
 

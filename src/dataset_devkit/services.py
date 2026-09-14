@@ -87,6 +87,9 @@ class BuildResult:
     content_hash: str
     partial: bool
     failed_recordings: tuple[str, ...]
+    source_type: str
+    privacy_classification: str
+    pose_frame: str
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,9 @@ class InspectionSummary:
     test_scene_count: int
     validation_state: str
     content_hash: str
+    source_type: str
+    privacy_classification: str
+    pose_frame: str
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -117,6 +123,9 @@ class InspectionSummary:
             "split_counts": {"train": self.train_scene_count, "test": self.test_scene_count},
             "validation_state": self.validation_state,
             "content_hash": self.content_hash,
+            "source_type": self.source_type,
+            "privacy_classification": self.privacy_classification,
+            "pose_frame": self.pose_frame,
         }
 
 
@@ -511,6 +520,10 @@ def _build_evidence_owned(
             ),
         },
         selected_validity,
+        source_type=batch.source_type,
+        privacy_classification=batch.privacy_classification,
+        pose_frame=batch.pose_frame,
+        global_horizontal_resolution_m=batch.global_horizontal_resolution_m,
     )
     return evidence, tuple(failures)
 
@@ -574,6 +587,9 @@ def build_dataset(config: GlobalConfig, *, runtime: BuildRuntime | None = None) 
         report.content_hash,
         bool(failures),
         failures,
+        evidence.source_type,
+        evidence.privacy_classification,
+        evidence.pose_frame,
     )
 
 
@@ -605,6 +621,7 @@ def inspect_dataset(
     sensors = dataset.table("sensor")
     validation = dataset.validation_report()
     manifest = json.loads((Path(dataroot) / "mz_extensions/content_manifest.json").read_text())
+    source = dataset.source_metadata()
     try:
         state = validation["state"]
         content_hash = manifest["root_sha256"]
@@ -625,4 +642,7 @@ def inspect_dataset(
         len(dataset.scenes_in_split("test")),
         state,
         content_hash,
+        str(source["source_type"]),
+        str(source["privacy_classification"]),
+        str(source["pose_frame"]),
     )

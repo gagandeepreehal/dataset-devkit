@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from collections.abc import Callable
 from decimal import Decimal
@@ -16,6 +17,7 @@ from dataset_devkit.config import (
     ScenarioRuleConfig,
     ScenariosConfig,
 )
+from dataset_devkit.dataset import Dataset
 from dataset_devkit.decoded_acquisition import (
     AcquiredDecodedRecording,
     DecodedHfAcquirer,
@@ -29,6 +31,7 @@ from dataset_devkit.extraction.cache import ExtractionResultCache
 from dataset_devkit.provenance import extraction_config_hash
 from dataset_devkit.services import BuildOperationalError, BuildRuntime, build_dataset
 from dataset_devkit.source_runtime import McapAcquirerProtocol, prepare_source
+from dataset_devkit.validation import validate_dataset as validate_output
 from decoded_v2_fixture import decoded_source_config, write_decoded_fixture
 
 
@@ -192,6 +195,35 @@ def test_decoded_backend_runs_through_common_build_orchestration(
 
     assert result.scene_count == 1
     assert result.partial is False
+    assert result.source_type == "decoded_hf"
+    assert result.privacy_classification == "privacy_transformed"
+    assert result.pose_frame == "recording_local_enu_v1"
+    dataset = Dataset(result.dataroot, result.version)
+    assert dataset.source_metadata() == {
+        "global_horizontal_resolution_m": 1.0,
+        "pose_frame": "recording_local_enu_v1",
+        "privacy_classification": "privacy_transformed",
+        "schema_version": 1,
+        "source_type": "decoded_hf",
+    }
+    gnss = json.loads(
+        (result.dataroot / "mz_extensions/gnss.json").read_text(encoding="utf-8")
+    )[0]
+    pose = dataset.ego_pose(gnss["sample_data_token"])
+    assert pose["translation"] == pytest.approx(gnss["translation_xyz_m"])
+    assert gnss["published_horizontal_resolution_m"] == 1.0
     assert ExtractionResultCache(config.paths.cache_dir).contains(
         batch.recordings[0].fingerprint, extraction_config_hash(config)
     )
+    gnss_path = result.dataroot / "mz_extensions/gnss.json"
+    gnss["translation_xyz_m"][0] += 1.0
+    gnss_path.chmod(0o600)
+    gnss_path.write_text(json.dumps(gnss), encoding="utf-8")
+    report = validate_output(
+        result.dataroot,
+        result.version,
+        official_smoke=False,
+        verify_manifest=False,
+    )
+    assert not report.succeeded
+    assert any(item.code == "extension_value" for item in report.findings)

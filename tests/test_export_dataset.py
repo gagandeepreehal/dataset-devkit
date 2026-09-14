@@ -216,6 +216,13 @@ def test_export_official_tables_extensions_and_sdk_queries(
     ).hexdigest()
 
     dataset = Dataset(root)
+    assert dataset.source_metadata() == {
+        "schema_version": 1,
+        "source_type": "mcap_hf",
+        "privacy_classification": "restricted_raw",
+        "pose_frame": "web_mercator_v1",
+        "global_horizontal_resolution_m": None,
+    }
     first_scene = dataset.table("scene")[0]
     samples = dataset.scene_samples(first_scene["token"])
     assert len(samples) == first_scene["nbr_samples"]

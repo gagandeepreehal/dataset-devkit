@@ -19,6 +19,7 @@ from PIL import Image
 from dataset_devkit.config import GLOBAL_CONFIG_ADAPTER, GlobalConfig
 from dataset_devkit.export import NUSCENES_VERSION, OFFICIAL_TABLES
 from dataset_devkit.provenance import (
+    DecodedSourceFingerprint,
     SourceFingerprint,
     canonical_hash,
     canonical_json,
@@ -1105,6 +1106,7 @@ def _extensions(
     }
     loaded: dict[str, object | None] = {}
     for name in (
+        "source",
         "recordings",
         "gnss",
         "validity",
@@ -1119,6 +1121,46 @@ def _extensions(
         loaded[name] = _load_json(
             root / "mz_extensions" / f"{name}.json", findings, f"mz_extensions/{name}.json"
         )
+    source_metadata = loaded["source"]
+    source_metadata_keys = {
+        "schema_version",
+        "source_type",
+        "privacy_classification",
+        "pose_frame",
+        "global_horizontal_resolution_m",
+    }
+    source_type = (
+        source_metadata.get("source_type")
+        if isinstance(source_metadata, dict)
+        else None
+    )
+    expected_source_contract = (
+        ("privacy_transformed", "recording_local_enu_v1", 1.0)
+        if source_type == "decoded_hf"
+        else ("restricted_raw", "web_mercator_v1", None)
+        if source_type == "mcap_hf"
+        else None
+    )
+    actual_source_contract = (
+        source_metadata.get("privacy_classification"),
+        source_metadata.get("pose_frame"),
+        source_metadata.get("global_horizontal_resolution_m"),
+    ) if isinstance(source_metadata, dict) else None
+    if (
+        not isinstance(source_metadata, dict)
+        or set(source_metadata) != source_metadata_keys
+        or source_metadata.get("schema_version") != 1
+        or expected_source_contract is None
+        or actual_source_contract != expected_source_contract
+    ):
+        findings.append(
+            ValidationFinding(
+                "error",
+                "privacy_contract",
+                "source",
+                "source privacy or pose frame is inconsistent",
+            )
+        )
     recordings = loaded["recordings"]
     log_tokens = {
         cast(str, item.get("token"))
@@ -1128,6 +1170,7 @@ def _extensions(
     recording_sources: set[str] = set()
     log_to_source: dict[str, str] = {}
     source_repo_paths: dict[str, str] = {}
+    source_types_by_digest: dict[str, str] = {}
     channels_by_source: dict[str, dict[str, str]] = {}
     recording_keys = {"source", "source_digest", "log_token", "channels"}
     legacy_source_keys = {"repo_id", "revision", "repo_path", "sha256", "size"}
@@ -1200,6 +1243,11 @@ def _extensions(
                 )
             else:
                 source_repo_paths[source] = repo_path
+                source_types_by_digest[source] = (
+                    "decoded_hf"
+                    if isinstance(parsed_source, DecodedSourceFingerprint)
+                    else "mcap_hf"
+                )
                 channels_by_source[source] = {
                     cast(str, row["normalized"]): cast(str, row["original"])
                     for row in channel_rows
@@ -1220,6 +1268,17 @@ def _extensions(
                 "extension_reference",
                 "recordings",
                 "recording log coverage differs from official logs",
+            )
+        )
+    if source_type in {"mcap_hf", "decoded_hf"} and any(
+        item != source_type for item in source_types_by_digest.values()
+    ):
+        findings.append(
+            ValidationFinding(
+                "error",
+                "privacy_contract",
+                "recordings",
+                "recording fingerprints differ from the declared source type",
             )
         )
     scene_to_source = {
@@ -1741,6 +1800,11 @@ def _extensions(
         "orientation_uncertainty",
         "before",
         "after",
+        "pose_frame",
+        "translation_xyz_m",
+        "published_east_m",
+        "published_north_m",
+        "published_horizontal_resolution_m",
     }
     gnss_identities = (
         [item.get("sample_data_token") for item in gnss if isinstance(item, dict)]
@@ -1775,6 +1839,11 @@ def _extensions(
         )
     gnss_malformed = False
     if isinstance(gnss, list):
+        pose_by_token = {
+            cast(str, pose["token"]): pose
+            for pose in tables["ego_pose"]
+            if isinstance(pose.get("token"), str)
+        }
         for item in gnss:
             if not isinstance(item, dict):
                 gnss_malformed = True
@@ -1810,6 +1879,9 @@ def _extensions(
                 item.get("latitude_deg"),
                 item.get("longitude_deg"),
                 item.get("height_m"),
+                item.get("published_east_m"),
+                item.get("published_north_m"),
+                item.get("published_horizontal_resolution_m"),
             )
             gnss_malformed = gnss_malformed or (
                 official_sample.get("scene_token") != scene_token
@@ -1873,6 +1945,31 @@ def _extensions(
                 or (item.get("before") is not None and not isinstance(item.get("before"), dict))
                 or (item.get("after") is not None and not isinstance(item.get("after"), dict))
             )
+            if source_type == "decoded_hf":
+                pose = pose_by_token.get(cast(str, official.get("ego_pose_token")), {})
+                translation = item.get("translation_xyz_m")
+                published_east = item.get("published_east_m")
+                published_north = item.get("published_north_m")
+                gnss_malformed = gnss_malformed or (
+                    item.get("pose_frame") != "recording_local_enu_v1"
+                    or item.get("published_horizontal_resolution_m") != 1.0
+                    or not isinstance(translation, list)
+                    or len(translation) != 3
+                    or any(not _finite_number(value) for value in translation)
+                    or pose.get("translation") != translation
+                    or not _finite_number(published_east)
+                    or not _finite_number(published_north)
+                    or float(cast(float, published_east)).is_integer() is False
+                    or float(cast(float, published_north)).is_integer() is False
+                )
+            else:
+                gnss_malformed = gnss_malformed or (
+                    item.get("pose_frame") != "web_mercator_v1"
+                    or item.get("translation_xyz_m") is None
+                    or item.get("published_east_m") is not None
+                    or item.get("published_north_m") is not None
+                    or item.get("published_horizontal_resolution_m") is not None
+                )
     else:
         gnss_malformed = True
     if gnss_malformed:

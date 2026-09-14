@@ -89,6 +89,7 @@ class PreparedSourceBatch:
     source_type: SourceType
     privacy_classification: PrivacyClassification
     pose_frame: PoseFrame
+    global_horizontal_resolution_m: float | None
     source_config_hash: str
     recordings: tuple[PreparedRecording, ...]
 
@@ -165,6 +166,7 @@ def _prepare_mcap(
         "mcap_hf",
         "restricted_raw",
         "web_mercator_v1",
+        None,
         canonical_hash(source.model_dump(mode="json")),
         tuple(prepared),
     )
@@ -219,6 +221,7 @@ def _prepare_decoded(
         "decoded_hf",
         "privacy_transformed",
         "recording_local_enu_v1",
+        1.0,
         canonical_hash(config.source.model_dump(mode="json")),
         tuple(prepared),
     )
