@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from dataset_devkit.config import TagsConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
-from dataset_devkit.provenance import SourceFingerprint
+from dataset_devkit.provenance import RecordingFingerprint
 from dataset_devkit.scene_models import (
     RecordingSceneResult,
     SampleDataRecord,
@@ -32,7 +32,7 @@ class ChannelCoverage:
 class SceneFeatures:
     scene_token: str
     scene_name: str
-    source: SourceFingerprint
+    source: RecordingFingerprint
     source_repo_path: str
     human_labels: tuple[str, ...]
     computed_tags: tuple[str, ...]
@@ -73,7 +73,7 @@ class SceneFeatures:
 
 @dataclass(frozen=True)
 class RecordingFeatureResult:
-    source: SourceFingerprint
+    source: RecordingFingerprint
     scenes: tuple[SceneFeatures, ...]
 
 

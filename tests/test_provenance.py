@@ -4,6 +4,7 @@ import json
 import math
 import os
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,13 +13,75 @@ from dataset_devkit.config import GlobalConfig
 from dataset_devkit.provenance import (
     AcquisitionManifest,
     ArtifactIdentity,
+    DecodedSourceFingerprint,
     ExtractionManifest,
     SourceFingerprint,
     canonical_json,
     extraction_config_hash,
+    fingerprint_from_dict,
+    fingerprint_to_dict,
     load_manifest,
     write_manifest,
 )
+
+
+def test_decoded_fingerprint_binds_recording_and_artifact_set() -> None:
+    fingerprint = DecodedSourceFingerprint(
+        repo_id="owner/dataset",
+        revision="0123456789abcdef0123456789abcdef01234567",
+        recording_id="recording-code",
+        catalog_row_sha256="a" * 64,
+        artifact_set_sha256="b" * 64,
+        total_size=123,
+    )
+
+    assert fingerprint.source_type == "decoded_hf"
+    assert fingerprint.privacy_classification == "privacy_transformed"
+    assert fingerprint_from_dict(fingerprint_to_dict(fingerprint)) == fingerprint
+
+
+def test_decoded_digest_changes_with_artifact_set() -> None:
+    first = DecodedSourceFingerprint(
+        "owner/dataset",
+        "0123456789abcdef0123456789abcdef01234567",
+        "recording-code",
+        "a" * 64,
+        "b" * 64,
+        123,
+    )
+    second = replace(first, artifact_set_sha256="c" * 64)
+
+    assert first.digest != second.digest
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"source_type": "mcap_hf"},
+        {"privacy_classification": "restricted_raw"},
+        {"revision": "main"},
+        {"catalog_row_sha256": "a" * 63},
+        {"artifact_set_sha256": "g" * 64},
+        {"total_size": True},
+        {"unknown": "value"},
+    ],
+)
+def test_decoded_fingerprint_parser_rejects_hybrid_or_invalid_shapes(
+    mutation: dict[str, object],
+) -> None:
+    fingerprint = DecodedSourceFingerprint(
+        "owner/dataset",
+        "0123456789abcdef0123456789abcdef01234567",
+        "recording-code",
+        "a" * 64,
+        "b" * 64,
+        123,
+    )
+    payload = fingerprint_to_dict(fingerprint)
+    payload.update(mutation)
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        fingerprint_from_dict(payload)
 
 
 def test_canonical_json_and_source_fingerprint_are_deterministic() -> None:

@@ -7,7 +7,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
-from dataset_devkit.config import GlobalConfig, validate_config_schema_and_runtime
+from dataset_devkit.config import GLOBAL_CONFIG_ADAPTER, validate_config_schema_and_runtime
 
 __all__ = ["validate_config_schema_and_runtime"]
 
@@ -16,7 +16,7 @@ DEFAULT_OUTPUT = Path("schema/dataset_config.schema.json")
 
 def render_schema() -> str:
     """Render a stable, human-reviewable JSON Schema document."""
-    return json.dumps(GlobalConfig.model_json_schema(), indent=2, sort_keys=True) + "\n"
+    return json.dumps(GLOBAL_CONFIG_ADAPTER.json_schema(), indent=2, sort_keys=True) + "\n"
 
 
 def main(argv: Sequence[str] | None = None) -> int:

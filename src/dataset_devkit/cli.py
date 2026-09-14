@@ -12,7 +12,7 @@ from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError
 
 from dataset_devkit.config import ConfigRootError, validate_config_schema_and_runtime
-from dataset_devkit.dataset import DatasetFormatError
+from dataset_devkit.dataset import Dataset, DatasetFormatError
 from dataset_devkit.identifiers import validate_safe_segment
 from dataset_devkit.provenance import canonical_json
 from dataset_devkit.publication import OwnedDirectoryCleanupError
@@ -84,18 +84,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "sample_count": result.sample_count,
                         "sample_data_count": result.sample_data_count,
                         "scene_count": result.scene_count,
+                        "source_type": result.source_type,
+                        "privacy_classification": result.privacy_classification,
+                        "pose_frame": result.pose_frame,
                         "version": result.version,
                     }
                 )
             )
         elif args.command == "validate":
             report = validate_dataset(args.dataroot, args.version)
+            source = Dataset(args.dataroot, args.version).source_metadata()
             print(
                 canonical_json(
                     {
                         "content_hash": report.content_hash,
                         "state": "succeeded",
                         "table_counts": dict(report.table_counts),
+                        "source_type": source["source_type"],
+                        "privacy_classification": source["privacy_classification"],
+                        "pose_frame": source["pose_frame"],
                         "version": args.version,
                     }
                 )

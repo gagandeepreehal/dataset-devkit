@@ -61,6 +61,10 @@ def test_interpolation_retains_raw_endpoints_uncertainty_and_height() -> None:
     assert result.sync_gap_before_ns == result.sync_gap_after_ns == 5
     assert result.projected_x_m == pytest.approx(111_319.490793, rel=1e-8)
     assert result.projected_y_m == pytest.approx(0.0, abs=1e-8)
+    assert result.translation_xyz_m == pytest.approx(
+        (result.projected_x_m, result.projected_y_m, 11.0)
+    )
+    assert result.pose_frame == "web_mercator_v1"
     assert result.quaternion_wxyz is not None
     assert math.sqrt(sum(value * value for value in result.quaternion_wxyz)) == pytest.approx(1)
 

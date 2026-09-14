@@ -92,6 +92,45 @@ def test_trajectory_uses_real_irregular_camera_timestamps(
     assert feature.segment_speeds_mps == pytest.approx((10.0, 5.0))
 
 
+def test_trajectory_features_ignore_published_global_context(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config = _config(config_factory(), max_duration_s=5, max_sample_gap_ms=5000)
+    first_report = _report(tmp_path / "first", (0, 1_000_000_000))
+    second_report = _report(tmp_path / "second", (0, 1_000_000_000))
+    shifted_audits = []
+    for audit in second_report.final_candidates:
+        shifted_cameras = tuple(
+            replace(
+                camera,
+                ego_pose=replace(
+                    camera.ego_pose,
+                    interpolation=replace(
+                        camera.ego_pose.interpolation,
+                        projected_x_m=1_000_000.0,
+                        projected_y_m=-500_000.0,
+                        published_east_m=1_000_000.0,
+                        published_north_m=-500_000.0,
+                    ),
+                ),
+            )
+            for camera in audit.samples
+        )
+        shifted_audits.append(replace(audit, samples=shifted_cameras))
+    second_report = replace(
+        second_report,
+        sample_audits=tuple(shifted_audits),
+        final_candidates=tuple(shifted_audits),
+    )
+
+    first = build_recording_scenes(first_report, SOURCE, config)
+    second = build_recording_scenes(second_report, SOURCE, config)
+
+    assert compute_recording_features(first, config.tags) == compute_recording_features(
+        second, config.tags
+    )
+
+
 @pytest.mark.parametrize("field", ["samples", "sample_data"])
 def test_task5_rejects_noncanonical_global_feature_record_order(
     tmp_path: Path, config_factory: Callable[[], GlobalConfig], field: str

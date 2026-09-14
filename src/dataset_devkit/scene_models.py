@@ -9,7 +9,7 @@ from typing import Literal
 from uuid import UUID
 
 from dataset_devkit.extraction.models import CameraCalibration, EgoPose, StagedImage
-from dataset_devkit.provenance import SourceFingerprint
+from dataset_devkit.provenance import RecordingFingerprint
 
 
 def _jsonable(value: object) -> object:
@@ -130,7 +130,7 @@ class SourceSampleRecord:
 
 @dataclass(frozen=True)
 class RecordingSceneResult:
-    source: SourceFingerprint
+    source: RecordingFingerprint
     source_samples: tuple[SourceSampleRecord, ...]
     scenes: tuple[SceneRecord, ...]
     samples: tuple[SampleRecord, ...]

@@ -20,6 +20,14 @@ class DatasetFormatError(ValueError):
 
 type JsonRecord = dict[str, Any]
 
+_SOURCE_METADATA_KEYS = {
+    "schema_version",
+    "source_type",
+    "privacy_classification",
+    "pose_frame",
+    "global_horizontal_resolution_m",
+}
+
 
 def _load_json(path: Path) -> object:
     try:
@@ -33,6 +41,27 @@ def _required_string(record: JsonRecord, field_name: str, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise DatasetFormatError(f"{label} {field_name} must be a nonempty string")
     return value
+
+
+def _validated_source_metadata(value: object) -> JsonRecord:
+    if not isinstance(value, dict) or set(value) != _SOURCE_METADATA_KEYS:
+        raise DatasetFormatError("source metadata is malformed")
+    source_type = value.get("source_type")
+    expected = (
+        ("privacy_transformed", "recording_local_enu_v1", 1.0)
+        if source_type == "decoded_hf"
+        else ("restricted_raw", "web_mercator_v1", None)
+        if source_type == "mcap_hf"
+        else None
+    )
+    actual = (
+        value.get("privacy_classification"),
+        value.get("pose_frame"),
+        value.get("global_horizontal_resolution_m"),
+    )
+    if value.get("schema_version") != 1 or expected is None or actual != expected:
+        raise DatasetFormatError("source privacy or pose frame is inconsistent")
+    return cast(JsonRecord, value)
 
 
 def _safe_asset_filename(
@@ -147,6 +176,7 @@ class Dataset:
             camera_index[key] = _required_string(item, "token", "sample_data")
         extensions: dict[str, object] = {}
         for name in (
+            "source",
             "recordings",
             "gnss",
             "validity",
@@ -159,6 +189,7 @@ class Dataset:
             "pipeline_audit",
         ):
             extensions[name] = _load_json(root / "mz_extensions" / f"{name}.json")
+        _validated_source_metadata(extensions["source"])
         object.__setattr__(self, "_tables", MappingProxyType(tables))
         object.__setattr__(self, "_token_index", MappingProxyType(indexes))
         object.__setattr__(self, "_extensions", MappingProxyType(extensions))
@@ -172,6 +203,10 @@ class Dataset:
             return deepcopy(self._tables[table_name])
         except KeyError as error:
             raise DatasetFormatError(f"unknown table {table_name!r}") from error
+
+    def source_metadata(self) -> JsonRecord:
+        """Return the validated source privacy and coordinate-frame contract."""
+        return deepcopy(_validated_source_metadata(self._extensions["source"]))
 
     def get(self, table_name: str, token: str) -> JsonRecord:
         """Return one official record by token."""

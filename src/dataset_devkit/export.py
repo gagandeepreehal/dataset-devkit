@@ -21,7 +21,13 @@ from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import CameraCalibration, EgoPose, StagedImage
 from dataset_devkit.features import SceneFeatures
 from dataset_devkit.identifiers import validate_safe_segment
-from dataset_devkit.provenance import SourceFingerprint, canonical_hash, canonical_json
+from dataset_devkit.provenance import (
+    RecordingFingerprint,
+    canonical_hash,
+    canonical_json,
+    fingerprint_locator,
+    fingerprint_to_dict,
+)
 from dataset_devkit.publication import StagingLease
 from dataset_devkit.scenario_selection import ScenarioSelectionResult, validate_scenario_selection
 from dataset_devkit.scene_models import (
@@ -329,7 +335,11 @@ class ExportEvidence:
     resolved_config: GlobalConfig
     content_manifest: object
     pipeline_audit: object | None = None
-    validity_reports: Sequence[tuple[SourceFingerprint, ValidityReport]] = ()
+    validity_reports: Sequence[tuple[RecordingFingerprint, ValidityReport]] = ()
+    source_type: str = "mcap_hf"
+    privacy_classification: str = "restricted_raw"
+    pose_frame: str = "web_mercator_v1"
+    global_horizontal_resolution_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -365,7 +375,7 @@ def pipeline_graph_scene_sequence(
     return [
         {
             "source_digest": graph.source.digest,
-            "source_repo_path": graph.source.repo_path,
+            "source_repo_path": fingerprint_locator(graph.source),
             "scene_token": scene.token,
             "ordinal": scene.ordinal,
             "first_timestamp_ns": scene.first_timestamp_ns,
@@ -514,7 +524,7 @@ def _logical_audit_payload(
 
 
 def _recording_validity_payload(
-    source: SourceFingerprint,
+    source: RecordingFingerprint,
     report: ValidityReport,
 ) -> dict[str, object]:
     final_ids = {
@@ -912,7 +922,7 @@ def _export_into(
         logs.append(
             {
                 "token": token,
-                "logfile": graph.source.repo_path,
+                "logfile": fingerprint_locator(graph.source),
                 "vehicle": "",
                 "date_captured": "",
                 "location": "",
@@ -1048,6 +1058,16 @@ def _export_into(
                         "orientation_uncertainty": _jsonable(interpolation.orientation_uncertainty),
                         "before": _jsonable(interpolation.before),
                         "after": _jsonable(interpolation.after),
+                        "pose_frame": interpolation.pose_frame or evidence.pose_frame,
+                        "translation_xyz_m": _jsonable(
+                            interpolation.translation_xyz_m
+                            or item.ego_pose.translation_xyz_m
+                        ),
+                        "published_east_m": interpolation.published_east_m,
+                        "published_north_m": interpolation.published_north_m,
+                        "published_horizontal_resolution_m": (
+                            interpolation.published_horizontal_resolution_m
+                        ),
                     }
                 )
         validity_extension.append(
@@ -1136,7 +1156,7 @@ def _export_into(
 
     recordings = [
         {
-            "source": graph.source.to_dict(),
+            "source": fingerprint_to_dict(graph.source),
             "source_digest": graph.source.digest,
             "log_token": log_by_source[graph.source.digest],
             "channels": [
@@ -1146,6 +1166,13 @@ def _export_into(
         }
         for graph in selected_graphs
     ]
+    source_metadata = {
+        "schema_version": 1,
+        "source_type": evidence.source_type,
+        "privacy_classification": evidence.privacy_classification,
+        "pose_frame": evidence.pose_frame,
+        "global_horizontal_resolution_m": evidence.global_horizontal_resolution_m,
+    }
     selected_annotation_tokens = {
         token for _, scene in selected_scenes for token in scene.annotation_refs
     }
@@ -1176,6 +1203,7 @@ def _export_into(
         ],
     }
     _write_json(writer, ("mz_extensions", "recordings.json"), recordings)
+    _write_json(writer, ("mz_extensions", "source.json"), source_metadata)
     _write_json(writer, ("mz_extensions", "gnss.json"), gnss_extension)
     validity_payload = {
         "schema_version": 2,

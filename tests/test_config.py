@@ -7,7 +7,41 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from dataset_devkit.config import GlobalConfig, load_config
+from dataset_devkit.config import (
+    DecodedHfSourceConfig,
+    GlobalConfigV1,
+    load_config,
+    privacy_classification,
+)
+
+
+def decoded_source() -> dict[str, object]:
+    return {
+        "type": "decoded_hf",
+        "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "recordings_path": "data/recordings.parquet",
+        "recording_ids": ["recording-code"],
+        "splits": ["train"],
+        "cameras": [
+            "cam_front",
+            "cam_front_left",
+            "cam_front_right",
+            "cam_rear",
+            "cam_rear_left",
+            "cam_rear_right",
+        ],
+        "modalities": ["video", "gnss", "calibration"],
+    }
+
+
+def minimal_decoded_config() -> dict[str, object]:
+    data = minimal_config()
+    data["schema_version"] = "2.0"
+    data["source"] = decoded_source()
+    del data["huggingface"]
+    del data["topics"]
+    return data
 
 
 def minimal_config() -> dict[str, object]:
@@ -77,6 +111,46 @@ def write_config(tmp_path: Path, data: dict[str, object]) -> Path:
     return config_path
 
 
+def test_decoded_source_has_fixed_privacy_classification() -> None:
+    source = DecodedHfSourceConfig.model_validate(decoded_source())
+
+    assert source.type == "decoded_hf"
+    assert source.privacy_classification == "privacy_transformed"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("revision", "main"),
+        ("recordings_path", "../recordings.parquet"),
+        ("cameras", ["cam_front", "unknown"]),
+        ("modalities", ["video", "gnss"]),
+    ],
+)
+def test_decoded_source_rejects_mutable_or_incomplete_input(
+    field: str, value: object
+) -> None:
+    payload = decoded_source()
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        DecodedHfSourceConfig.model_validate(payload)
+
+
+def test_decoded_config_loads_without_raw_topics(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, minimal_decoded_config()))
+
+    assert config.schema_version == "2.0"
+    assert privacy_classification(config) == "privacy_transformed"
+
+
+def test_legacy_config_normalizes_to_restricted_mcap(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, minimal_config()))
+
+    assert config.schema_version == "1.0"
+    assert privacy_classification(config) == "restricted_raw"
+
+
 def test_load_config_requires_top_level_json_object(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text("[]", encoding="utf-8")
@@ -98,7 +172,7 @@ def test_load_config_is_strict_and_resolves_relative_paths(tmp_path: Path) -> No
 
     config = load_config(config_path)
 
-    assert isinstance(config, GlobalConfig)
+    assert isinstance(config, GlobalConfigV1)
     assert config.huggingface.repo_id == (
         "gagandeepreehal/minuszero-indian-autonomous-driving-monocam"
     )
@@ -273,6 +347,7 @@ def test_ordinary_urls_and_secret_named_paths_are_allowed(tmp_path: Path) -> Non
 
     config = load_config(write_config(tmp_path, data))
 
+    assert isinstance(config, GlobalConfigV1)
     assert config.huggingface.repo_id.endswith("/minuszero-indian-autonomous-driving-monocam")
     assert config.annotations.path.name == "annotations.jsonl"
 
@@ -391,6 +466,7 @@ def test_bearer_prefixed_ordinary_strings_and_paths_are_allowed(tmp_path: Path) 
 
     config = load_config(write_config(tmp_path, data))
 
+    assert isinstance(config, GlobalConfigV1)
     assert config.annotations.path.name == "annotations.jsonl"
     assert config.topics.camera == "bearer migration archive for July recordings"
 

@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
-from fractions import Fraction
 from pathlib import Path
 from threading import Lock
-from typing import Protocol
 
-from dataset_devkit.config import GlobalConfig
+from dataset_devkit.config import GlobalConfig, GlobalConfigV1, GlobalConfigV2
 from dataset_devkit.coordinator import (
     PublicationBlockedError,
     RecordingCoordinator,
@@ -31,12 +28,9 @@ from dataset_devkit.extraction.cache import ExtractionResultCache
 from dataset_devkit.extraction.camera import HevcDecoder
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import RecordingExtractionResult
-from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.features import SceneFeatures, compute_recording_features
 from dataset_devkit.filtering import filter_scenes
-from dataset_devkit.huggingface_acquisition import AcquisitionResult, HuggingFaceAcquirer
-from dataset_devkit.huggingface_manifest import ManifestEntry
-from dataset_devkit.provenance import SourceFingerprint, canonical_hash, extraction_config_hash
+from dataset_devkit.provenance import canonical_hash, extraction_config_hash
 from dataset_devkit.publication import (
     OwnedDirectoryAuthority,
     OwnedDirectoryCleanupError,
@@ -47,6 +41,13 @@ from dataset_devkit.publication import (
 from dataset_devkit.quarantine import write_rejection_manifest
 from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scenes import build_recording_scenes
+from dataset_devkit.source_runtime import (
+    DEFAULT_DECODED_ACQUIRER_FACTORY,
+    DEFAULT_MCAP_ACQUIRER_FACTORY,
+    DecodedAcquirerProtocol,
+    McapAcquirerProtocol,
+    prepare_source,
+)
 from dataset_devkit.split import split_selected_scenes
 from dataset_devkit.validation import ValidationReport, finalize_dataset
 from dataset_devkit.validation import validate_dataset as _validate_dataset
@@ -56,28 +57,24 @@ class BuildOperationalError(RuntimeError):
     """Raised for a safe, user-facing pipeline failure."""
 
 
-class AcquirerProtocol(Protocol):
-    def load_entries(self) -> tuple[ManifestEntry, ...]: ...
-
-    def acquire(self, entry: ManifestEntry) -> AcquisitionResult: ...
-
-    def extraction_cache_reusable(
-        self, source: SourceFingerprint, expected_extraction_config_hash: str
-    ) -> bool: ...
-
-    def record_extraction_complete(
-        self, source: SourceFingerprint, completed_extraction_config_hash: str
-    ) -> Path: ...
-
-
 @dataclass(frozen=True)
 class BuildRuntime:
     """Injectable external-runtime boundary used by deterministic tests."""
 
-    acquirer_factory: Callable[[GlobalConfig], AcquirerProtocol] = HuggingFaceAcquirer.from_config
+    mcap_acquirer_factory: Callable[[GlobalConfigV1], McapAcquirerProtocol] = (
+        DEFAULT_MCAP_ACQUIRER_FACTORY
+    )
+    decoded_acquirer_factory: Callable[[GlobalConfigV2], DecodedAcquirerProtocol] = (
+        DEFAULT_DECODED_ACQUIRER_FACTORY
+    )
     decoder_factory: Callable[[], HevcDecoder] | None = None
     extraction_cache_factory: Callable[[Path], ExtractionResultCache] = ExtractionResultCache
     official_smoke: bool = True
+    acquirer_factory: Callable[[GlobalConfigV1], McapAcquirerProtocol] | None = None
+
+    def __post_init__(self) -> None:
+        if self.acquirer_factory is not None:
+            object.__setattr__(self, "mcap_acquirer_factory", self.acquirer_factory)
 
 
 @dataclass(frozen=True)
@@ -90,6 +87,9 @@ class BuildResult:
     content_hash: str
     partial: bool
     failed_recordings: tuple[str, ...]
+    source_type: str
+    privacy_classification: str
+    pose_frame: str
 
 
 @dataclass(frozen=True)
@@ -106,6 +106,9 @@ class InspectionSummary:
     test_scene_count: int
     validation_state: str
     content_hash: str
+    source_type: str
+    privacy_classification: str
+    pose_frame: str
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -120,6 +123,9 @@ class InspectionSummary:
             "split_counts": {"train": self.train_scene_count, "test": self.test_scene_count},
             "validation_state": self.validation_state,
             "content_hash": self.content_hash,
+            "source_type": self.source_type,
+            "privacy_classification": self.privacy_classification,
+            "pose_frame": self.pose_frame,
         }
 
 
@@ -213,122 +219,101 @@ def _build_evidence_owned(
     runtime: BuildRuntime,
     working: _WorkingExtractionRegistry,
 ) -> tuple[ExportEvidence, tuple[str, ...]]:
-    acquirer = runtime.acquirer_factory(config)
-    entries = acquirer.load_entries()
-    if not entries:
+    try:
+        batch = prepare_source(config, runtime)
+    except Exception as error:
+        raise BuildOperationalError(str(error)) from error
+    if not batch.recordings:
         raise BuildOperationalError("repository manifest contains no recordings")
-    decoder_factory = runtime.decoder_factory
-    extractor_kwargs: dict[str, object] = {}
-    if decoder_factory is not None:
-        extractor_kwargs["decoder_factory"] = decoder_factory
-    extractor = RecordingExtractor(
-        camera_topic=config.topics.camera,
-        gnss_topic=config.topics.gnss,
-        target_fps=Fraction(str(config.downsampling.target_fps)),
-        tolerance_ns=int(config.downsampling.tolerance_ms * 1_000_000),
-        staging_root=config.paths.work_dir,
-        compatible_gnss_numeric_types=(
-            config.mcap_compatibility.compatible_gnss_numeric_types
-        ),
-        allow_gnss_rec_timestamp_log_time_fallback=(
-            config.mcap_compatibility.allow_gnss_rec_timestamp_log_time_fallback
-        ),
-        allow_native_camera_calibration_resolution=(
-            config.mcap_compatibility.allow_native_camera_calibration_resolution
-        ),
-        allow_camera_timestamp_batch_fallback=(
-            config.mcap_compatibility.allow_camera_timestamp_batch_fallback
-        ),
-        **extractor_kwargs,  # type: ignore[arg-type]
-    )
-
-    def acquire_one(entry: ManifestEntry) -> AcquisitionResult | Exception:
-        try:
-            return acquirer.acquire(entry)
-        except Exception as error:
-            return error
-
-    with ThreadPoolExecutor(max_workers=config.execution.workers) as executor:
-        acquired_outcomes = tuple(executor.map(acquire_one, entries))
-    acquired: list[tuple[int, ManifestEntry, AcquisitionResult]] = []
-    acquisition_errors: list[tuple[int, ManifestEntry, Exception]] = []
-    for index, (entry, outcome) in enumerate(zip(entries, acquired_outcomes, strict=True)):
-        if isinstance(outcome, Exception):
-            acquisition_errors.append((index, entry, outcome))
-        else:
-            acquired.append((index, entry, outcome))
-    acquisition_by_path = {
-        item.artifact_path.resolve(): item for _, _, item in acquired
-    }
+    extraction_hash = extraction_config_hash(config)
     extraction_cache = runtime.extraction_cache_factory(config.paths.cache_dir)
-    recording_id_by_path = {
-        item.artifact_path.resolve(): f"recording-{index:06d}"
-        for index, _, item in acquired
+    prepared_by_path = {
+        item.working_path.resolve(): item
+        for item in batch.recordings
+        if item.preparation_error is None
     }
+    prepared_by_id = {item.recording_id: item for item in batch.recordings}
+    if len(prepared_by_id) != len(batch.recordings):
+        raise BuildOperationalError("source runtime produced duplicate recording IDs")
+    if len(prepared_by_path) != sum(
+        item.preparation_error is None for item in batch.recordings
+    ):
+        raise BuildOperationalError("source runtime produced duplicate working paths")
 
-    def extract_cached(path: Path) -> RecordingExtractionResult:
-        acquisition = acquisition_by_path[path.resolve()]
-        recording_id = recording_id_by_path[path.resolve()]
-        source = acquisition.manifest.source
-        if acquirer.extraction_cache_reusable(source, extraction_hash):
+    def extract_prepared(path: Path) -> RecordingExtractionResult:
+        prepared = prepared_by_path[path.resolve()]
+        can_reuse = (
+            prepared.cache_reusable is None
+            or prepared.cache_reusable(extraction_hash)
+        )
+        if can_reuse:
             cached = extraction_cache._materialize_owned(
-                source,
+                prepared.fingerprint,
                 extraction_hash,
                 path,
                 config.paths.work_dir,
-                recording_id,
+                prepared.recording_id,
             )
             if cached is not None:
-                working.register(recording_id, cached.result, cached.authority)
+                working.register(
+                    prepared.recording_id, cached.result, cached.authority
+                )
                 return cached.result
-        owned_extraction = extractor.extract_owned(path)
+        owned_extraction = prepared.extract_owned()
         extracted = owned_extraction.result
-        working.register(recording_id, extracted, owned_extraction.authority)
+        working.register(
+            prepared.recording_id, extracted, owned_extraction.authority
+        )
         try:
             extraction_cache.store(
-                source,
+                prepared.fingerprint,
                 extraction_hash,
                 extracted,
                 force_refresh=True,
             )
-            acquirer.record_extraction_complete(source, extraction_hash)
+            if prepared.record_extraction_complete is not None:
+                prepared.record_extraction_complete(extraction_hash)
         except Exception as error:
             try:
-                working.cleanup(recording_id)
+                working.cleanup(prepared.recording_id)
             except OwnedDirectoryCleanupError as cleanup_error:
                 raise cleanup_error from error
             raise
         return extracted
 
-    coordinator = RecordingCoordinator(config=config, extractor=extract_cached)
-    source_config_hash = canonical_hash(config.huggingface.model_dump(mode="json"))
-    extraction_hash = extraction_config_hash(config)
+    coordinator = RecordingCoordinator(config=config, extractor=extract_prepared)
     acquisition_failures: list[RecordingFailure] = []
-    for index, entry, error in acquisition_errors:
+    for prepared in batch.recordings:
+        preparation_error = prepared.preparation_error
+        if preparation_error is None:
+            continue
         request = RecordingRequest(
-            f"recording-{index:06d}",
-            Path(entry.repo_path),
-            source_config_hash,
+            prepared.recording_id,
+            Path(prepared.locator),
+            batch.source_config_hash,
             extraction_hash,
         )
         acquisition_failures.append(
             coordinator.quarantine_failure(
                 request,
-                error,
+                preparation_error,
                 category=(
-                    "structural" if isinstance(error, StructuralExtractionError) else "unexpected"
+                    "structural"
+                    if isinstance(preparation_error, StructuralExtractionError)
+                    else "unexpected"
                 ),
                 stage="acquisition",
             )
         )
     requests = tuple(
         RecordingRequest(
-            f"recording-{index:06d}",
-            acquisition.artifact_path,
-            canonical_hash(acquisition.manifest.source.to_dict()),
+            prepared.recording_id,
+            prepared.working_path,
+            canonical_hash(prepared.fingerprint.to_dict()),
             extraction_hash,
         )
-        for index, _, acquisition in acquired
+        for prepared in batch.recordings
+        if prepared.preparation_error is None
     )
     try:
         coordinator_result = (
@@ -349,10 +334,10 @@ def _build_evidence_owned(
     success_by_source: dict[str, RecordingSuccess] = {}
     scene_failures: list[RecordingFailure] = []
     for success in successes:
-        acquisition = acquisition_by_path[success.extraction.source_path.resolve()]
+        prepared = prepared_by_id[success.recording_id]
         try:
             graph = build_recording_scenes(
-                success.validity, acquisition.manifest.source, config
+                success.validity, prepared.fingerprint, config
             )
         except Exception as error:
             request = request_by_id[success.recording_id]
@@ -461,8 +446,7 @@ def _build_evidence_owned(
         except Exception:
             quarantine_complete = False
     failures = tuple(
-        entries[int(item.recording_id.removeprefix("recording-"))].repo_path
-        for item in all_failures
+        prepared_by_id[item.recording_id].locator for item in all_failures
     )
     if failures and (
         not config.execution.allow_partial_export
@@ -504,7 +488,7 @@ def _build_evidence_owned(
         {"schema_version": 1, "state": "pending_finalization"},
         {
             "schema_version": 1,
-            "source_order": [entry.repo_path for entry in entries],
+            "source_order": [item.locator for item in batch.recordings],
             "failed_recordings": list(failures),
             "filter": {
                 "accepted": [
@@ -536,6 +520,10 @@ def _build_evidence_owned(
             ),
         },
         selected_validity,
+        source_type=batch.source_type,
+        privacy_classification=batch.privacy_classification,
+        pose_frame=batch.pose_frame,
+        global_horizontal_resolution_m=batch.global_horizontal_resolution_m,
     )
     return evidence, tuple(failures)
 
@@ -599,6 +587,9 @@ def build_dataset(config: GlobalConfig, *, runtime: BuildRuntime | None = None) 
         report.content_hash,
         bool(failures),
         failures,
+        evidence.source_type,
+        evidence.privacy_classification,
+        evidence.pose_frame,
     )
 
 
@@ -630,6 +621,7 @@ def inspect_dataset(
     sensors = dataset.table("sensor")
     validation = dataset.validation_report()
     manifest = json.loads((Path(dataroot) / "mz_extensions/content_manifest.json").read_text())
+    source = dataset.source_metadata()
     try:
         state = validation["state"]
         content_hash = manifest["root_sha256"]
@@ -650,4 +642,7 @@ def inspect_dataset(
         len(dataset.scenes_in_split("test")),
         state,
         content_hash,
+        str(source["source_type"]),
+        str(source["privacy_classification"]),
+        str(source["pose_frame"]),
     )

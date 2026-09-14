@@ -34,7 +34,7 @@ from dataset_devkit.extraction.service import RecordingExtractor
 from dataset_devkit.extraction.staging import stage_jpeg
 from dataset_devkit.features import compute_recording_features
 from dataset_devkit.filtering import filter_scenes
-from dataset_devkit.provenance import SourceFingerprint, canonical_json
+from dataset_devkit.provenance import DecodedSourceFingerprint, SourceFingerprint, canonical_json
 from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scene_models import SourceSampleRecord
 from dataset_devkit.scenes import build_recording_scenes, validate_scene_graph
@@ -50,6 +50,14 @@ SOURCE = SourceFingerprint(
     "owner/dataset",
     "a" * 40,
     "data/day/a.mcap",
+    "b" * 64,
+    123,
+)
+DECODED_SOURCE = DecodedSourceFingerprint(
+    "owner/dataset",
+    "0123456789abcdef0123456789abcdef01234567",
+    "recording-code",
+    "a" * 64,
     "b" * 64,
     123,
 )
@@ -236,6 +244,20 @@ def test_multicamera_tokens_real_timestamps_chains_and_determinism(
         chain = [item for item in first.sample_data if item.channel == channel]
         assert chain[0].prev == "" and chain[-1].next == ""
         assert chain[0].next == chain[1].token and chain[1].prev == chain[0].token
+
+
+def test_decoded_recording_identity_flows_through_scene_graph(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    result = build_recording_scenes(
+        _report(tmp_path, (0, 1_000_000_000)),
+        DECODED_SOURCE,
+        _config(config_factory()),
+    )
+
+    assert result.source == DECODED_SOURCE
+    assert {scene.source_repo_path for scene in result.scenes} == {"recording-code"}
+    validate_scene_graph(result)
 
 
 def test_duplicate_final_logical_timestamp_structural_fails(

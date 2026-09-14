@@ -16,7 +16,7 @@ from dataset_devkit.export import (
     export_dataset,
     pipeline_graph_scene_sequence,
 )
-from dataset_devkit.provenance import SourceFingerprint
+from dataset_devkit.provenance import SourceFingerprint, fingerprint_locator
 from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scene_models import RecordingSceneResult
 from dataset_devkit.scenes import build_recording_scenes
@@ -69,7 +69,7 @@ def _evidence(
                 scene_token=scene.token,
                 scene_name=scene.name,
                 source=graph.source,
-                source_repo_path=graph.source.repo_path,
+                source_repo_path=fingerprint_locator(graph.source),
             ),
             computed_tags=("selected",)
             if graph is selected_graph and index in {0, 2}

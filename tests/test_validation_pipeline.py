@@ -22,6 +22,7 @@ from dataset_devkit import validation as validation_module
 from dataset_devkit.config import (
     FiltersConfig,
     GlobalConfig,
+    GlobalConfigV1,
     ScenarioRuleConfig,
     ScenariosConfig,
     TagsConfig,
@@ -140,7 +141,8 @@ def _pipeline_config(
     repo_paths: tuple[str, ...],
     *,
     partial: bool,
-) -> GlobalConfig:
+) -> GlobalConfigV1:
+    assert isinstance(base, GlobalConfigV1)
     annotations = tmp_path / "annotations.jsonl"
     annotations.write_text("")
     paths = base.paths.model_copy(
@@ -494,6 +496,16 @@ def test_manifest_detects_tamper_extra_and_symlink(
             "extension_reference",
         ),
         (
+            "mz_extensions/source.json",
+            lambda value: value.update(privacy_classification="privacy_transformed"),
+            "privacy_contract",
+        ),
+        (
+            "mz_extensions/source.json",
+            lambda value: value.update(pose_frame="recording_local_enu_v1"),
+            "privacy_contract",
+        ),
+        (
             "mz_extensions/annotations.json",
             lambda value: value["scenes"].append(dict(value["scenes"][0])),
             "extension_reference",
@@ -604,6 +616,9 @@ def test_inspect_and_atomic_publication_refuses_overwrite(
     assert summary.validation_state == "succeeded"
     assert summary.scene_count > 0
     assert summary.content_hash
+    assert summary.source_type == "mcap_hf"
+    assert summary.privacy_classification == "restricted_raw"
+    assert summary.pose_frame == "web_mercator_v1"
     with pytest.raises(FileExistsError, match="overwrite"):
         publish_staging(tmp_path / "other", final)
 
@@ -909,6 +924,7 @@ def test_feature_failure_blocks_default_and_partial_export_keeps_good_source(
     def fail_bad_feature(
         graph: RecordingSceneResult, tags: TagsConfig
     ) -> RecordingFeatureResult:
+        assert isinstance(graph.source, SourceFingerprint)
         if graph.source.repo_path == bad_blob:
             raise StructuralExtractionError("injected per-source feature failure")
         return original_compute(graph, tags)
@@ -962,6 +978,7 @@ def test_export_preflight_failure_blocks_default_and_partial_keeps_good_source(
     )
 
     def fail_bad_preflight(graph: RecordingSceneResult) -> None:
+        assert isinstance(graph.source, SourceFingerprint)
         if graph.source.repo_path != bad_blob:
             preflight_recording_export(graph)
             return

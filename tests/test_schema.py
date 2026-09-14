@@ -9,22 +9,26 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from dataset_devkit.config import GlobalConfig, TagsConfig, load_config
+from dataset_devkit.config import (
+    GLOBAL_CONFIG_ADAPTER,
+    TagsConfig,
+    load_config,
+)
 from dataset_devkit.schema import validate_config_schema_and_runtime
-from test_config import minimal_config
+from test_config import minimal_config, minimal_decoded_config
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "schema" / "dataset_config.schema.json"
 
 
 def test_checked_in_schema_is_current_and_deterministic() -> None:
-    expected = json.dumps(GlobalConfig.model_json_schema(), indent=2, sort_keys=True) + "\n"
+    expected = json.dumps(GLOBAL_CONFIG_ADAPTER.json_schema(), indent=2, sort_keys=True) + "\n"
 
     assert SCHEMA_PATH.read_text(encoding="utf-8") == expected
 
 
 def _required_camera_schema() -> dict[str, object]:
-    schema = GlobalConfig.model_json_schema()
+    schema = GLOBAL_CONFIG_ADAPTER.json_schema()
     return schema["$defs"]["FrameValidityConfig"]["properties"]["required_cameras"]  # type: ignore[no-any-return]
 
 
@@ -53,11 +57,29 @@ def test_required_camera_json_schema_directly_rejects_duplicates_and_unsafe_segm
 
 
 def _schema_errors(data: dict[str, object]) -> list[object]:
-    return list(Draft202012Validator(GlobalConfig.model_json_schema()).iter_errors(data))
+    return list(Draft202012Validator(GLOBAL_CONFIG_ADAPTER.json_schema()).iter_errors(data))
 
 
 def test_example_shape_is_valid_under_generated_json_schema() -> None:
     assert not _schema_errors(minimal_config())
+
+
+def test_decoded_shape_is_valid_under_generated_json_schema() -> None:
+    assert not _schema_errors(minimal_decoded_config())
+
+
+def test_schema_v2_rejects_mcap_source_that_has_no_runtime_contract() -> None:
+    data = minimal_decoded_config()
+    data["source"] = {
+        "type": "mcap_hf",
+        "repo_id": "owner/dataset",
+        "revision": "a" * 40,
+        "manifest_path": "manifest.jsonl",
+    }
+
+    assert _schema_errors(data)
+    with pytest.raises(ValidationError):
+        GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
 
 def test_schema_rejects_unsafe_per_channel_coverage_key() -> None:
@@ -68,7 +90,7 @@ def test_schema_rejects_unsafe_per_channel_coverage_key() -> None:
 
 
 def test_safe_segment_maps_close_additional_properties_in_generated_schema() -> None:
-    definition = GlobalConfig.model_json_schema()["$defs"]["FiltersConfig"]
+    definition = GLOBAL_CONFIG_ADAPTER.json_schema()["$defs"]["FiltersConfig"]
     properties = definition["properties"]
     for field in (
         "min_camera_coverage_by_channel",
@@ -118,7 +140,7 @@ def test_schema_directly_enforces_reference_camera_require_coupling() -> None:
 
 
 def test_task6_runtime_constraint_metadata_is_complete_and_exact() -> None:
-    definitions = GlobalConfig.model_json_schema()["$defs"]
+    definitions = GLOBAL_CONFIG_ADAPTER.json_schema()["$defs"]
     expected = {
         "TagsConfig": {
             (
@@ -244,7 +266,7 @@ def test_unrepresentable_task6_constraints_are_schema_visible_and_runtime_reject
     for data in invalid_configs:
         assert not _schema_errors(data)
         with pytest.raises(ValidationError):
-            GlobalConfig.model_validate(data)
+            GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
 
 def test_combined_schema_and_runtime_validator_is_public_and_authoritative(
@@ -289,7 +311,7 @@ def test_per_channel_ratio_bounds_have_schema_and_runtime_parity(
 
 
 def test_task6_string_item_and_name_schema_constraints_cover_every_field() -> None:
-    definitions = GlobalConfig.model_json_schema()["$defs"]
+    definitions = GLOBAL_CONFIG_ADAPTER.json_schema()["$defs"]
     filters = definitions["FiltersConfig"]["properties"]
     for field in (
         "required_any_tags",

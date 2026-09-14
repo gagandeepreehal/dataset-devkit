@@ -8,6 +8,11 @@ candidates and poses. Extra cameras are preserved. A reason attached to any came
 invalidates the complete logical sample when that reason's toggle is enabled. A grid miss has an
 audit record but no extracted or final sample.
 
+For decoded V2, this policy consumes GNSS and exact relative timestamps only after the pinned
+privacy control plane and selected artifacts pass structural verification. Precise recording-local
+ENU is the pose input. Sanitized one-metre global context is never substituted when local ENU is
+missing or invalid.
+
 ## Invalidity observations
 
 Every condition that is observed is emitted, even when its invalidator toggle is disabled and even
@@ -19,7 +24,7 @@ misses. Threshold equality is accepted; `*_exceeded` means strict `measured > th
 
 | Code | Measurement and semantics |
 | --- | --- |
-| `gnss_source_invalid` | Interpolation is unavailable or either preserved endpoint/source has `is_valid == false`; availability, endpoint booleans/timestamps, and interpolation fraction are retained. |
+| `gnss_source_invalid` | Interpolation is unavailable or either preserved endpoint/source has `is_valid == false`; availability, endpoint booleans/timestamps, and interpolation fraction are retained. Invalid decoded rows remain barriers and are not skipped to join distant valid endpoints. |
 | `position_sigma_exceeded` | Any interpolated `east_sigma_m`, `north_sigma_m`, or `up_sigma_m` strictly exceeds `gnss.position_sigma_max_m`; all interpolated axes plus both raw endpoint uncertainty mappings, fraction, timestamps, and endpoint gaps are reported. |
 | `orientation_variance_exceeded` | The conservative maximum across all finite numeric leaves in interpolated `orientation_error` strictly exceeds `gnss.orientation_variance_max`; stable flattened paths, the deterministic maximum path, incompatible/uninterpolated paths, both raw endpoint mappings, fraction, timestamps, and endpoint gaps remain in details. |
 | `gnss_sync_gap_exceeded` | The maximum of the preserved before/after bracket gaps strictly exceeds `gnss.sync_gap_max_ms`; each gap and the maximum are reported in nanoseconds. |
@@ -89,6 +94,10 @@ decoder frame-count mismatch, unsafe/unverifiable JPEG staging, invalid timestam
 or inconsistent internal/final references. All present scalar, repeated, and nested
 `orientation_error` numeric values must also be finite, and nonnumeric uncertainty descriptor
 fields are rejected. These conditions always raise `StructuralExtractionError`.
+
+Decoded catalog/privacy-manifest disagreement, missing selected artifacts, hash or size mismatch,
+invalid recording-local ENU, or privacy-incompatible output metadata are structural failures too.
+They stop that backend; no raw MCAP acquisition or fallback is attempted.
 
 ## Quarantine report contract
 

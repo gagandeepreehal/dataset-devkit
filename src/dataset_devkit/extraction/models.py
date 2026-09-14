@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from dataset_devkit.extraction.grid import GridSelection
 from dataset_devkit.extraction.uncertainty import bounded_freeze
@@ -155,12 +155,65 @@ class GnssSample:
         )
 
 
+type PoseFrame = Literal["web_mercator_v1", "recording_local_enu_v1"]
+
+
+@dataclass(frozen=True)
+class PrivacyGnssSample:
+    recording_offset_ns: int
+    is_valid: bool
+    local_east_m: float | None
+    local_north_m: float | None
+    local_up_m: float | None
+    roll_rad: float | None
+    pitch_rad: float | None
+    yaw_rad: float | None
+    published_east_m: float | None
+    published_north_m: float | None
+    latitude_deg: float | None
+    longitude_deg: float | None
+    height_m: float | None
+    position_uncertainty: Mapping[str, Any]
+    orientation_uncertainty: Mapping[str, Any]
+    quality: Mapping[str, Any]
+    local_enu_origin_offset_ns: Literal[0]
+    published_horizontal_resolution_m: float | None
+
+    @property
+    def timestamp_ns(self) -> int:
+        """Compatibility view of the authoritative recording-relative offset."""
+        return self.recording_offset_ns
+
+    @property
+    def rec_timestamp_ns(self) -> int:
+        return self.recording_offset_ns
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "position_uncertainty",
+            bounded_freeze(self.position_uncertainty, root_path="position_uncertainty"),
+        )
+        object.__setattr__(
+            self,
+            "orientation_uncertainty",
+            bounded_freeze(
+                self.orientation_uncertainty, root_path="orientation_uncertainty"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "quality",
+            bounded_freeze(self.quality, root_path="quality"),
+        )
+
+
 @dataclass(frozen=True)
 class GnssInterpolation:
     timestamp_ns: int
     available: bool
-    before: GnssSample | None
-    after: GnssSample | None
+    before: GnssSample | PrivacyGnssSample | None
+    after: GnssSample | PrivacyGnssSample | None
     fraction: float | None
     sync_gap_before_ns: int | None
     sync_gap_after_ns: int | None
@@ -175,6 +228,12 @@ class GnssInterpolation:
     source_validity: tuple[bool, bool] | None = None
     position_uncertainty_uninterpolated_paths: tuple[str, ...] = ()
     orientation_uncertainty_uninterpolated_paths: tuple[str, ...] = ()
+    translation_xyz_m: tuple[float, float, float] | None = None
+    pose_frame: PoseFrame | None = None
+    published_east_m: float | None = None
+    published_north_m: float | None = None
+    published_horizontal_resolution_m: float | None = None
+    quality: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -190,6 +249,11 @@ class GnssInterpolation:
             bounded_freeze(
                 self.orientation_uncertainty, root_path="orientation_uncertainty"
             ),
+        )
+        object.__setattr__(
+            self,
+            "quality",
+            bounded_freeze(self.quality, root_path="quality"),
         )
 
 
@@ -219,7 +283,7 @@ class RecordingExtractionResult:
     source_path: Path
     staging_root: Path
     camera_batches: tuple[RawCameraBatch, ...]
-    gnss_samples: tuple[GnssSample, ...]
+    gnss_samples: tuple[GnssSample | PrivacyGnssSample, ...]
     selected_grid: GridSelection
     samples: tuple[ExtractedCameraSample, ...]
     ego_poses_by_timestamp: Mapping[int, EgoPose]

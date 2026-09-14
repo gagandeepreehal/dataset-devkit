@@ -9,7 +9,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from dataset_devkit.config import GlobalConfig, load_config
+from dataset_devkit.config import GLOBAL_CONFIG_ADAPTER, GlobalConfig, load_config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -55,7 +55,7 @@ def test_scene_defaults_and_exact_integer_nanoseconds(
 def test_all_exact_scene_modes_are_accepted(config_factory: object, mode: str) -> None:
     data = config_factory().model_dump(mode="python")  # type: ignore[operator]
     data["scenes"]["mode"] = mode
-    assert GlobalConfig.model_validate(data).scenes.mode == mode
+    assert GLOBAL_CONFIG_ADAPTER.validate_python(data).scenes.mode == mode
 
 
 @pytest.mark.parametrize("mode", ["fixed", "annotation", "AUTO", ""])
@@ -63,7 +63,7 @@ def test_old_or_unknown_scene_modes_are_rejected(config_factory: object, mode: s
     data = config_factory().model_dump(mode="python")  # type: ignore[operator]
     data["scenes"]["mode"] = mode
     with pytest.raises(ValidationError, match="mode"):
-        GlobalConfig.model_validate(data)
+        GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
 
 @pytest.mark.parametrize(
@@ -83,7 +83,7 @@ def test_scene_annotation_configuration_is_strict(
     data = copy.deepcopy(config_factory().model_dump(mode="python"))  # type: ignore[operator]
     data[section][field] = value
     with pytest.raises(ValidationError):
-        GlobalConfig.model_validate(data)
+        GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
 
 @pytest.mark.parametrize(
@@ -131,15 +131,15 @@ def test_direct_model_api_requires_decimal_for_task5_times(
     data = config_factory().model_dump(mode="python")
     data["scenes"]["min_duration_s"] = 0.29
     with pytest.raises(ValidationError, match="min_duration_s"):
-        GlobalConfig.model_validate(data)
+        GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
     data["scenes"]["min_duration_s"] = Decimal("0.29")
-    config = GlobalConfig.model_validate(data)
+    config = GLOBAL_CONFIG_ADAPTER.validate_python(data)
     assert config.scenes.min_duration_ns == 290_000_000
 
 
 def test_task5_time_schema_accepts_json_numbers_not_decimal_strings() -> None:
-    schema = GlobalConfig.model_json_schema()
+    schema = GLOBAL_CONFIG_ADAPTER.json_schema()
     for model_name, fields in {
         "ScenesConfig": (
             "min_duration_s",

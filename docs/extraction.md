@@ -1,9 +1,13 @@
-# Native MCAP extraction contract
+# Native MCAP and decoded V2 extraction contracts
 
-`dataset_devkit.extraction.RecordingExtractor` is the one-recording boundary between verified
+`dataset_devkit.extraction.RecordingExtractor` is the restricted-raw MCAP boundary between verified
 acquisition and validity/scene/export policy. It reads a local MCAP, stages selected camera images,
 and returns immutable typed records. It does not decide whether timestamp gaps, GNSS quality, or
 individual samples are acceptable; `evaluate_validity` applies those Task 4 policies afterward.
+
+`dataset_devkit.decoded_extraction.DecodedRecordingExtractor` implements the same downstream
+recording contract from privacy-transformed decoded V2 videos and Parquet tables. It does not
+reconstruct an MCAP, use absolute dates, or search for a raw fallback.
 
 ## Required source streams
 
@@ -122,8 +126,9 @@ endpoint mappings. GNSS roll, pitch, and yaw use a right-handed Cartesian frame 
 body-to-world rotation. They are applied as
 fixed-axis roll about +X, then pitch about +Y, then yaw about +Z, so composition is
 `qz * qy * qx`; the quaternion is stored in `(w, x, y, z)` order. Endpoint attitudes use
-shortest-path quaternion SLERP. Longitude/latitude are projected from EPSG:4326 to EPSG:3857 with
-`always_xy=True`. Raw geodetic endpoints, source validity, uncertainties, interpolation fraction,
+shortest-path quaternion SLERP. For restricted-raw MCAP only, longitude/latitude are projected
+from EPSG:4326 to EPSG:3857 with `always_xy=True`. Raw geodetic endpoints, source validity,
+uncertainties, interpolation fraction,
 uninterpolated numeric paths, and both synchronization gaps remain available for audit and later
 policy. Result mappings are defensive, read-only copies; nested mapping/list/set values are
 recursively frozen.
@@ -136,9 +141,38 @@ target_timestamp_ns`, and its absolute error must equal the magnitude of that si
 Contradictions are structural failures. Combined selected/miss audit output is always sorted by
 target timestamp.
 
+## Decoded V2 synchronization, cameras, and GNSS
+
+Decoded extraction consumes only catalog-selected artifacts whose size and SHA-256 passed the
+public control-plane gate. The default camera set is `cam_front`, `cam_front_left`,
+`cam_front_right`, `cam_rear`, `cam_rear_left`, and `cam_rear_right`; `cam_front_tilted` is used
+only when explicitly selected. Camera frames are joined to their exact source camera and packet
+index. Ordering, nearest-frame selection, GNSS bracketing, interpolation, and scene timestamps use
+signed relative integer nanoseconds. `time_of_day_ns`, where present, is context only and is never
+used as a substitute for the relative timeline.
+
+The privacy-transformed GNSS table is authoritative. Valid rows require finite
+`local_enu.local_east_m`, `local_enu.local_north_m`, and `local_enu.local_up_m`,
+`local_enu_origin_offset_ns == 0`, and `published_horizontal_resolution_m == 1.0`. Invalid rows are
+preserved as interpolation barriers instead of silently disappearing. Frame-time translation is
+linear interpolation of the precise local axes, while orientation retains shortest-path quaternion
+SLERP and the existing conservative quality rules. Out-of-range frames are invalid; there is no
+clamping or extrapolation.
+
+Every GNSS row must carry the selected catalog recording ID. Mixed or foreign recording IDs fail
+before interpolation. Recursive metadata inspection rejects calendar/GPS week-day, epoch,
+timestamp, and ISO-date material while allowing only the declared relative offsets and contextual
+time-of-day fields.
+
+Published global Web Mercator east/north and inverse-derived latitude/longitude remain sanitized
+one-metre context. They are checked and, after interpolation, rounded again to the one-metre grid.
+They never feed pose, distance, speed, curvature, filtering, or scene selection. Official
+`ego_pose.translation` is `(local_east_m, local_north_m, local_up_m)` in
+`recording_local_enu_v1`.
+
 ## Structural failures
 
-`StructuralExtractionError` stops the recording for malformed MCAP/protobuf data, unresolved
+`StructuralExtractionError` stops an MCAP recording for malformed MCAP/protobuf data, unresolved
 descriptors, absent required streams, wrong schema/format, invalid protobuf timestamps, impossible
 or changing camera arrays/calibration, corrupt HEVC, decoder frame-count violations, unsafe JPEG
 staging, duplicate grid batch times, or duplicate GNSS times. Decoder contexts are closed on both
@@ -148,3 +182,8 @@ inode-bound files and directory before propagating the failure.
 
 Backward or gapped but otherwise valid camera timestamps are not a structural failure. The result
 contains per-stream timestamp deltas so the validity stage can apply the configured policy.
+
+Decoded extraction similarly fails structurally on catalog/table disagreement, missing selected
+camera or calibration rows, duplicate or unsafe identities, non-integral relative timestamps,
+unexpected video frame counts, invalid local ENU, unsanitized global coordinates, or any artifact
+mutation. A decoded structural or privacy failure is never retried through MCAP.

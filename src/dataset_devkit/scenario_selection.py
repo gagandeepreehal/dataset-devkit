@@ -10,7 +10,7 @@ from typing import Literal, Protocol
 import dataset_devkit.filtering as filtering_module
 from dataset_devkit.config import ScenarioRuleConfig, ScenariosConfig
 from dataset_devkit.features import SceneFeatures
-from dataset_devkit.provenance import canonical_hash, canonical_json
+from dataset_devkit.provenance import canonical_hash, canonical_json, fingerprint_to_dict
 
 
 @dataclass(frozen=True)
@@ -311,7 +311,7 @@ def _rank(
             "rule_index": rule_index,
             "rule_name": rule_name,
             "scene_token": feature.scene_token,
-            "source": feature.source.to_dict(),
+            "source": fingerprint_to_dict(feature.source),
         }
     )
 

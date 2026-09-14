@@ -305,6 +305,8 @@ def interpolate_gnss(
         quaternion_wxyz=quaternion,
         projected_x_m=projected_x,
         projected_y_m=projected_y,
+        translation_xyz_m=(projected_x, projected_y, height),
+        pose_frame="web_mercator_v1",
         position_uncertainty=position_uncertainty,
         orientation_uncertainty=orientation_uncertainty,
         source_validity=(before.is_valid, after.is_valid),
