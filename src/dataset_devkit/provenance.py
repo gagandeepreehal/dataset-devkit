@@ -351,7 +351,10 @@ def extraction_config_hash(config: GlobalConfig) -> str:
     extraction_config = {
         "schema_version": config.schema_version,
         "source_extraction": (
-            config.topics.model_dump(mode="json")
+            {
+                "topics": config.topics.model_dump(mode="json"),
+                "mcap_compatibility": config.mcap_compatibility.model_dump(mode="json"),
+            }
             if isinstance(config, GlobalConfigV1)
             else normalized_source(config).model_dump(
                 mode="json", exclude={"repo_id", "revision", "privacy_classification"}

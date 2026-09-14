@@ -212,6 +212,13 @@ class TopicsConfig(StrictModel):
         return value
 
 
+class McapCompatibilityConfig(StrictModel):
+    compatible_gnss_numeric_types: bool = False
+    allow_gnss_rec_timestamp_log_time_fallback: bool = False
+    allow_native_camera_calibration_resolution: bool = False
+    allow_camera_timestamp_batch_fallback: bool = False
+
+
 class DownsamplingConfig(StrictModel):
     target_fps: float = Field(gt=0)
     tolerance_ms: float = Field(ge=0)
@@ -767,6 +774,9 @@ type SourceConfig = McapHfSourceConfig | DecodedHfSourceConfig
 
 class _GlobalConfigCommon(StrictModel):
     paths: PathsConfig
+    mcap_compatibility: McapCompatibilityConfig = Field(
+        default_factory=McapCompatibilityConfig
+    )
     downsampling: DownsamplingConfig
     image: ImageConfig
     gnss: GnssConfig

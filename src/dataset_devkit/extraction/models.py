@@ -43,6 +43,7 @@ class RawCameraFrame:
     camera_name: str
     camera_timestamp_ns: int
     calibration: CameraCalibration
+    camera_timestamp_source: str = "camera_timestamp"
 
 
 @dataclass(frozen=True)

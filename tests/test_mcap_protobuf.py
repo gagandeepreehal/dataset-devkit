@@ -10,7 +10,11 @@ from google.protobuf import descriptor_pb2
 
 from dataset_devkit.extraction import mcap_source
 from dataset_devkit.extraction.errors import StructuralExtractionError
-from dataset_devkit.extraction.mcap_source import build_message_classes, read_recording
+from dataset_devkit.extraction.mcap_source import (
+    build_message_classes,
+    iter_camera_access_units,
+    read_recording,
+)
 from mcap_fixture import (
     HEVC_AU,
     camera_message,
@@ -70,6 +74,21 @@ def descriptor_with_optional_numeric(message_name: str, field_name: str) -> byte
     raise AssertionError(f"message {message_name!r} not found")
 
 
+def descriptor_without_field(message_name: str, field_name: str) -> bytes:
+    file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
+    for file_proto in file_set.file:
+        for message in iter_descriptor_messages(file_proto.message_type):
+            if message.name != message_name:
+                continue
+            retained = [field for field in message.field if field.name != field_name]
+            if len(retained) == len(message.field):
+                raise AssertionError(f"field {message_name}.{field_name} not found")
+            message.ClearField("field")
+            message.field.extend(retained)
+            return file_set.SerializeToString()
+    raise AssertionError(f"message {message_name!r} not found")
+
+
 def descriptor_with_nested_orientation_variances() -> bytes:
     file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
     calibration = next(file for file in file_set.file if file.name == "calibration.proto")
@@ -90,6 +109,26 @@ def descriptor_with_nested_orientation_variances() -> bytes:
         type_name=".autonome.OrientationError.AxisVariance",
     )
     samples.label = descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED
+    return file_set.SerializeToString()
+
+
+def descriptor_with_extra_position_error_fields() -> bytes:
+    file_set = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_bytes())
+    calibration = next(file for file in file_set.file if file.name == "calibration.proto")
+    position_error = next(
+        message for message in calibration.message_type if message.name == "PositionError"
+    )
+    for number, (name, field_type) in enumerate(
+        (
+            ("position_rms", descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE),
+            ("pdop", descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT),
+            ("vdop", descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT),
+            ("covariance_en", descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE),
+        ),
+        start=5,
+    ):
+        field = position_error.field.add(name=name, number=number, type=field_type)
+        field.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
     return file_set.SerializeToString()
 
 
@@ -452,6 +491,124 @@ def test_camera_descriptor_rejects_top_level_calibration_types(
         read_recording(path, "rec_cameras", "gnss")
 
 
+def test_missing_per_camera_timestamps_use_auditable_batch_fallback(
+    tmp_path: Path,
+) -> None:
+    descriptor_data = descriptor_without_field("CompressedVideos", "camera_timestamp")
+    path = tmp_path / "missing-camera-timestamps.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        camera_payloads=(camera_message(descriptor_data=descriptor_data),),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="camera_timestamp"):
+        read_recording(path, "rec_cameras", "gnss")
+
+    recording = read_recording(
+        path,
+        "rec_cameras",
+        "gnss",
+        allow_camera_timestamp_batch_fallback=True,
+    )
+    access_units = tuple(
+        iter_camera_access_units(
+            path,
+            "rec_cameras",
+            recording,
+            allow_camera_timestamp_batch_fallback=True,
+        )
+    )
+
+    frames = recording.camera_batches[0].frames
+    assert {frame.camera_timestamp_source for frame in frames} == {"batch_timestamp"}
+    assert {frame.camera_timestamp_ns for frame in frames} == {1_000_000_005}
+    assert len(access_units) == 2
+
+
+def test_camera_native_calibration_resolution_mode_normalizes_both_passes(
+    tmp_path: Path,
+) -> None:
+    payload = camera_message(
+        dimensions=(1280, 720),
+        intrinsic_dimensions=(1920, 1080),
+    )
+    path = tmp_path / "native-resolution-calibration.mcap"
+    write_mcap(path, camera_payloads=(payload,))
+
+    with pytest.raises(StructuralExtractionError, match="dimensions differ"):
+        read_recording(path, "rec_cameras", "gnss")
+
+    recording = read_recording(
+        path,
+        "rec_cameras",
+        "gnss",
+        allow_native_camera_calibration_resolution=True,
+    )
+    access_units = tuple(
+        iter_camera_access_units(
+            path,
+            "rec_cameras",
+            recording,
+            allow_native_camera_calibration_resolution=True,
+        )
+    )
+
+    assert len(access_units) == 2
+    indexed = recording.camera_batches[0].frames[0].calibration.intrinsic
+    streamed = access_units[0].frame.calibration.intrinsic
+    for intrinsic in (indexed, streamed):
+        assert intrinsic.width == 1280
+        assert intrinsic.height == 720
+        assert intrinsic.focal_length_x == pytest.approx(2 / 3)
+        assert intrinsic.focal_length_y == pytest.approx(2 / 3)
+        assert intrinsic.optical_center_x == pytest.approx(4 / 3)
+        assert intrinsic.optical_center_y == pytest.approx(4 / 3)
+
+
+def test_camera_native_calibration_resolution_rejects_aspect_ratio_change(
+    tmp_path: Path,
+) -> None:
+    payload = camera_message(
+        dimensions=(1280, 720),
+        intrinsic_dimensions=(1920, 1200),
+    )
+    path = tmp_path / "bad-native-resolution-calibration.mcap"
+    write_mcap(path, camera_payloads=(payload,))
+
+    with pytest.raises(StructuralExtractionError, match="aspect ratio"):
+        read_recording(
+            path,
+            "rec_cameras",
+            "gnss",
+            allow_native_camera_calibration_resolution=True,
+        )
+
+
+def test_camera_native_calibration_resolution_rejects_nonfinite_dimensions(
+    tmp_path: Path,
+) -> None:
+    camera_type, _ = message_classes()
+    message = camera_type.FromString(
+        camera_message(
+            dimensions=(1280, 720),
+            intrinsic_dimensions=(1920, 1080),
+        )
+    )
+    message.camera_intrinsic[0].width = float("inf")
+    message.camera_intrinsic[0].height = float("inf")
+    path = tmp_path / "nonfinite-native-resolution-calibration.mcap"
+    write_mcap(path, camera_payloads=(bytes(message.SerializeToString()),))
+
+    with pytest.raises(StructuralExtractionError, match="intrinsic values must be finite"):
+        read_recording(
+            path,
+            "rec_cameras",
+            "gnss",
+            allow_native_camera_calibration_resolution=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("message_name", "field_name"),
     [("GnssFix", "is_valid"), ("PositionError", "hdop")],
@@ -469,6 +626,117 @@ def test_gnss_descriptor_rejects_wrong_scalar_types(
 
     with pytest.raises(StructuralExtractionError, match=f"GNSS schema field.*{field_name}"):
         read_recording(path, "rec_cameras", "gnss")
+
+
+def test_gnss_compatible_numeric_mode_accepts_float_hdop(tmp_path: Path) -> None:
+    descriptor_data = descriptor_with_field_change(
+        "PositionError",
+        "hdop",
+        field_type=descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT,
+    )
+    path = tmp_path / "float-hdop.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        gnss_payloads=(gnss_message(900_000_000, 0, descriptor_data=descriptor_data),),
+    )
+
+    with pytest.raises(StructuralExtractionError, match="position_error.hdop"):
+        read_recording(path, "rec_cameras", "gnss")
+
+    recording = read_recording(
+        path,
+        "rec_cameras",
+        "gnss",
+        compatible_gnss_numeric_types=True,
+    )
+
+    assert recording.gnss_samples[0].position_uncertainty["hdop"] == pytest.approx(1.0)
+
+
+def test_gnss_preserves_descriptor_known_position_error_fields(tmp_path: Path) -> None:
+    descriptor_data = descriptor_with_extra_position_error_fields()
+    _, gnss_type = message_classes(descriptor_data)
+    message = gnss_type.FromString(
+        gnss_message(900_000_000, 0, descriptor_data=descriptor_data)
+    )
+    message.position_error.position_rms = 0.4
+    message.position_error.pdop = 1.5
+    message.position_error.vdop = 1.25
+    message.position_error.covariance_en = -0.02
+    path = tmp_path / "extra-position-error-fields.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        gnss_payloads=(bytes(message.SerializeToString()),),
+    )
+
+    recording = read_recording(path, "rec_cameras", "gnss")
+
+    assert recording.gnss_samples[0].position_uncertainty == {
+        "east_sigma_m": pytest.approx(0.1),
+        "north_sigma_m": pytest.approx(0.2),
+        "up_sigma_m": pytest.approx(0.3),
+        "hdop": pytest.approx(1.0),
+        "position_rms": pytest.approx(0.4),
+        "pdop": pytest.approx(1.5),
+        "vdop": pytest.approx(1.25),
+        "covariance_en": pytest.approx(-0.02),
+    }
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_gnss_rejects_nonfinite_extended_position_error_fields(
+    tmp_path: Path, value: float
+) -> None:
+    descriptor_data = descriptor_with_extra_position_error_fields()
+    _, gnss_type = message_classes(descriptor_data)
+    message = gnss_type.FromString(
+        gnss_message(900_000_000, 0, descriptor_data=descriptor_data)
+    )
+    message.position_error.position_rms = value
+    path = tmp_path / "nonfinite-extended-position-error.mcap"
+    write_mcap(
+        path,
+        descriptor_data=descriptor_data,
+        gnss_payloads=(bytes(message.SerializeToString()),),
+    )
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match="position_error.position_rms.*finite",
+    ):
+        read_recording(path, "rec_cameras", "gnss")
+
+
+def test_missing_gnss_rec_timestamp_log_time_fallback_is_opt_in_and_auditable(
+    tmp_path: Path,
+) -> None:
+    _, gnss_type = message_classes()
+    message = gnss_type.FromString(gnss_message(900_000_000, 0))
+    message.ClearField("rec_timestamp")
+    path = tmp_path / "missing-gnss-rec-timestamp.mcap"
+    write_mcap(path, gnss_payloads=(bytes(message.SerializeToString()),))
+
+    with pytest.raises(
+        StructuralExtractionError,
+        match="has no value for Timestamp 'rec_timestamp'",
+    ):
+        read_recording(path, "rec_cameras", "gnss")
+
+    recording = read_recording(
+        path,
+        "rec_cameras",
+        "gnss",
+        allow_gnss_rec_timestamp_log_time_fallback=True,
+    )
+
+    sample = recording.gnss_samples[0]
+    assert sample.rec_timestamp_ns == 50
+    assert sample.raw_identifiers["dataset_devkit_rec_timestamp_fallback"] == {
+        "source": "mcap_log_time",
+        "timestamp_ns": 50,
+    }
 
 
 def test_gnss_descriptor_is_validated_before_message_decode(tmp_path: Path) -> None:

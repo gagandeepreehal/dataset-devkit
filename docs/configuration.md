@@ -86,6 +86,35 @@ A decoded privacy, catalog, schema, size, or hash failure stops the build. There
 fallback. Production decoded payloads, work directories, and caches belong on `mzcloud`; local
 execution is intended for configuration checks and tiny fixtures.
 
+## MCAP compatibility
+
+Strict source-schema validation is the default. A release containing one of the observed legacy
+schema variants can enable only the required compatibility paths:
+
+```json
+{
+  "mcap_compatibility": {
+    "compatible_gnss_numeric_types": true,
+    "allow_gnss_rec_timestamp_log_time_fallback": true,
+    "allow_native_camera_calibration_resolution": true,
+    "allow_camera_timestamp_batch_fallback": true
+  }
+}
+```
+
+- `compatible_gnss_numeric_types` accepts required GNSS numeric fields encoded as protobuf
+  `float` or `double` instead of requiring `double` exactly.
+- `allow_gnss_rec_timestamp_log_time_fallback` uses the MCAP record `log_time` only when a GNSS
+  message omits `rec_timestamp`, and records the substitution in `raw_identifiers`.
+- `allow_native_camera_calibration_resolution` accepts positive, same-aspect-ratio intrinsic
+  dimensions and scales the intrinsic matrix into the camera batch coordinate system.
+- `allow_camera_timestamp_batch_fallback` uses the camera batch `timestamp` only when the
+  descriptor has no per-camera `camera_timestamp` field, and records the timestamp source on each
+  raw frame.
+
+These values are part of the extraction cache identity. Changing any of them forces extraction
+under a new cache key.
+
 ## MCAP repository manifest
 
 The repository manifest is UTF-8 JSONL. Blank and comment-only lines are ignored. Every recording
@@ -126,6 +155,7 @@ before publication.
 
 - `paths`: isolated work, cache, and output directories; overlaps are rejected.
 - `topics`: schema `"1.0"` MCAP-only camera and GNSS topic names.
+- `mcap_compatibility`: opt-in handling for the observed legacy source-schema variants.
 - `downsampling`: positive target FPS and nonnegative timestamp tolerance.
 - `image`: the version 1 JPEG quality contract.
 - `gnss`, `frame_validity`, and `sanity_checks`: extraction validity and sanity policy.

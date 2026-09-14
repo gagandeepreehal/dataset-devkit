@@ -142,7 +142,13 @@ def build_message_classes(data: bytes) -> dict[str, type[Message]]:
     return classes
 
 
-def _timestamp_ns(message: Message, field_name: str, context: str) -> int:
+def _timestamp_ns(
+    message: Message,
+    field_name: str,
+    context: str,
+    *,
+    missing_fallback_ns: int | None = None,
+) -> int:
     descriptor = message.DESCRIPTOR.fields_by_name.get(field_name)
     if (
         descriptor is None
@@ -150,9 +156,17 @@ def _timestamp_ns(message: Message, field_name: str, context: str) -> int:
         or descriptor.message_type.full_name != "google.protobuf.Timestamp"
     ):
         raise StructuralExtractionError(f"{context} lacks required Timestamp field {field_name!r}")
+    if not message.HasField(field_name):
+        if missing_fallback_ns is None:
+            raise StructuralExtractionError(
+                f"{context} has no value for Timestamp {field_name!r}"
+            )
+        if not 0 <= missing_fallback_ns <= (2**63 - 1):
+            raise StructuralExtractionError(
+                f"{context} fallback for Timestamp {field_name!r} is outside int64 nanoseconds"
+            )
+        return missing_fallback_ns
     try:
-        if not message.HasField(field_name):
-            raise StructuralExtractionError(f"{context} has no value for Timestamp {field_name!r}")
         value: Any = getattr(message, field_name)
         timestamp = Timestamp(seconds=int(value.seconds), nanos=int(value.nanos))
         return timestamp.ToNanoseconds()
@@ -201,7 +215,9 @@ def _require_descriptor_field(
     return cast(FieldDescriptor, field)
 
 
-def _validate_camera_schema(descriptor: Descriptor) -> None:
+def _validate_camera_schema(
+    descriptor: Descriptor, *, allow_camera_timestamp_batch_fallback: bool = False
+) -> None:
     scalar_specs = (
         ("rec_frame_id", 1, FieldDescriptor.TYPE_INT64),
         ("format", 4, FieldDescriptor.TYPE_STRING),
@@ -244,16 +260,20 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
             repeated=True,
             number=number,
         )
-    _require_descriptor_field(
-        descriptor,
-        context="camera",
-        path="camera_timestamp",
-        name="camera_timestamp",
-        field_type=FieldDescriptor.TYPE_MESSAGE,
-        repeated=True,
-        number=14,
-        message_type="google.protobuf.Timestamp",
-    )
+    if (
+        "camera_timestamp" in descriptor.fields_by_name
+        or not allow_camera_timestamp_batch_fallback
+    ):
+        _require_descriptor_field(
+            descriptor,
+            context="camera",
+            path="camera_timestamp",
+            name="camera_timestamp",
+            field_type=FieldDescriptor.TYPE_MESSAGE,
+            repeated=True,
+            number=14,
+            message_type="google.protobuf.Timestamp",
+        )
     intrinsic_field = _require_descriptor_field(
         descriptor,
         context="camera",
@@ -324,19 +344,72 @@ def _validate_camera_schema(descriptor: Descriptor) -> None:
         )
 
 
-def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
+def _normalize_camera_intrinsic(
+    intrinsic: CameraIntrinsic,
+    *,
+    batch_width: int,
+    batch_height: int,
+    enabled: bool,
+) -> CameraIntrinsic:
+    if (
+        not enabled
+        or (intrinsic.width == batch_width and intrinsic.height == batch_height)
+        or not math.isfinite(intrinsic.width)
+        or not math.isfinite(intrinsic.height)
+        or intrinsic.width <= 0
+        or intrinsic.height <= 0
+        or batch_width <= 0
+        or batch_height <= 0
+        or not math.isclose(
+            intrinsic.width * batch_height,
+            intrinsic.height * batch_width,
+            rel_tol=1e-6,
+            abs_tol=1e-6,
+        )
+    ):
+        return intrinsic
+    scale_x = batch_width / intrinsic.width
+    scale_y = batch_height / intrinsic.height
+    return CameraIntrinsic(
+        focal_length_x=intrinsic.focal_length_x * scale_x,
+        focal_length_y=intrinsic.focal_length_y * scale_y,
+        optical_center_x=intrinsic.optical_center_x * scale_x,
+        optical_center_y=intrinsic.optical_center_y * scale_y,
+        rmse=intrinsic.rmse * scale_x,
+        skew=intrinsic.skew * scale_x,
+        distortion_coeffs=intrinsic.distortion_coeffs,
+        width=float(batch_width),
+        height=float(batch_height),
+    )
+
+
+def _parse_camera(
+    message: Message,
+    *,
+    allow_camera_timestamp_batch_fallback: bool = False,
+    allow_native_camera_calibration_resolution: bool = False,
+) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
     dynamic: Any = message
     try:
         number_of_cameras = int(dynamic.number_of_cameras)
         if number_of_cameras <= 0:
             raise StructuralExtractionError("number_of_cameras must be greater than zero")
+        recorded_timestamp_ns = _timestamp_ns(message, "timestamp", "camera message")
         arrays = {
             "data": dynamic.data,
             "name": dynamic.name,
-            "camera_timestamp": dynamic.camera_timestamp,
             "camera_intrinsic": dynamic.camera_intrinsic,
             "camera_extrinsic": dynamic.camera_extrinsic,
         }
+        has_camera_timestamps = "camera_timestamp" in message.DESCRIPTOR.fields_by_name
+        batch_width = int(dynamic.width)
+        batch_height = int(dynamic.height)
+        if has_camera_timestamps:
+            arrays["camera_timestamp"] = dynamic.camera_timestamp
+        elif not allow_camera_timestamp_batch_fallback:
+            raise StructuralExtractionError(
+                "camera message has no per-camera timestamps"
+            )
         mismatched = [name for name, values in arrays.items() if len(values) != number_of_cameras]
         if mismatched:
             raise StructuralExtractionError(
@@ -345,29 +418,41 @@ def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
         frames: list[RawCameraFrame] = []
         payloads: list[bytes] = []
         for index in range(number_of_cameras):
-            timestamp_holder = dynamic.camera_timestamp[index]
-            timestamp = Timestamp(
-                seconds=int(timestamp_holder.seconds), nanos=int(timestamp_holder.nanos)
-            )
-            try:
-                camera_timestamp_ns = timestamp.ToNanoseconds()
-            except ValueError as error:
-                raise StructuralExtractionError(
-                    f"camera[{index}] has invalid protobuf Timestamp camera_timestamp"
-                ) from error
+            if has_camera_timestamps:
+                timestamp_holder = dynamic.camera_timestamp[index]
+                timestamp = Timestamp(
+                    seconds=int(timestamp_holder.seconds),
+                    nanos=int(timestamp_holder.nanos),
+                )
+                try:
+                    camera_timestamp_ns = timestamp.ToNanoseconds()
+                except ValueError as error:
+                    raise StructuralExtractionError(
+                        f"camera[{index}] has invalid protobuf Timestamp camera_timestamp"
+                    ) from error
+                camera_timestamp_source = "camera_timestamp"
+            else:
+                camera_timestamp_ns = recorded_timestamp_ns
+                camera_timestamp_source = "batch_timestamp"
             intrinsic = dynamic.camera_intrinsic[index]
             extrinsic = dynamic.camera_extrinsic[index]
+            parsed_intrinsic = CameraIntrinsic(
+                float(intrinsic.focal_length_x),
+                float(intrinsic.focal_length_y),
+                float(intrinsic.optical_center_x),
+                float(intrinsic.optical_center_y),
+                float(intrinsic.rmse),
+                float(intrinsic.skew),
+                tuple(float(value) for value in intrinsic.distortion_coeffs),
+                float(intrinsic.width),
+                float(intrinsic.height),
+            )
             calibration = CameraCalibration(
-                CameraIntrinsic(
-                    float(intrinsic.focal_length_x),
-                    float(intrinsic.focal_length_y),
-                    float(intrinsic.optical_center_x),
-                    float(intrinsic.optical_center_y),
-                    float(intrinsic.rmse),
-                    float(intrinsic.skew),
-                    tuple(float(value) for value in intrinsic.distortion_coeffs),
-                    float(intrinsic.width),
-                    float(intrinsic.height),
+                _normalize_camera_intrinsic(
+                    parsed_intrinsic,
+                    batch_width=batch_width,
+                    batch_height=batch_height,
+                    enabled=allow_native_camera_calibration_resolution,
                 ),
                 CameraExtrinsic(
                     tuple(float(value) for value in extrinsic.rotation_vector),
@@ -387,6 +472,7 @@ def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
                     camera_name,
                     camera_timestamp_ns,
                     calibration,
+                    camera_timestamp_source,
                 )
             )
             payload = bytes(dynamic.data[index])
@@ -395,12 +481,12 @@ def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
         return (
             RawCameraBatch(
                 rec_timestamp_ns=_timestamp_ns(message, "rec_timestamp", "camera message"),
-                recorded_timestamp_ns=_timestamp_ns(message, "timestamp", "camera message"),
+                recorded_timestamp_ns=recorded_timestamp_ns,
                 frame_id=int(dynamic.frame_id),
                 rec_frame_id=int(dynamic.rec_frame_id),
                 format=str(dynamic.format),
-                width=int(dynamic.width),
-                height=int(dynamic.height),
+                width=batch_width,
+                height=batch_height,
                 frames=tuple(frames),
             ),
             tuple(payloads),
@@ -413,7 +499,9 @@ def _parse_camera(message: Message) -> tuple[RawCameraBatch, tuple[bytes, ...]]:
         ) from error
 
 
-def _validate_gnss_schema(descriptor: Descriptor) -> None:
+def _validate_gnss_schema(
+    descriptor: Descriptor, *, compatible_numeric_types: bool = False
+) -> None:
     for name in ("timestamp", "rec_timestamp"):
         _require_descriptor_field(
             descriptor,
@@ -443,12 +531,23 @@ def _validate_gnss_schema(descriptor: Descriptor) -> None:
         )
         nested = cast(Descriptor, parent.message_type)
         for child_name in child_names:
+            child = nested.fields_by_name.get(child_name)
+            accepted_types = (
+                {FieldDescriptor.TYPE_DOUBLE, FieldDescriptor.TYPE_FLOAT}
+                if compatible_numeric_types
+                else {FieldDescriptor.TYPE_DOUBLE}
+            )
+            if child is None or child.type not in accepted_types:
+                raise StructuralExtractionError(
+                    f"GNSS schema field {f'{parent_name}.{child_name}'!r} "
+                    "has the wrong number, type, or cardinality"
+                )
             _require_descriptor_field(
                 nested,
                 context="GNSS",
                 path=f"{parent_name}.{child_name}",
                 name=child_name,
-                field_type=FieldDescriptor.TYPE_DOUBLE,
+                field_type=child.type,
                 repeated=False,
             )
     orientation_error = _require_descriptor_field(
@@ -507,7 +606,7 @@ def _validate_orientation_error_schema(
             )
 
 
-def _validate_orientation_error_values(
+def _validate_numeric_message_values(
     message: Message,
     *,
     path: str,
@@ -522,12 +621,14 @@ def _validate_orientation_error_values(
         values = value if field.is_repeated else (value,)
         if field.type == FieldDescriptor.TYPE_MESSAGE:
             for nested in values:
-                _validate_orientation_error_values(
+                _validate_numeric_message_values(
                     cast(Message, nested),
                     path=field_path,
                     depth=depth + 1,
                     budget=active_budget,
                 )
+            continue
+        if field.type not in _PROTOBUF_NUMERIC_TYPES:
             continue
         for index, numeric in enumerate(values):
             numeric_path = f"{field_path}[{index}]" if field.is_repeated else field_path
@@ -552,7 +653,9 @@ def _message_dict(message: Message, *, root_path: str) -> dict[str, Any]:
     return dict(cast(dict[str, Any], frozen))
 
 
-def _parse_gnss(message: Message) -> GnssSample:
+def _parse_gnss(
+    message: Message, *, rec_timestamp_fallback_ns: int | None = None
+) -> GnssSample:
     dynamic: Any = message
     try:
         for field_name in (
@@ -602,15 +705,34 @@ def _parse_gnss(message: Message) -> GnssSample:
             "orientation_error",
         ):
             raw.pop(known, None)
-        _validate_orientation_error_values(
+        if (
+            rec_timestamp_fallback_ns is not None
+            and not message.HasField("rec_timestamp")
+        ):
+            raw["dataset_devkit_rec_timestamp_fallback"] = {
+                "source": "mcap_log_time",
+                "timestamp_ns": rec_timestamp_fallback_ns,
+            }
+        _validate_numeric_message_values(
+            cast(Message, dynamic.position_error), path="position_error"
+        )
+        _validate_numeric_message_values(
             cast(Message, dynamic.orientation_error), path="orientation_error"
         )
         orientation_uncertainty = _message_dict(
             dynamic.orientation_error, root_path="orientation_error"
         )
+        position_uncertainty = _message_dict(
+            dynamic.position_error, root_path="position_error"
+        )
         return GnssSample(
             timestamp_ns=_timestamp_ns(message, "timestamp", "GNSS message"),
-            rec_timestamp_ns=_timestamp_ns(message, "rec_timestamp", "GNSS message"),
+            rec_timestamp_ns=_timestamp_ns(
+                message,
+                "rec_timestamp",
+                "GNSS message",
+                missing_fallback_ns=rec_timestamp_fallback_ns,
+            ),
             is_valid=bool(dynamic.is_valid),
             latitude_deg=numeric_values[0],
             longitude_deg=numeric_values[1],
@@ -618,12 +740,7 @@ def _parse_gnss(message: Message) -> GnssSample:
             roll_rad=numeric_values[3],
             pitch_rad=numeric_values[4],
             yaw_rad=numeric_values[5],
-            position_uncertainty={
-                "east_sigma_m": numeric_values[6],
-                "north_sigma_m": numeric_values[7],
-                "up_sigma_m": numeric_values[8],
-                "hdop": numeric_values[9],
-            },
+            position_uncertainty=position_uncertainty,
             orientation_uncertainty=orientation_uncertainty,
             raw_identifiers=raw,
         )
@@ -688,8 +805,24 @@ def _assert_source_identity(path: Path, expected: SourceIdentity) -> None:
         )
 
 
-def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecording:
-    """Index configured topics without retaining compressed camera payload bytes."""
+def read_recording(
+    path: Path,
+    camera_topic: str,
+    gnss_topic: str,
+    *,
+    compatible_gnss_numeric_types: bool = False,
+    allow_gnss_rec_timestamp_log_time_fallback: bool = False,
+    allow_native_camera_calibration_resolution: bool = False,
+    allow_camera_timestamp_batch_fallback: bool = False,
+) -> RawRecording:
+    """Index configured topics without retaining compressed camera payload bytes.
+
+    The opt-in numeric compatibility mode accepts protobuf ``float`` or
+    ``double`` for required nested GNSS numeric fields. A separate opt-in uses
+    the MCAP record ``log_time`` when a GNSS message omits ``rec_timestamp`` and
+    records that substitution in ``raw_identifiers``. Strict validation remains
+    the default for both behaviors.
+    """
     camera_batches: list[RawCameraBatch] = []
     gnss_samples: list[GnssSample] = []
     camera_seen = False
@@ -729,17 +862,44 @@ def read_recording(path: Path, camera_topic: str, gnss_topic: str) -> RawRecordi
                 schema_name, message_type = cached
                 if channel.topic == camera_topic:
                     camera_seen = True
-                    _validate_camera_schema(cast(Descriptor, message_type.DESCRIPTOR))
-                    batch, _ = _parse_camera(
-                        _parse_message(message_type, record.data, "camera")
+                    _validate_camera_schema(
+                        cast(Descriptor, message_type.DESCRIPTOR),
+                        allow_camera_timestamp_batch_fallback=(
+                            allow_camera_timestamp_batch_fallback
+                        ),
                     )
-                    camera_state = validate_camera_batch(batch, camera_state)
+                    batch, _ = _parse_camera(
+                        _parse_message(message_type, record.data, "camera"),
+                        allow_camera_timestamp_batch_fallback=(
+                            allow_camera_timestamp_batch_fallback
+                        ),
+                        allow_native_camera_calibration_resolution=(
+                            allow_native_camera_calibration_resolution
+                        ),
+                    )
+                    camera_state = validate_camera_batch(
+                        batch,
+                        camera_state,
+                        allow_native_calibration_resolution=(
+                            allow_native_camera_calibration_resolution
+                        ),
+                    )
                     camera_batches.append(batch)
                 elif channel.topic == gnss_topic:
                     gnss_seen = True
-                    _validate_gnss_schema(cast(Descriptor, message_type.DESCRIPTOR))
+                    _validate_gnss_schema(
+                        cast(Descriptor, message_type.DESCRIPTOR),
+                        compatible_numeric_types=compatible_gnss_numeric_types,
+                    )
                     gnss_samples.append(
-                        _parse_gnss(_parse_message(message_type, record.data, "GNSS"))
+                        _parse_gnss(
+                            _parse_message(message_type, record.data, "GNSS"),
+                            rec_timestamp_fallback_ns=(
+                                int(record.log_time)
+                                if allow_gnss_rec_timestamp_log_time_fallback
+                                else None
+                            ),
+                        )
                     )
             if _source_identity(os.fstat(stream.fileno())) != source_identity:
                 raise StructuralExtractionError("recording changed while building extraction index")
@@ -766,6 +926,9 @@ def iter_camera_access_units(
     path: Path,
     camera_topic: str,
     recording: RawRecording,
+    *,
+    allow_native_camera_calibration_resolution: bool = False,
+    allow_camera_timestamp_batch_fallback: bool = False,
 ) -> Iterator[CameraAccessUnit]:
     """Reopen and stream structurally verified camera AUs for the decode pass."""
     _assert_source_identity(path, recording.source_identity)
@@ -801,12 +964,29 @@ def iter_camera_access_units(
                         raise StructuralExtractionError(
                             f"embedded descriptor does not define MCAP schema {schema.name!r}"
                         )
-                    _validate_camera_schema(cast(Descriptor, message_type.DESCRIPTOR))
+                    _validate_camera_schema(
+                        cast(Descriptor, message_type.DESCRIPTOR),
+                        allow_camera_timestamp_batch_fallback=(
+                            allow_camera_timestamp_batch_fallback
+                        ),
+                    )
                     schema_cache[schema.id] = message_type
                 batch, payloads = _parse_camera(
-                    _parse_message(message_type, record.data, "camera")
+                    _parse_message(message_type, record.data, "camera"),
+                    allow_camera_timestamp_batch_fallback=(
+                        allow_camera_timestamp_batch_fallback
+                    ),
+                    allow_native_camera_calibration_resolution=(
+                        allow_native_camera_calibration_resolution
+                    ),
                 )
-                camera_state = validate_camera_batch(batch, camera_state)
+                camera_state = validate_camera_batch(
+                    batch,
+                    camera_state,
+                    allow_native_calibration_resolution=(
+                        allow_native_camera_calibration_resolution
+                    ),
+                )
                 if batch_ordinal >= len(recording.camera_batches):
                     raise StructuralExtractionError(
                         "camera stream changed between extraction passes: extra batch"
