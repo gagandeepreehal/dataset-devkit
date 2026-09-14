@@ -10,8 +10,11 @@ import av
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyproj import Transformer
 
 from dataset_devkit.config import DEFAULT_DECODED_CAMERAS, DecodedHfSourceConfig
+
+_TO_WGS84 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
 
 @dataclass(frozen=True)
@@ -146,8 +149,12 @@ def write_tiny_videos_and_tables(
                 "orientation": {"roll_rad": 0.0, "pitch_rad": 0.0, "yaw_rad": 0.1},
                 "enu": {"east_m": 8_000_000.0 + index * 10, "north_m": 1_500_000.0 + index * 4},
                 "lat_lon_ht": {
-                    "latitude_deg": 13.35220710406326,
-                    "longitude_deg": 71.86522272956172,
+                    "latitude_deg": _TO_WGS84.transform(
+                        8_000_000.0 + index * 10, 1_500_000.0 + index * 4
+                    )[1],
+                    "longitude_deg": _TO_WGS84.transform(
+                        8_000_000.0 + index * 10, 1_500_000.0 + index * 4
+                    )[0],
                     "height_m": 900.25 + index / 2.0,
                 },
                 "position_uncertainty": {"sigma_m": 0.1},

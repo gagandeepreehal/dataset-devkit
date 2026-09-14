@@ -118,18 +118,12 @@ class RecordingExtractor:
                 return existing
             interpolation = interpolate_gnss(recording.gnss_samples, timestamp_ns)
             if interpolation.available:
-                assert interpolation.projected_x_m is not None
-                assert interpolation.projected_y_m is not None
-                assert interpolation.height_m is not None
+                assert interpolation.translation_xyz_m is not None
                 assert interpolation.quaternion_wxyz is not None
                 pose = EgoPose(
                     timestamp_ns,
                     True,
-                    (
-                        interpolation.projected_x_m,
-                        interpolation.projected_y_m,
-                        interpolation.height_m,
-                    ),
+                    interpolation.translation_xyz_m,
                     interpolation.quaternion_wxyz,
                     interpolation,
                 )
