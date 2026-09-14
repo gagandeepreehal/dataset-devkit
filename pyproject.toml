@@ -27,6 +27,7 @@ dependencies = [
   "pillow>=11,<13",
   "protobuf>=5,<7",
   "pydantic>=2.10,<3",
+  "pyarrow>=25,<26",
   "pyproj>=3.7,<4",
   "scikit-learn>=1.6,<2",
   "scipy>=1.15,<2",
@@ -73,5 +74,6 @@ init_forbid_extra = true
 warn_required_dynamic_aliases = true
 
 [[tool.mypy.overrides]]
-module = ["mcap", "mcap.*"]
+module = ["mcap", "mcap.*", "pyarrow", "pyarrow.*"]
 follow_imports = "skip"
+ignore_missing_imports = true
