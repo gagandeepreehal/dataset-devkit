@@ -35,23 +35,24 @@ Both inputs are Hugging Face dataset repositories pinned to immutable commits:
 }
 ```
 
-`decoded_hf` is the recommended public-consumer backend and is fixed to
-`privacy_classification: "privacy_transformed"`. `recording_ids` and `splits` are intersected; at
-least one must select data. The six untilted cameras are the default. The seventh supported camera,
-`cam_front_tilted`, is opt-in. Video, GNSS, and calibration are required modalities; camera labels,
-semantic masks, and depth can be selected for acquisition without changing the core scene builder.
+`decoded_hf` is the only schema `"2.0"` backend. It is the recommended public-consumer backend and
+is fixed to `privacy_classification: "privacy_transformed"`. `recording_ids` and `splits` are
+intersected; at least one must select data. The six untilted cameras are the default. The seventh
+supported camera, `cam_front_tilted`, is opt-in. Video, GNSS, and calibration are required
+modalities; camera labels, semantic masks, and depth can be selected for acquisition without
+changing the core scene builder.
 
-The equivalent explicit MCAP source is:
+Original MCAP remains available through schema `"1.0"`:
 
 ```json
 {
-  "schema_version": "2.0",
-  "source": {
-    "type": "mcap_hf",
+  "schema_version": "1.0",
+  "huggingface": {
     "repo_id": "owner/dataset",
     "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "manifest_path": "manifest.jsonl"
-  }
+  },
+  "topics": {"camera": "rec_cameras", "gnss": "gnss"}
 }
 ```
 

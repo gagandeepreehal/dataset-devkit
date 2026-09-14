@@ -5,6 +5,7 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -47,6 +48,15 @@ _ANONYMIZER_COLUMNS = {
     "sequence",
     "fields_json",
 }
+_ALLOWED_RELATIVE_OR_CONTEXT_TIME_FIELDS = {
+    "recording_offset_ns",
+    "local_enu_origin_offset_ns",
+    "log_time_offset_ns",
+    "publish_time_offset_ns",
+    "time_of_day_ns",
+    "log_time_of_day_ns",
+    "publish_time_of_day_ns",
+}
 _FORBIDDEN_TIME_FIELDS = {
     "timestamp_ns",
     "rec_timestamp_ns",
@@ -56,6 +66,7 @@ _FORBIDDEN_TIME_FIELDS = {
     "date",
     "datetime",
 }
+_ISO_DATE_VALUE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
 
 __all__ = ["PrivacyGnssSample", "interpolate_privacy_gnss", "parse_privacy_gnss"]
 
@@ -78,11 +89,36 @@ def _int(value: object, label: str) -> int:
     return value
 
 
+def _is_forbidden_absolute_time_field(name: str) -> bool:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    folded = separated.casefold()
+    if folded in _ALLOWED_RELATIVE_OR_CONTEXT_TIME_FIELDS:
+        return False
+    compact = re.sub(r"[^a-z0-9]", "", folded)
+    tokens = {item for item in re.split(r"[^a-z0-9]+", folded) if item}
+    if folded in _FORBIDDEN_TIME_FIELDS or "absolute_date" in folded:
+        return True
+    if tokens & {"date", "datetime", "timestamp", "epoch", "year", "month", "day", "week"}:
+        return True
+    if compact in {
+        "gpsweek",
+        "gpsday",
+        "dayofyear",
+        "dayofweek",
+        "timeofweek",
+        "weeknumber",
+        "gpstime",
+        "utctime",
+        "unixtime",
+    }:
+        return True
+    return compact.endswith("timestamp") or compact.startswith(("epoch", "unixtime"))
+
+
 def _reject_absolute_fields(value: object, location: str = "row") -> None:
     if isinstance(value, Mapping):
         for key, nested in value.items():
-            name = str(key).casefold()
-            if name in _FORBIDDEN_TIME_FIELDS or "absolute_date" in name:
+            if _is_forbidden_absolute_time_field(str(key)):
                 raise StructuralExtractionError(
                     f"privacy GNSS contains forbidden absolute time field at {location}.{key}"
                 )
@@ -90,6 +126,10 @@ def _reject_absolute_fields(value: object, location: str = "row") -> None:
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, nested in enumerate(value):
             _reject_absolute_fields(nested, f"{location}[{index}]")
+    elif isinstance(value, str) and _ISO_DATE_VALUE.search(value) is not None:
+        raise StructuralExtractionError(
+            f"privacy GNSS contains forbidden absolute time value at {location}"
+        )
 
 
 def _round_half_away(value: float) -> int:
@@ -116,8 +156,12 @@ def _quality_interpolation(
     return result
 
 
-def parse_privacy_gnss(path: Path) -> tuple[PrivacyGnssSample, ...]:
+def parse_privacy_gnss(
+    path: Path, *, expected_recording_id: str
+) -> tuple[PrivacyGnssSample, ...]:
     """Parse a strict date-free GNSS shard without Hive partition inference."""
+    if not expected_recording_id:
+        raise ValueError("expected recording ID must be nonempty")
     try:
         parquet = pq.ParquetFile(path)
         columns = set(parquet.schema_arrow.names)
@@ -166,6 +210,10 @@ def parse_privacy_gnss(path: Path) -> tuple[PrivacyGnssSample, ...]:
         row_recording_id = row.get("recording_id")
         if not isinstance(row_recording_id, str) or not row_recording_id:
             raise StructuralExtractionError("privacy GNSS recording ID is invalid")
+        if row_recording_id != expected_recording_id:
+            raise StructuralExtractionError(
+                "privacy GNSS recording ID differs from selected recording"
+            )
         if recording_id is None:
             recording_id = row_recording_id
         elif row_recording_id != recording_id:

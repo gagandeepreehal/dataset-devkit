@@ -360,7 +360,10 @@ class DecodedRecordingExtractor:
                 raise StructuralExtractionError(
                     "decoded calibration dimensions differ from camera frames"
                 )
-        gnss = parse_privacy_gnss(bundle.path(bundle.entry.artifact("gnss").path))
+        gnss = parse_privacy_gnss(
+            bundle.path(bundle.entry.artifact("gnss").path),
+            expected_recording_id=bundle.entry.recording_id,
+        )
         offsets = sorted({row.batch_offset_ns for row in rows})
         selection = select_camera_grid(offsets, self.target_fps, self.tolerance_ns)
         return self._decode(bundle, by_camera, calibrations, gnss, selection)

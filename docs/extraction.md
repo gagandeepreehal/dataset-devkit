@@ -159,6 +159,11 @@ linear interpolation of the precise local axes, while orientation retains shorte
 SLERP and the existing conservative quality rules. Out-of-range frames are invalid; there is no
 clamping or extrapolation.
 
+Every GNSS row must carry the selected catalog recording ID. Mixed or foreign recording IDs fail
+before interpolation. Recursive metadata inspection rejects calendar/GPS week-day, epoch,
+timestamp, and ISO-date material while allowing only the declared relative offsets and contextual
+time-of-day fields.
+
 Published global Web Mercator east/north and inverse-derived latitude/longitude remain sanitized
 one-metre context. They are checked and, after interpolation, rounded again to the one-metre grid.
 They never feed pose, distance, speed, curvature, filtering, or scene selection. Official

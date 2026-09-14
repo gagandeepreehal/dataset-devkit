@@ -856,7 +856,7 @@ class GlobalConfigV1(_GlobalConfigCommon):
 
 class GlobalConfigV2(_GlobalConfigCommon):
     schema_version: Literal["2.0"]
-    source: Annotated[SourceConfig, Field(discriminator="type")]
+    source: DecodedHfSourceConfig
 
 
 type GlobalConfig = GlobalConfigV1 | GlobalConfigV2

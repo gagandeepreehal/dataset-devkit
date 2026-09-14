@@ -245,9 +245,7 @@ def prepare_source(
     """Acquire and bind exactly the backend selected by the versioned config."""
     if isinstance(config, GlobalConfigV1):
         return _prepare_mcap(config, runtime)
-    if config.source.type == "decoded_hf":
-        return _prepare_decoded(config, runtime)
-    raise ValueError("schema 2.0 currently requires a decoded_hf source")
+    return _prepare_decoded(config, runtime)
 
 
 DEFAULT_MCAP_ACQUIRER_FACTORY = cast(

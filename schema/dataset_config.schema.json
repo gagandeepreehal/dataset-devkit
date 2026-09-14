@@ -708,22 +708,7 @@
           "type": "string"
         },
         "source": {
-          "discriminator": {
-            "mapping": {
-              "decoded_hf": "#/$defs/DecodedHfSourceConfig",
-              "mcap_hf": "#/$defs/McapHfSourceConfig"
-            },
-            "propertyName": "type"
-          },
-          "oneOf": [
-            {
-              "$ref": "#/$defs/McapHfSourceConfig"
-            },
-            {
-              "$ref": "#/$defs/DecodedHfSourceConfig"
-            }
-          ],
-          "title": "Source"
+          "$ref": "#/$defs/DecodedHfSourceConfig"
         },
         "split": {
           "$ref": "#/$defs/SplitConfig"
@@ -891,42 +876,6 @@
         }
       },
       "title": "McapCompatibilityConfig",
-      "type": "object"
-    },
-    "McapHfSourceConfig": {
-      "additionalProperties": false,
-      "properties": {
-        "manifest_path": {
-          "title": "Manifest Path",
-          "type": "string"
-        },
-        "privacy_classification": {
-          "const": "restricted_raw",
-          "default": "restricted_raw",
-          "title": "Privacy Classification",
-          "type": "string"
-        },
-        "repo_id": {
-          "title": "Repo Id",
-          "type": "string"
-        },
-        "revision": {
-          "title": "Revision",
-          "type": "string"
-        },
-        "type": {
-          "const": "mcap_hf",
-          "default": "mcap_hf",
-          "title": "Type",
-          "type": "string"
-        }
-      },
-      "required": [
-        "repo_id",
-        "revision",
-        "manifest_path"
-      ],
-      "title": "McapHfSourceConfig",
       "type": "object"
     },
     "PathsConfig": {

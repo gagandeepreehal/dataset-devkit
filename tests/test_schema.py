@@ -68,6 +68,20 @@ def test_decoded_shape_is_valid_under_generated_json_schema() -> None:
     assert not _schema_errors(minimal_decoded_config())
 
 
+def test_schema_v2_rejects_mcap_source_that_has_no_runtime_contract() -> None:
+    data = minimal_decoded_config()
+    data["source"] = {
+        "type": "mcap_hf",
+        "repo_id": "owner/dataset",
+        "revision": "a" * 40,
+        "manifest_path": "manifest.jsonl",
+    }
+
+    assert _schema_errors(data)
+    with pytest.raises(ValidationError):
+        GLOBAL_CONFIG_ADAPTER.validate_python(data)
+
+
 def test_schema_rejects_unsafe_per_channel_coverage_key() -> None:
     data = minimal_config()
     data["filters"] = {"min_camera_coverage_by_channel": {"../front": 0.5}}

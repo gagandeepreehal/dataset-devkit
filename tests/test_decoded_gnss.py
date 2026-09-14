@@ -92,11 +92,19 @@ def test_parse_privacy_gnss_reads_precise_fixture_rows(tmp_path: Path) -> None:
     fixture = write_decoded_fixture(tmp_path)
     path = next((fixture.root / "data/tables/gnss").rglob("*.parquet"))
 
-    samples = parse_privacy_gnss(path)
+    samples = parse_privacy_gnss(path, expected_recording_id=fixture.recording_id)
 
     assert [sample.recording_offset_ns for sample in samples] == [0, 1_000_000_000]
     assert samples[1].local_east_m == 10.0
     assert samples[1].published_east_m == 8_000_010.0
+
+
+def test_parse_privacy_gnss_binds_rows_to_expected_recording(tmp_path: Path) -> None:
+    fixture = write_decoded_fixture(tmp_path)
+    path = next((fixture.root / "data/tables/gnss").rglob("*.parquet"))
+
+    with pytest.raises(StructuralExtractionError, match="selected recording"):
+        parse_privacy_gnss(path, expected_recording_id="another-recording")
 
 
 def test_parse_privacy_gnss_accepts_anonymizer_fields_json_schema(tmp_path: Path) -> None:
@@ -125,7 +133,7 @@ def test_parse_privacy_gnss_accepts_anonymizer_fields_json_schema(tmp_path: Path
         )
     pq.write_table(pa.Table.from_pylist(production_rows), source)
 
-    samples = parse_privacy_gnss(source)
+    samples = parse_privacy_gnss(source, expected_recording_id=fixture.recording_id)
 
     assert [item.recording_offset_ns for item in samples] == [0, 1_000_000_000]
     assert samples[1].local_east_m == 10.0
@@ -167,7 +175,7 @@ def test_anonymizer_invalid_gnss_row_is_an_interpolation_barrier(tmp_path: Path)
         )
     pq.write_table(pa.Table.from_pylist(production_rows), source)
 
-    samples = parse_privacy_gnss(source)
+    samples = parse_privacy_gnss(source, expected_recording_id=fixture.recording_id)
 
     assert not samples[1].is_valid
     assert not interpolate_privacy_gnss(samples, 500_000_000).available
@@ -182,7 +190,7 @@ def test_privacy_gnss_rejects_nonzero_origin_offset(tmp_path: Path) -> None:
     pq.write_table(pa.Table.from_pylist(rows), path)
 
     with pytest.raises(StructuralExtractionError, match="origin offset"):
-        parse_privacy_gnss(path)
+        parse_privacy_gnss(path, expected_recording_id=fixture.recording_id)
 
 
 def test_privacy_gnss_rejects_duplicate_offsets_and_absolute_time_fields(
@@ -194,14 +202,65 @@ def test_privacy_gnss_rejects_duplicate_offsets_and_absolute_time_fields(
     rows[1]["recording_offset_ns"] = rows[0]["recording_offset_ns"]
     pq.write_table(pa.Table.from_pylist(rows), path)
     with pytest.raises(StructuralExtractionError, match="offset"):
-        parse_privacy_gnss(path)
+        parse_privacy_gnss(path, expected_recording_id=fixture.recording_id)
 
     rows[1]["recording_offset_ns"] = 1_000_000_000
     rows[0]["timestamp_ns"] = 123
     rows[1]["timestamp_ns"] = 124
     pq.write_table(pa.Table.from_pylist(rows), path)
     with pytest.raises(StructuralExtractionError, match="absolute.*time|forbidden"):
-        parse_privacy_gnss(path)
+        parse_privacy_gnss(path, expected_recording_id=fixture.recording_id)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["gps_week", "gps_day", "day_of_year", "utc_timestamp", "epoch_seconds"],
+)
+def test_privacy_gnss_rejects_nested_reversible_time_fields(
+    tmp_path: Path, field_name: str
+) -> None:
+    fixture = write_decoded_fixture(tmp_path)
+    path = next((fixture.root / "data/tables/gnss").rglob("*.parquet"))
+    rows = pq.ParquetFile(path).read().to_pylist()
+    fields = {
+        key: value
+        for key, value in rows[0].items()
+        if key not in {"recording_id", "recording_offset_ns"}
+    }
+    quality = dict(fields["quality"])
+    quality[field_name] = 123
+    fields["quality"] = quality
+    production_row = {
+        "recording_id": fixture.recording_id,
+        "log_time_of_day_ns": 10_000_000_000,
+        "log_time_offset_ns": 0,
+        "publish_time_of_day_ns": 10_000_000_000,
+        "publish_time_offset_ns": 0,
+        "channel": "gnss",
+        "schema_hash": "a" * 64,
+        "sequence": 0,
+        "fields_json": json.dumps(fields, sort_keys=True),
+    }
+    pq.write_table(pa.Table.from_pylist([production_row]), path)
+
+    with pytest.raises(StructuralExtractionError, match="forbidden absolute time"):
+        parse_privacy_gnss(path, expected_recording_id=fixture.recording_id)
+
+
+@pytest.mark.parametrize("value", ["2026-09-14", "2026-09-14T12:34:56Z"])
+def test_privacy_gnss_rejects_nested_iso_date_values(
+    tmp_path: Path, value: str
+) -> None:
+    fixture = write_decoded_fixture(tmp_path)
+    path = next((fixture.root / "data/tables/gnss").rglob("*.parquet"))
+    rows = pq.ParquetFile(path).read().to_pylist()
+    quality = dict(rows[0]["quality"])
+    quality["note"] = value
+    rows[0]["quality"] = quality
+    pq.write_table(pa.Table.from_pylist(rows), path)
+
+    with pytest.raises(StructuralExtractionError, match="forbidden absolute time"):
+        parse_privacy_gnss(path, expected_recording_id=fixture.recording_id)
 
 
 def test_privacy_gnss_never_extrapolates() -> None:
