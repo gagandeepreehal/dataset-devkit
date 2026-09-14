@@ -12,7 +12,8 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from dataset_devkit.config import GlobalConfig, HuggingFaceConfig
+from dataset_devkit.config import GlobalConfigV1, HuggingFaceConfig
+from dataset_devkit.decoded_manifest import PublicArtifact
 from dataset_devkit.huggingface_manifest import ManifestEntry, parse_manifest
 from dataset_devkit.provenance import (
     AcquisitionManifest,
@@ -51,6 +52,13 @@ class AcquisitionResult:
     manifest_path: Path
     extraction_manifest_path: Path
     manifest: AcquisitionManifest
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedRepositoryFile:
+    artifact: PublicArtifact
+    path: Path
+    cache_hit: bool
 
 
 @dataclass(frozen=True)
@@ -199,6 +207,94 @@ def _inside(path: Path, root: Path) -> bool:
     return True
 
 
+def _download_repository_file(
+    download_file: DownloadFile,
+    *,
+    repo_id: str,
+    revision: str,
+    filename: str,
+    local_dir: Path,
+) -> Path:
+    try:
+        returned = Path(
+            download_file(
+                repo_id=repo_id,
+                repo_type="dataset",
+                revision=revision,
+                filename=filename,
+                local_dir=local_dir,
+                force_download=True,
+            )
+        )
+    except Exception as error:
+        raise AcquisitionError(f"failed to download {filename!r}") from error
+    if not _inside(returned, local_dir):
+        raise AcquisitionError("download returned a path outside owned scratch")
+    return returned
+
+
+def _verify_expected_file(
+    path: Path, root: Path, artifact: PublicArtifact
+) -> _VerifiedFile:
+    verified = _verify_file(path, root)
+    if verified.size != artifact.size:
+        raise IntegrityError("downloaded size differs from repository manifest")
+    if verified.sha256 != artifact.sha256:
+        raise IntegrityError("downloaded SHA-256 differs from repository manifest")
+    return verified
+
+
+class VerifiedHfFileCache:
+    """Acquire exact commit-pinned repository files into a verified cache."""
+
+    def __init__(self, cache_dir: Path, download_file: DownloadFile | None = None) -> None:
+        self.cache_dir = cache_dir.absolute()
+        if download_file is None:
+            from huggingface_hub import hf_hub_download
+
+            download_file = hf_hub_download
+        self.download_file = download_file
+
+    def acquire(
+        self,
+        *,
+        repo_id: str,
+        revision: str,
+        artifact: PublicArtifact,
+    ) -> VerifiedRepositoryFile:
+        if artifact.size <= 0 or len(artifact.sha256) != 64:
+            raise IntegrityError("repository artifact identity is invalid")
+        identity = canonical_hash(
+            {
+                "repo_id": repo_id,
+                "revision": revision,
+                "path": artifact.path,
+                "size": artifact.size,
+                "sha256": artifact.sha256,
+            }
+        )
+        directory = _ensure_beneath(self.cache_dir, "huggingface-files", identity)
+        final = directory / f"artifact{Path(artifact.path).suffix}"
+        with _recording_lock(directory):
+            if final.exists():
+                _verify_expected_file(final, directory, artifact)
+                return VerifiedRepositoryFile(artifact, final, True)
+            scratch = _ensure_beneath(directory, "download")
+            returned = _download_repository_file(
+                self.download_file,
+                repo_id=repo_id,
+                revision=revision,
+                filename=artifact.path,
+                local_dir=scratch,
+            )
+            verified = _verify_expected_file(returned, scratch, artifact)
+            os.replace(returned, final)
+            promoted = _verify_file(final, directory)
+            if promoted != verified:
+                raise AcquisitionError("promoted cache artifact changed identity")
+            return VerifiedRepositoryFile(artifact, final, False)
+
+
 class HuggingFaceAcquirer:
     """Acquire commit-pinned dataset files into a SHA-256-verified cache."""
 
@@ -220,7 +316,7 @@ class HuggingFaceAcquirer:
         self.download_file = download_file
 
     @classmethod
-    def from_config(cls, config: GlobalConfig) -> HuggingFaceAcquirer:
+    def from_config(cls, config: GlobalConfigV1) -> HuggingFaceAcquirer:
         return cls(
             huggingface=config.huggingface,
             cache_dir=config.paths.cache_dir,
@@ -228,22 +324,13 @@ class HuggingFaceAcquirer:
         )
 
     def _download(self, filename: str, local_dir: Path) -> Path:
-        try:
-            returned = Path(
-                self.download_file(
-                    repo_id=self.huggingface.repo_id,
-                    repo_type="dataset",
-                    revision=self.huggingface.revision,
-                    filename=filename,
-                    local_dir=local_dir,
-                    force_download=True,
-                )
-            )
-        except Exception as error:
-            raise AcquisitionError(f"failed to download {filename!r}") from error
-        if not _inside(returned, local_dir):
-            raise AcquisitionError("download returned a path outside owned scratch")
-        return returned
+        return _download_repository_file(
+            self.download_file,
+            repo_id=self.huggingface.repo_id,
+            revision=self.huggingface.revision,
+            filename=filename,
+            local_dir=local_dir,
+        )
 
     def load_entries(self) -> tuple[ManifestEntry, ...]:
         identity = canonical_hash(
@@ -294,11 +381,11 @@ class HuggingFaceAcquirer:
                 self.cache_dir, "huggingface", source.digest, "download"
             )
             returned = self._download(entry.repo_path, scratch)
-            verified = _verify_file(returned, scratch)
-            if verified.size != source.size:
-                raise IntegrityError("downloaded size differs from repository manifest")
-            if verified.sha256 != source.sha256:
-                raise IntegrityError("downloaded SHA-256 differs from repository manifest")
+            verified = _verify_expected_file(
+                returned,
+                scratch,
+                PublicArtifact(source.repo_path, source.size, source.sha256),
+            )
             os.replace(returned, paths.final)
             final = _verify_file(paths.final, paths.directory)
             if final != verified:
