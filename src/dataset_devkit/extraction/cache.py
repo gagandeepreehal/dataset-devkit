@@ -23,7 +23,7 @@ from dataset_devkit.extraction.staging import (
     rollback_staging_invocation,
     staged_directory_metadata,
 )
-from dataset_devkit.provenance import SourceFingerprint, canonical_json
+from dataset_devkit.provenance import RecordingFingerprint, canonical_json
 from dataset_devkit.publication import (
     OwnedDirectoryAuthority,
     OwnedDirectoryCleanupError,
@@ -533,7 +533,7 @@ class ExtractionResultCache:
         self.cache_dir = cache_dir.absolute()
         self.root = self.cache_dir / "extraction-results"
 
-    def path_for(self, source: SourceFingerprint, config_hash: str) -> Path:
+    def path_for(self, source: RecordingFingerprint, config_hash: str) -> Path:
         if len(config_hash) != 64 or any(
             character not in "0123456789abcdef" for character in config_hash
         ):
@@ -541,7 +541,7 @@ class ExtractionResultCache:
         return self.root / source.digest / config_hash
 
     def _open_source(
-        self, lease: _CacheRootLease, source: SourceFingerprint, *, create: bool
+        self, lease: _CacheRootLease, source: RecordingFingerprint, *, create: bool
     ) -> tuple[int, _Identity]:
         return _open_child_directory(lease.root_fd, source.digest, create=create)
 
@@ -550,7 +550,7 @@ class ExtractionResultCache:
         lease: _CacheRootLease,
         source_fd: int,
         source_identity: _Identity,
-        source: SourceFingerprint,
+        source: RecordingFingerprint,
         config_hash: str,
         *,
         verify_images: bool,
@@ -631,7 +631,7 @@ class ExtractionResultCache:
             if generation_fd >= 0:
                 os.close(generation_fd)
 
-    def contains(self, source: SourceFingerprint, config_hash: str) -> bool:
+    def contains(self, source: RecordingFingerprint, config_hash: str) -> bool:
         """Return whether a complete generation verifies without exposing its evidence."""
         self.path_for(source, config_hash)
         try:
@@ -659,7 +659,7 @@ class ExtractionResultCache:
 
     def materialize(
         self,
-        source: SourceFingerprint,
+        source: RecordingFingerprint,
         config_hash: str,
         source_path: Path,
         working_root: Path,
@@ -672,7 +672,7 @@ class ExtractionResultCache:
 
     def _materialize_owned(
         self,
-        source: SourceFingerprint,
+        source: RecordingFingerprint,
         config_hash: str,
         source_path: Path,
         working_root: Path,
@@ -795,7 +795,7 @@ class ExtractionResultCache:
 
     def store(
         self,
-        source: SourceFingerprint,
+        source: RecordingFingerprint,
         config_hash: str,
         result: RecordingExtractionResult,
         *,
@@ -837,7 +837,7 @@ class ExtractionResultCache:
         lease: _CacheRootLease,
         source_fd: int,
         source_identity: _Identity,
-        source: SourceFingerprint,
+        source: RecordingFingerprint,
         config_hash: str,
         result: RecordingExtractionResult,
     ) -> CacheStoreResult:

@@ -18,7 +18,13 @@ from PIL import Image
 
 from dataset_devkit.config import GLOBAL_CONFIG_ADAPTER, GlobalConfig
 from dataset_devkit.export import NUSCENES_VERSION, OFFICIAL_TABLES
-from dataset_devkit.provenance import canonical_hash, canonical_json
+from dataset_devkit.provenance import (
+    SourceFingerprint,
+    canonical_hash,
+    canonical_json,
+    fingerprint_from_dict,
+    fingerprint_locator,
+)
 from dataset_devkit.publication import StagingLease, hash_regular_files_fd
 
 _MANIFEST = "mz_extensions/content_manifest.json"
@@ -1124,7 +1130,7 @@ def _extensions(
     source_repo_paths: dict[str, str] = {}
     channels_by_source: dict[str, dict[str, str]] = {}
     recording_keys = {"source", "source_digest", "log_token", "channels"}
-    source_keys = {"repo_id", "revision", "repo_path", "sha256", "size"}
+    legacy_source_keys = {"repo_id", "revision", "repo_path", "sha256", "size"}
     channel_keys = {"original", "normalized"}
     if isinstance(recordings, list) and all(
         isinstance(item, dict) and set(item) == recording_keys for item in recordings
@@ -1152,15 +1158,27 @@ def _extensions(
             recording_sources.add(source)
             log_to_source[log_token] = source
             source_value = item.get("source")
-            repo_path = source_value.get("repo_path") if isinstance(source_value, dict) else None
+            parsed_source = None
+            if isinstance(source_value, dict):
+                with suppress(ValueError):
+                    parsed_source = (
+                        SourceFingerprint.from_dict(source_value)
+                        if set(source_value) == legacy_source_keys
+                        else fingerprint_from_dict(source_value)
+                    )
+            repo_path = (
+                None
+                if parsed_source is None
+                else fingerprint_locator(parsed_source)
+            )
             channels = item.get("channels")
             channel_rows = (
                 cast(list[dict[str, Any]], channels) if isinstance(channels, list) else []
             )
             channel_identities = [row.get("normalized") for row in channel_rows]
             if (
-                not isinstance(source_value, dict)
-                or set(source_value) != source_keys
+                parsed_source is None
+                or parsed_source.digest != source
                 or not isinstance(repo_path, str)
                 or source in source_repo_paths
                 or not isinstance(channels, list)
@@ -2080,10 +2098,10 @@ def _extensions(
         findings,
     )
     if config is not None:
-        required = {
-            f"CAM_{str(channel).upper().replace('-', '_')}"
-            for channel in config.frame_validity.required_cameras
-        }
+        required = set()
+        for channel in config.frame_validity.required_cameras:
+            body = str(channel).upper().replace("-", "_")
+            required.add(body if body.startswith("CAM_") else f"CAM_{body}")
         calibration_by_token = {
             cast(str, item["token"]): item
             for item in tables["calibrated_sensor"]

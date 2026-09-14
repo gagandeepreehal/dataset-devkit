@@ -178,6 +178,15 @@ class PrivacyGnssSample:
     local_enu_origin_offset_ns: Literal[0]
     published_horizontal_resolution_m: float | None
 
+    @property
+    def timestamp_ns(self) -> int:
+        """Compatibility view of the authoritative recording-relative offset."""
+        return self.recording_offset_ns
+
+    @property
+    def rec_timestamp_ns(self) -> int:
+        return self.recording_offset_ns
+
     def __post_init__(self) -> None:
         object.__setattr__(
             self,

@@ -21,7 +21,12 @@ from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import CameraCalibration, EgoPose, StagedImage
 from dataset_devkit.features import SceneFeatures
 from dataset_devkit.identifiers import validate_safe_segment
-from dataset_devkit.provenance import SourceFingerprint, canonical_hash, canonical_json
+from dataset_devkit.provenance import (
+    RecordingFingerprint,
+    canonical_hash,
+    canonical_json,
+    fingerprint_locator,
+)
 from dataset_devkit.publication import StagingLease
 from dataset_devkit.scenario_selection import ScenarioSelectionResult, validate_scenario_selection
 from dataset_devkit.scene_models import (
@@ -329,7 +334,7 @@ class ExportEvidence:
     resolved_config: GlobalConfig
     content_manifest: object
     pipeline_audit: object | None = None
-    validity_reports: Sequence[tuple[SourceFingerprint, ValidityReport]] = ()
+    validity_reports: Sequence[tuple[RecordingFingerprint, ValidityReport]] = ()
 
 
 @dataclass(frozen=True)
@@ -365,7 +370,7 @@ def pipeline_graph_scene_sequence(
     return [
         {
             "source_digest": graph.source.digest,
-            "source_repo_path": graph.source.repo_path,
+            "source_repo_path": fingerprint_locator(graph.source),
             "scene_token": scene.token,
             "ordinal": scene.ordinal,
             "first_timestamp_ns": scene.first_timestamp_ns,
@@ -514,7 +519,7 @@ def _logical_audit_payload(
 
 
 def _recording_validity_payload(
-    source: SourceFingerprint,
+    source: RecordingFingerprint,
     report: ValidityReport,
 ) -> dict[str, object]:
     final_ids = {
@@ -912,7 +917,7 @@ def _export_into(
         logs.append(
             {
                 "token": token,
-                "logfile": graph.source.repo_path,
+                "logfile": fingerprint_locator(graph.source),
                 "vehicle": "",
                 "date_captured": "",
                 "location": "",
