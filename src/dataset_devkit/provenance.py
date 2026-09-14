@@ -12,7 +12,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
-from dataset_devkit.config import GlobalConfig
+from dataset_devkit.config import GlobalConfig, GlobalConfigV1, normalized_source
+from dataset_devkit.identifiers import validate_safe_segment
 from dataset_devkit.repository_paths import RepositoryPathError, validate_repo_mcap_path
 
 DownloadStatus = Literal["downloaded", "cache_hit"]
@@ -104,6 +105,133 @@ class SourceFingerprint:
     @property
     def cache_key(self) -> str:
         return self.digest
+
+
+@dataclass(frozen=True)
+class DecodedSourceFingerprint:
+    repo_id: str
+    revision: str
+    recording_id: str
+    catalog_row_sha256: str
+    artifact_set_sha256: str
+    total_size: int
+    source_type: Literal["decoded_hf"] = "decoded_hf"
+    privacy_classification: Literal["privacy_transformed"] = "privacy_transformed"
+
+    def __post_init__(self) -> None:
+        invalid = (
+            not isinstance(self.repo_id, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*",
+                self.repo_id,
+            )
+            is None
+            or not isinstance(self.revision, str)
+            or re.fullmatch(r"[0-9a-f]{40}", self.revision) is None
+            or not isinstance(self.catalog_row_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.catalog_row_sha256) is None
+            or not isinstance(self.artifact_set_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.artifact_set_sha256) is None
+            or not isinstance(self.total_size, int)
+            or isinstance(self.total_size, bool)
+            or self.total_size <= 0
+        )
+        try:
+            validate_safe_segment(self.recording_id)
+        except ValueError:
+            invalid = True
+        if invalid:
+            raise ValueError("invalid decoded source fingerprint values")
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: object) -> DecodedSourceFingerprint:
+        expected = {
+            "repo_id",
+            "revision",
+            "recording_id",
+            "catalog_row_sha256",
+            "artifact_set_sha256",
+            "total_size",
+            "source_type",
+            "privacy_classification",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError("invalid decoded source fingerprint")
+        if (
+            value["source_type"] != "decoded_hf"
+            or value["privacy_classification"] != "privacy_transformed"
+        ):
+            raise ValueError("invalid decoded source fingerprint classification")
+        try:
+            return cls(
+                repo_id=cast(str, value["repo_id"]),
+                revision=cast(str, value["revision"]),
+                recording_id=cast(str, value["recording_id"]),
+                catalog_row_sha256=cast(str, value["catalog_row_sha256"]),
+                artifact_set_sha256=cast(str, value["artifact_set_sha256"]),
+                total_size=cast(int, value["total_size"]),
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("invalid decoded source fingerprint values") from error
+
+    @property
+    def digest(self) -> str:
+        return canonical_hash(self.to_dict())
+
+    @property
+    def cache_key(self) -> str:
+        return self.digest
+
+
+type RecordingFingerprint = SourceFingerprint | DecodedSourceFingerprint
+
+
+def fingerprint_to_dict(value: RecordingFingerprint) -> dict[str, object]:
+    """Serialize an exact discriminated recording fingerprint."""
+    if isinstance(value, SourceFingerprint):
+        return {
+            "source_type": "mcap_hf",
+            "privacy_classification": "restricted_raw",
+            **value.to_dict(),
+        }
+    return value.to_dict()
+
+
+def fingerprint_from_dict(value: object) -> RecordingFingerprint:
+    """Parse a strict recording fingerprint without accepting hybrid shapes."""
+    if not isinstance(value, dict):
+        raise ValueError("invalid recording fingerprint")
+    source_type = value.get("source_type")
+    if source_type == "decoded_hf":
+        return DecodedSourceFingerprint.from_dict(value)
+    if source_type == "mcap_hf":
+        expected = {
+            "source_type",
+            "privacy_classification",
+            "repo_id",
+            "revision",
+            "repo_path",
+            "sha256",
+            "size",
+        }
+        if set(value) != expected or value.get("privacy_classification") != "restricted_raw":
+            raise ValueError("invalid MCAP source fingerprint")
+        legacy = {
+            key: value[key]
+            for key in ("repo_id", "revision", "repo_path", "sha256", "size")
+        }
+        return SourceFingerprint.from_dict(legacy)
+    raise ValueError("invalid recording fingerprint source type")
+
+
+def fingerprint_locator(value: RecordingFingerprint) -> str:
+    """Return the backend-neutral recording locator safe for diagnostics."""
+    if isinstance(value, SourceFingerprint):
+        return value.repo_path
+    return value.recording_id
 
 
 @dataclass(frozen=True)
@@ -222,7 +350,13 @@ def extraction_config_hash(config: GlobalConfig) -> str:
     """Hash only resolved configuration that affects recording extraction."""
     extraction_config = {
         "schema_version": config.schema_version,
-        "topics": config.topics.model_dump(mode="json"),
+        "source_extraction": (
+            config.topics.model_dump(mode="json")
+            if isinstance(config, GlobalConfigV1)
+            else normalized_source(config).model_dump(
+                mode="json", exclude={"repo_id", "revision", "privacy_classification"}
+            )
+        ),
         "downsampling": config.downsampling.model_dump(mode="json"),
         "image": config.image.model_dump(mode="json"),
         "gnss": config.gnss.model_dump(mode="json"),

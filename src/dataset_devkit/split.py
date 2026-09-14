@@ -14,7 +14,7 @@ from uuid import UUID
 
 from dataset_devkit.config import ScenariosConfig, SplitConfig
 from dataset_devkit.features import SceneFeatures
-from dataset_devkit.provenance import canonical_hash, canonical_json
+from dataset_devkit.provenance import canonical_hash, canonical_json, fingerprint_locator
 from dataset_devkit.scenario_selection import (
     ScenarioAssignment,
     ScenarioSelectionResult,
@@ -175,7 +175,10 @@ def _validate_inputs(
         feature = features[identity]
         assignment = assignments[identity]
         graph = graph_by_source[identity[1]]
-        if feature.source != graph.source or feature.source_repo_path != graph.source.repo_path:
+        if (
+            feature.source != graph.source
+            or feature.source_repo_path != fingerprint_locator(graph.source)
+        ):
             raise ValueError("selected feature source evidence differs from its recording graph")
         selected_scene = scene_by_identity.get(identity)
         if selected_scene is None:
@@ -413,7 +416,7 @@ def _compute_split(
                 pairs.append(
                     AdjacentSceneLeakagePair(
                         graph.source.digest,
-                        graph.source.repo_path,
+                        fingerprint_locator(graph.source),
                         earlier.token,
                         later.token,
                         earlier.last_timestamp_ns,

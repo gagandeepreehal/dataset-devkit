@@ -16,7 +16,13 @@ from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import ExtractedCameraSample
 from dataset_devkit.extraction.staging import verify_staged_image_identity
 from dataset_devkit.identifiers import validate_safe_segment
-from dataset_devkit.provenance import SourceFingerprint, canonical_json
+from dataset_devkit.provenance import (
+    RecordingFingerprint,
+    SourceFingerprint,
+    canonical_json,
+    fingerprint_locator,
+    fingerprint_to_dict,
+)
 from dataset_devkit.repository_paths import RepositoryPathError, validate_repo_mcap_path
 from dataset_devkit.scene_models import (
     AnnotationMatch,
@@ -54,7 +60,7 @@ def _evidence_jsonable(value: object) -> object:
 
 def _feature_evidence_token(
     namespace: UUID,
-    source: SourceFingerprint,
+    source: RecordingFingerprint,
     source_samples: tuple[SourceSampleRecord, ...],
     sample_data: tuple[SampleDataRecord, ...],
 ) -> str:
@@ -62,7 +68,7 @@ def _feature_evidence_token(
         namespace,
         "feature-evidence",
         [
-            source.to_dict(),
+            fingerprint_to_dict(source),
             [
                 [
                     item.timestamp_ns,
@@ -90,14 +96,15 @@ def _feature_evidence_token(
 
 
 def _validate_input(
-    report: ValidityReport, source: SourceFingerprint
+    report: ValidityReport, source: RecordingFingerprint
 ) -> tuple[LogicalSampleAudit, ...]:
-    try:
-        validate_repo_mcap_path(source.repo_path)
-    except RepositoryPathError as error:
-        raise StructuralExtractionError(
-            "source fingerprint has an invalid repository MCAP path"
-        ) from error
+    if isinstance(source, SourceFingerprint):
+        try:
+            validate_repo_mcap_path(source.repo_path)
+        except RepositoryPathError as error:
+            raise StructuralExtractionError(
+                "source fingerprint has an invalid repository MCAP path"
+            ) from error
     samples = report.final_candidates
     timestamps = tuple(item.grid_target_timestamp_ns for item in samples)
     if len(timestamps) != len(set(timestamps)):
@@ -194,8 +201,8 @@ def _validate_input(
                 )
                 if not all(math.isfinite(value) for value in calibration_numbers):
                     raise StructuralExtractionError("sample calibration contains non-finite values")
-    if report.source_path.name and not source.repo_path:
-        raise StructuralExtractionError("source fingerprint lacks exact repository path")
+    if report.source_path.name and not fingerprint_locator(source):
+        raise StructuralExtractionError("source fingerprint lacks exact recording locator")
     return samples
 
 
@@ -259,7 +266,7 @@ class _SampleIndex:
 
 def _annotation_state(
     parsed: Sequence[ParsedAnnotation],
-    source: SourceFingerprint,
+    source: RecordingFingerprint,
     index: _SampleIndex,
     config: GlobalConfig,
 ) -> tuple[
@@ -269,7 +276,8 @@ def _annotation_state(
     dict[str, tuple[LogicalSampleAudit, ...]],
 ]:
     namespace = config.scenes.dataset_namespace
-    source_identity = source.to_dict()
+    source_identity = fingerprint_to_dict(source)
+    source_locator = fingerprint_locator(source)
     records = tuple(
         AnnotationRecord(
             _token(
@@ -287,7 +295,7 @@ def _annotation_state(
     matches: list[AnnotationMatch] = []
     candidates: list[_WindowCandidate] = []
     for parsed_item, record in zip(parsed, records, strict=True):
-        if parsed_item.repo_path != source.repo_path:
+        if parsed_item.repo_path != source_locator:
             matches.append(
                 AnnotationMatch(
                     record.token, record.line_number, False, None, None, None, "different_recording"
@@ -552,14 +560,14 @@ def _exclude_annotation_ranges(
 
 def _materialize(
     candidates: Sequence[_SceneCandidate],
-    source: SourceFingerprint,
+    source: RecordingFingerprint,
     settings: _BuildSettings,
     namespace: UUID,
 ) -> tuple[tuple[SceneRecord, ...], tuple[SampleRecord, ...], tuple[SampleDataRecord, ...]]:
     scenes: list[SceneRecord] = []
     samples: list[SampleRecord] = []
     sample_data: list[SampleDataRecord] = []
-    source_identity = source.to_dict()
+    source_identity = fingerprint_to_dict(source)
     settings_identity = settings.identity()
     for ordinal, candidate in enumerate(candidates):
         logical_timestamps = tuple(item.grid_target_timestamp_ns for item in candidate.samples)
@@ -654,7 +662,7 @@ def _materialize(
                 candidate.labels,
                 candidate.annotation_refs,
                 candidate.window_token,
-                source.repo_path,
+                fingerprint_locator(source),
             )
         )
     return tuple(scenes), tuple(samples), tuple(sample_data)
@@ -662,7 +670,7 @@ def _materialize(
 
 def build_recording_scenes(
     report: ValidityReport,
-    source: SourceFingerprint,
+    source: RecordingFingerprint,
     config: GlobalConfig,
     *,
     annotations_path: Path | None = None,
@@ -958,7 +966,7 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             result.dataset_namespace,
             "annotation",
             [
-                result.source.to_dict(),
+                fingerprint_to_dict(result.source),
                 annotation.line_number,
                 annotation.repo_path,
                 annotation.timestamp_ns,
@@ -987,7 +995,7 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         expected_match: tuple[bool, int | None, int | None, int | None, str]
         if match.line_number != annotation.line_number:
             raise StructuralExtractionError("annotation match line identity is inconsistent")
-        if annotation.repo_path != result.source.repo_path:
+        if annotation.repo_path != fingerprint_locator(result.source):
             expected_match = (False, None, None, None, "different_recording")
         elif not timestamp_values:
             expected_match = (False, None, None, None, "no_valid_samples")
@@ -1092,7 +1100,7 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             result.dataset_namespace,
             "annotation-window",
             [
-                result.source.to_dict(),
+                fingerprint_to_dict(result.source),
                 expected_tokens,
                 expected_first,
                 expected_last,
@@ -1178,13 +1186,13 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
         zip(result.scenes, expected_partitions, strict=True)
     ):
         members = samples_by_scene.get(scene.token, [])
-        if scene.source_repo_path != result.source.repo_path:
+        if scene.source_repo_path != fingerprint_locator(result.source):
             raise StructuralExtractionError("scene source repository path is inconsistent")
         expected_scene_token = _token(
             result.dataset_namespace,
             "scene",
             [
-                result.source.to_dict(),
+                fingerprint_to_dict(result.source),
                 expected_partition.kind,
                 expected_partition.window_token,
                 expected_partition.timestamps,
@@ -1221,7 +1229,7 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             expected_sample_token = _token(
                 result.dataset_namespace,
                 "sample",
-                [result.source.to_dict(), scene.token, member.timestamp_ns],
+                [fingerprint_to_dict(result.source), scene.token, member.timestamp_ns],
             )
             expected_prev = "" if index == 0 else members[index - 1].token
             expected_next = "" if index == len(members) - 1 else members[index + 1].token
@@ -1263,7 +1271,7 @@ def validate_scene_graph(result: RecordingSceneResult) -> None:
             result.dataset_namespace,
             "sample-data",
             [
-                result.source.to_dict(),
+                fingerprint_to_dict(result.source),
                 item.scene_token,
                 item.sample_token,
                 item.channel,
