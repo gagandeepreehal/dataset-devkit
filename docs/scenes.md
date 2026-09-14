@@ -3,8 +3,8 @@
 Task 5 consumes one successful recording policy result at a time. Its only sample input is
 `ValidityReport.final_candidates`. Invalid retained audit samples, dropped invalid samples, and
 grid misses remain in the Task 4 report and can never become scenes. The builder also takes the
-exact Hugging Face `SourceFingerprint`; local MCAP and staging paths are preserved as references but are
-never token inputs.
+exact discriminated Hugging Face source fingerprint. Local source and staging paths are preserved
+as references but are never token inputs.
 
 ## Configuration and integer time
 
@@ -37,6 +37,11 @@ inside the run. Within each run the automatic algorithm is deliberately greedy:
 
 This also defines leftover behavior: a final short candidate is rejected intact. No balancing,
 overlap, or sample reuse occurs.
+
+Decoded V2 timestamps are exact offsets from that recording's synchronized video start. Scene gap
+and duration calculations never use absolute dates or contextual time of day. Each recording owns
+an independent `recording_local_enu_v1` tangent frame, and the coordinator invokes scene building
+per recording, so scenes and trajectories cannot cross an origin or recording boundary.
 
 ## Annotation JSONL
 

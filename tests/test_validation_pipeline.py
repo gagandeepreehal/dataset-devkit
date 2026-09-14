@@ -22,6 +22,7 @@ from dataset_devkit import validation as validation_module
 from dataset_devkit.config import (
     FiltersConfig,
     GlobalConfig,
+    GlobalConfigV1,
     ScenarioRuleConfig,
     ScenariosConfig,
     TagsConfig,
@@ -135,7 +136,8 @@ def _pipeline_config(
     repo_paths: tuple[str, ...],
     *,
     partial: bool,
-) -> GlobalConfig:
+) -> GlobalConfigV1:
+    assert isinstance(base, GlobalConfigV1)
     annotations = tmp_path / "annotations.jsonl"
     annotations.write_text("")
     paths = base.paths.model_copy(
@@ -875,6 +877,7 @@ def test_feature_failure_blocks_default_and_partial_export_keeps_good_source(
     def fail_bad_feature(
         graph: RecordingSceneResult, tags: TagsConfig
     ) -> RecordingFeatureResult:
+        assert isinstance(graph.source, SourceFingerprint)
         if graph.source.repo_path == bad_blob:
             raise StructuralExtractionError("injected per-source feature failure")
         return original_compute(graph, tags)
@@ -928,6 +931,7 @@ def test_export_preflight_failure_blocks_default_and_partial_keeps_good_source(
     )
 
     def fail_bad_preflight(graph: RecordingSceneResult) -> None:
+        assert isinstance(graph.source, SourceFingerprint)
         if graph.source.repo_path != bad_blob:
             preflight_recording_export(graph)
             return

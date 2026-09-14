@@ -37,7 +37,7 @@ whose strict order would collide or reverse after conversion. Camera rotation ve
 converted to normalized `wxyz` quaternions; real translation, intrinsic matrices, image sizes,
 and camera-time ego poses are required and must be finite.
 
-`mz_extensions` contains canonical `recordings.json`, `gnss.json`, `validity.json`,
+`mz_extensions` contains canonical `source.json`, `recordings.json`, `gnss.json`, `validity.json`,
 `validation.json`, `tags.json`, `annotations.json`, `split.json`, `config.json`, and
 `content_manifest.json`, plus `pipeline_audit.json` for filtering, rejection, and ordered
 scenario-selection evidence. The pipeline audit also retains a compact, complete Task 5 scene
@@ -46,6 +46,18 @@ by an unselected scene. Computed tags and human labels stay separate. Before Tas
 `validation.json` truthfully records `state: "not_run"` and never claims success.
 `validity.json` uses schema version 2 with `recordings` for complete per-source observations and
 grid/sample audits, plus `scenes` for selected-scene aggregates and official sample references.
+
+`source.json` makes the backend boundary machine-readable. Decoded output must declare
+`decoded_hf`, `privacy_transformed`, `recording_local_enu_v1`, and global horizontal resolution
+`1.0`. Restricted-raw MCAP declares `mcap_hf`, `restricted_raw`, and the legacy Web Mercator pose
+frame with no privacy resolution claim. `recordings.json` stores a source-discriminated fingerprint
+for each recording.
+
+For decoded output, each `gnss.json` row includes the precise local `translation_xyz_m` used by its
+official ego pose and the separate one-metre `published_east_m`/`published_north_m` context. Final
+validation requires the local translation to equal `ego_pose.translation`, requires global
+east/north to be integral metres, and rejects a source/privacy/pose combination outside the fixed
+contract.
 
 ## Final validation, manifest, and publication
 
@@ -102,8 +114,10 @@ dataset-devkit inspect --dataroot DATASET --version v1.0-trainval
 ```
 
 Inspection reports official table and image counts, normalized camera channels, recording and
-train/test counts, final validation state, and the root content hash. It validates first and does
-not manufacture summaries from malformed content.
+train/test counts, source type, privacy classification, pose frame, final validation state, and the
+root content hash. It validates first and does not manufacture summaries from malformed content.
+These checks verify published structure and evidence; they do not independently rerun the video
+anonymizer.
 
 ## Read-only SDK
 
@@ -121,7 +135,7 @@ duplicate tokens. Its stable methods are:
   `annotation_scene_references()`, individual annotation resolvers, and
   `scene_annotation_evidence(scene_token)`;
 - `split(scene_token)` and `scenes_in_split("train" | "test")`;
-- `recordings()`, `validation_report()`, and `pipeline_audit()`.
+- `recordings()`, `source_metadata()`, `validation_report()`, and `pipeline_audit()`.
 
 Camera lookup uses a load-time validated `(sample_token, channel)` index, requires exactly one row,
 and rejects missing, malformed, or ambiguous references. Every returned table, record, traversal,

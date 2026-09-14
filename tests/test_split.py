@@ -16,7 +16,7 @@ from dataset_devkit.config import (
     SplitConfig,
 )
 from dataset_devkit.features import SceneFeatures
-from dataset_devkit.provenance import SourceFingerprint
+from dataset_devkit.provenance import SourceFingerprint, fingerprint_locator
 from dataset_devkit.scenario_selection import ScenarioSelectionResult, select_scenarios
 from dataset_devkit.scene_models import RecordingSceneResult
 from dataset_devkit.scenes import build_recording_scenes
@@ -66,7 +66,7 @@ def _selection(
             scene_token=scene.token,
             scene_name=scene.name,
             source=graph.source,
-            source_repo_path=graph.source.repo_path,
+            source_repo_path=fingerprint_locator(graph.source),
         )
         for graph, scene in pairs
     )
@@ -259,6 +259,7 @@ def test_rejects_missing_foreign_duplicate_and_mutated_evidence(
             ),
         )
     elif mutation == "graph":
+        assert isinstance(first.source, SourceFingerprint)
         first = replace(first, source=replace(first.source, sha256="c" * 64))
         graphs = (first,)
     with pytest.raises(ValueError):

@@ -926,8 +926,10 @@ def test_failure_after_tombstone_link_rolls_back_without_partial_drop(
 
 def _nested_orientation_result(tmp_path: Path) -> RecordingExtractionResult:
     result = _result(tmp_path)
+    source = result.gnss_samples[0]
+    assert isinstance(source, GnssSample)
     before = replace(
-        result.gnss_samples[0],
+        source,
         is_valid=True,
         position_uncertainty={
             "east_sigma_m": 0.1,

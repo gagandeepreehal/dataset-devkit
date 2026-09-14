@@ -10,17 +10,24 @@ Each logical sample contributes exactly one trajectory observation. `reference_c
 with policy `require` demands that exact channel in every sample. Policy
 `lexicographic_fallback` chooses the lexicographically first `(channel, camera_index)` and records
 the channels used plus the fallback count. The observation uses that camera's integer nanosecond
-timestamp and Web-Mercator ego-pose `(x, y)` coordinates. Logical-grid intervals and configured
+timestamp and the official ego-pose `(x, y)` coordinates. Logical-grid intervals and configured
 FPS are never used as elapsed trajectory time.
 
-EPSG:3857 Web Mercator coordinates are projected map units, not locally corrected geodesic
-distances. Their scale grows with latitude (approximately by `sec(latitude)`), so reported planar
-distance, speed, and curvature inherit that distortion. These deterministic features are suitable
-for like-for-like selection within the same operating region; applications requiring physical
-ground distance across latitudes must use an appropriate local/geodesic projection upstream.
+For decoded V2, the official pose is precise per-recording local ENU produced by the privacy
+transformation. Distance, speed, acceleration, curvature, turn direction, stationary/stopping
+classification, trajectory filters, and scenario selection all use local east/north; local up is
+retained in translation. One-metre-rounded global coordinates are context only and never enter
+feature computation. Each recording has a separate origin and no cross-recording trajectory is
+created.
+
+For restricted-raw MCAP, the legacy official pose remains EPSG:3857 Web Mercator. Those projected
+map units are not locally corrected geodesic distances and their scale grows with latitude, so
+MCAP-derived planar features inherit that distortion. The exported `mz_extensions/source.json`
+declares the pose frame, preventing consumers from treating the two coordinate contracts as the
+same frame.
 
 Segment duration is the positive difference between consecutive real timestamps in seconds.
-Distance is planar Euclidean Web-Mercator distance. `mean_speed_mps` is the arithmetic mean of the
+Distance is planar Euclidean distance in the declared pose frame. `mean_speed_mps` is the arithmetic mean of the
 segment speeds; median and maximum are calculated over the same segment population.
 `time_weighted_speed_mps` is separately named and equals total distance divided by total real
 duration. A one-sample scene has zero finite duration, distance, and speed. Zero-distance segments
