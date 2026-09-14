@@ -33,6 +33,96 @@
       "title": "AnnotationsConfig",
       "type": "object"
     },
+    "DecodedHfSourceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "cameras": {
+          "items": {
+            "enum": [
+              "cam_front",
+              "cam_front_left",
+              "cam_front_right",
+              "cam_front_tilted",
+              "cam_rear",
+              "cam_rear_left",
+              "cam_rear_right"
+            ],
+            "type": "string"
+          },
+          "title": "Cameras",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "modalities": {
+          "items": {
+            "enum": [
+              "video",
+              "gnss",
+              "calibration",
+              "camera_labels",
+              "semantic",
+              "depth"
+            ],
+            "type": "string"
+          },
+          "title": "Modalities",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "privacy_classification": {
+          "const": "privacy_transformed",
+          "default": "privacy_transformed",
+          "title": "Privacy Classification",
+          "type": "string"
+        },
+        "recording_ids": {
+          "items": {
+            "minLength": 1,
+            "pattern": "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$",
+            "type": "string"
+          },
+          "title": "Recording Ids",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "recordings_path": {
+          "const": "data/recordings.parquet",
+          "title": "Recordings Path",
+          "type": "string"
+        },
+        "repo_id": {
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        },
+        "splits": {
+          "items": {
+            "minLength": 1,
+            "pattern": "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$",
+            "type": "string"
+          },
+          "title": "Splits",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "type": {
+          "const": "decoded_hf",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_id",
+        "revision",
+        "type",
+        "recordings_path"
+      ],
+      "title": "DecodedHfSourceConfig",
+      "type": "object"
+    },
     "DownsamplingConfig": {
       "additionalProperties": false,
       "properties": {
@@ -482,6 +572,181 @@
       "title": "FrameValidityConfig",
       "type": "object"
     },
+    "GlobalConfigV1": {
+      "additionalProperties": false,
+      "properties": {
+        "annotations": {
+          "$ref": "#/$defs/AnnotationsConfig"
+        },
+        "downsampling": {
+          "$ref": "#/$defs/DownsamplingConfig"
+        },
+        "execution": {
+          "$ref": "#/$defs/ExecutionConfig"
+        },
+        "filters": {
+          "$ref": "#/$defs/FiltersConfig"
+        },
+        "frame_validity": {
+          "$ref": "#/$defs/FrameValidityConfig"
+        },
+        "gnss": {
+          "$ref": "#/$defs/GnssConfig"
+        },
+        "huggingface": {
+          "$ref": "#/$defs/HuggingFaceConfig"
+        },
+        "image": {
+          "$ref": "#/$defs/ImageConfig"
+        },
+        "paths": {
+          "$ref": "#/$defs/PathsConfig"
+        },
+        "publication": {
+          "$ref": "#/$defs/PublicationConfig"
+        },
+        "quarantine": {
+          "$ref": "#/$defs/QuarantineConfig"
+        },
+        "sanity_checks": {
+          "$ref": "#/$defs/SanityChecksConfig"
+        },
+        "scenarios": {
+          "$ref": "#/$defs/ScenariosConfig"
+        },
+        "scenes": {
+          "$ref": "#/$defs/ScenesConfig"
+        },
+        "schema_version": {
+          "const": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "split": {
+          "$ref": "#/$defs/SplitConfig"
+        },
+        "tags": {
+          "$ref": "#/$defs/TagsConfig"
+        },
+        "topics": {
+          "$ref": "#/$defs/TopicsConfig"
+        }
+      },
+      "required": [
+        "paths",
+        "downsampling",
+        "image",
+        "gnss",
+        "frame_validity",
+        "sanity_checks",
+        "scenes",
+        "annotations",
+        "tags",
+        "filters",
+        "scenarios",
+        "split",
+        "execution",
+        "publication",
+        "schema_version",
+        "huggingface",
+        "topics"
+      ],
+      "title": "GlobalConfigV1",
+      "type": "object"
+    },
+    "GlobalConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "annotations": {
+          "$ref": "#/$defs/AnnotationsConfig"
+        },
+        "downsampling": {
+          "$ref": "#/$defs/DownsamplingConfig"
+        },
+        "execution": {
+          "$ref": "#/$defs/ExecutionConfig"
+        },
+        "filters": {
+          "$ref": "#/$defs/FiltersConfig"
+        },
+        "frame_validity": {
+          "$ref": "#/$defs/FrameValidityConfig"
+        },
+        "gnss": {
+          "$ref": "#/$defs/GnssConfig"
+        },
+        "image": {
+          "$ref": "#/$defs/ImageConfig"
+        },
+        "paths": {
+          "$ref": "#/$defs/PathsConfig"
+        },
+        "publication": {
+          "$ref": "#/$defs/PublicationConfig"
+        },
+        "quarantine": {
+          "$ref": "#/$defs/QuarantineConfig"
+        },
+        "sanity_checks": {
+          "$ref": "#/$defs/SanityChecksConfig"
+        },
+        "scenarios": {
+          "$ref": "#/$defs/ScenariosConfig"
+        },
+        "scenes": {
+          "$ref": "#/$defs/ScenesConfig"
+        },
+        "schema_version": {
+          "const": "2.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "decoded_hf": "#/$defs/DecodedHfSourceConfig",
+              "mcap_hf": "#/$defs/McapHfSourceConfig"
+            },
+            "propertyName": "type"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/McapHfSourceConfig"
+            },
+            {
+              "$ref": "#/$defs/DecodedHfSourceConfig"
+            }
+          ],
+          "title": "Source"
+        },
+        "split": {
+          "$ref": "#/$defs/SplitConfig"
+        },
+        "tags": {
+          "$ref": "#/$defs/TagsConfig"
+        }
+      },
+      "required": [
+        "paths",
+        "downsampling",
+        "image",
+        "gnss",
+        "frame_validity",
+        "sanity_checks",
+        "scenes",
+        "annotations",
+        "tags",
+        "filters",
+        "scenarios",
+        "split",
+        "execution",
+        "publication",
+        "schema_version",
+        "source"
+      ],
+      "title": "GlobalConfigV2",
+      "type": "object"
+    },
     "GnssConfig": {
       "additionalProperties": false,
       "properties": {
@@ -593,6 +858,42 @@
         }
       },
       "title": "InvalidationRulesConfig",
+      "type": "object"
+    },
+    "McapHfSourceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_path": {
+          "title": "Manifest Path",
+          "type": "string"
+        },
+        "privacy_classification": {
+          "const": "restricted_raw",
+          "default": "restricted_raw",
+          "title": "Privacy Classification",
+          "type": "string"
+        },
+        "repo_id": {
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        },
+        "type": {
+          "const": "mcap_hf",
+          "default": "mcap_hf",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_id",
+        "revision",
+        "manifest_path"
+      ],
+      "title": "McapHfSourceConfig",
       "type": "object"
     },
     "PathsConfig": {
@@ -1085,84 +1386,19 @@
       "type": "object"
     }
   },
-  "additionalProperties": false,
-  "properties": {
-    "annotations": {
-      "$ref": "#/$defs/AnnotationsConfig"
+  "discriminator": {
+    "mapping": {
+      "1.0": "#/$defs/GlobalConfigV1",
+      "2.0": "#/$defs/GlobalConfigV2"
     },
-    "downsampling": {
-      "$ref": "#/$defs/DownsamplingConfig"
-    },
-    "execution": {
-      "$ref": "#/$defs/ExecutionConfig"
-    },
-    "filters": {
-      "$ref": "#/$defs/FiltersConfig"
-    },
-    "frame_validity": {
-      "$ref": "#/$defs/FrameValidityConfig"
-    },
-    "gnss": {
-      "$ref": "#/$defs/GnssConfig"
-    },
-    "huggingface": {
-      "$ref": "#/$defs/HuggingFaceConfig"
-    },
-    "image": {
-      "$ref": "#/$defs/ImageConfig"
-    },
-    "paths": {
-      "$ref": "#/$defs/PathsConfig"
-    },
-    "publication": {
-      "$ref": "#/$defs/PublicationConfig"
-    },
-    "quarantine": {
-      "$ref": "#/$defs/QuarantineConfig"
-    },
-    "sanity_checks": {
-      "$ref": "#/$defs/SanityChecksConfig"
-    },
-    "scenarios": {
-      "$ref": "#/$defs/ScenariosConfig"
-    },
-    "scenes": {
-      "$ref": "#/$defs/ScenesConfig"
-    },
-    "schema_version": {
-      "const": "1.0",
-      "title": "Schema Version",
-      "type": "string"
-    },
-    "split": {
-      "$ref": "#/$defs/SplitConfig"
-    },
-    "tags": {
-      "$ref": "#/$defs/TagsConfig"
-    },
-    "topics": {
-      "$ref": "#/$defs/TopicsConfig"
-    }
+    "propertyName": "schema_version"
   },
-  "required": [
-    "schema_version",
-    "huggingface",
-    "paths",
-    "topics",
-    "downsampling",
-    "image",
-    "gnss",
-    "frame_validity",
-    "sanity_checks",
-    "scenes",
-    "annotations",
-    "tags",
-    "filters",
-    "scenarios",
-    "split",
-    "execution",
-    "publication"
-  ],
-  "title": "GlobalConfig",
-  "type": "object"
+  "oneOf": [
+    {
+      "$ref": "#/$defs/GlobalConfigV1"
+    },
+    {
+      "$ref": "#/$defs/GlobalConfigV2"
+    }
+  ]
 }

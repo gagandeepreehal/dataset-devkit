@@ -7,11 +7,19 @@ import math
 import re
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 from urllib.parse import parse_qsl, urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    WithJsonSchema,
+    field_validator,
+    model_validator,
+)
 
 from dataset_devkit.identifiers import SafeSegment
 
@@ -134,10 +142,9 @@ class ConfigRootError(ValueError):
     """Raised when a JSON configuration does not contain an object root."""
 
 
-class HuggingFaceConfig(StrictModel):
+class HuggingFaceIdentityConfig(StrictModel):
     repo_id: str
     revision: str
-    manifest_path: str
 
     @field_validator("repo_id")
     @classmethod
@@ -152,6 +159,10 @@ class HuggingFaceConfig(StrictModel):
         if re.fullmatch(r"[0-9a-f]{40}", value) is None:
             raise ValueError("revision must be a full lowercase commit SHA")
         return value
+
+
+class HuggingFaceConfig(HuggingFaceIdentityConfig):
+    manifest_path: str
 
     @field_validator("manifest_path")
     @classmethod
@@ -678,11 +689,84 @@ class PublicationConfig(StrictModel):
     refuse_overwrite: Literal[True]
 
 
-class GlobalConfig(StrictModel):
-    schema_version: Literal["1.0"]
-    huggingface: HuggingFaceConfig
+CameraName = Literal[
+    "cam_front",
+    "cam_front_left",
+    "cam_front_right",
+    "cam_front_tilted",
+    "cam_rear",
+    "cam_rear_left",
+    "cam_rear_right",
+]
+DecodedModality = Literal[
+    "video",
+    "gnss",
+    "calibration",
+    "camera_labels",
+    "semantic",
+    "depth",
+]
+PrivacyClassification = Literal["restricted_raw", "privacy_transformed"]
+
+DEFAULT_DECODED_CAMERAS: tuple[CameraName, ...] = (
+    "cam_front",
+    "cam_front_left",
+    "cam_front_right",
+    "cam_rear",
+    "cam_rear_left",
+    "cam_rear_right",
+)
+
+
+def _default_decoded_modalities() -> list[DecodedModality]:
+    return ["video", "gnss", "calibration"]
+
+
+class McapHfSourceConfig(HuggingFaceConfig):
+    type: Literal["mcap_hf"] = "mcap_hf"
+    privacy_classification: Literal["restricted_raw"] = "restricted_raw"
+
+
+class DecodedHfSourceConfig(HuggingFaceIdentityConfig):
+    type: Literal["decoded_hf"]
+    recordings_path: Literal["data/recordings.parquet"]
+    recording_ids: list[SafeSegment] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    splits: list[SafeSegment] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    cameras: list[CameraName] = Field(
+        default_factory=lambda: list(DEFAULT_DECODED_CAMERAS),
+        json_schema_extra={"uniqueItems": True},
+    )
+    modalities: list[DecodedModality] = Field(
+        default_factory=_default_decoded_modalities,
+        json_schema_extra={"uniqueItems": True},
+    )
+    privacy_classification: Literal["privacy_transformed"] = "privacy_transformed"
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> DecodedHfSourceConfig:
+        required = {"video", "gnss", "calibration"}
+        if not required.issubset(self.modalities):
+            raise ValueError("decoded source requires video, gnss, and calibration")
+        for name, values in (
+            ("cameras", self.cameras),
+            ("recording IDs", self.recording_ids),
+            ("splits", self.splits),
+            ("modalities", self.modalities),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"decoded {name} must be unique")
+        return self
+
+
+type SourceConfig = McapHfSourceConfig | DecodedHfSourceConfig
+
+
+class _GlobalConfigCommon(StrictModel):
     paths: PathsConfig
-    topics: TopicsConfig
     downsampling: DownsamplingConfig
     image: ImageConfig
     gnss: GnssConfig
@@ -699,7 +783,7 @@ class GlobalConfig(StrictModel):
     publication: PublicationConfig
 
     @model_validator(mode="after")
-    def validate_quarantine_isolation(self) -> GlobalConfig:
+    def validate_quarantine_isolation(self) -> Self:
         quarantine_dir = self.quarantine.directory
         for name, destructive_path in (
             ("work_dir", self.paths.work_dir),
@@ -754,6 +838,36 @@ class GlobalConfig(StrictModel):
         return value
 
 
+class GlobalConfigV1(_GlobalConfigCommon):
+    schema_version: Literal["1.0"]
+    huggingface: HuggingFaceConfig
+    topics: TopicsConfig
+
+
+class GlobalConfigV2(_GlobalConfigCommon):
+    schema_version: Literal["2.0"]
+    source: Annotated[SourceConfig, Field(discriminator="type")]
+
+
+type GlobalConfig = GlobalConfigV1 | GlobalConfigV2
+
+GLOBAL_CONFIG_ADAPTER: TypeAdapter[GlobalConfig] = TypeAdapter(
+    Annotated[GlobalConfig, Field(discriminator="schema_version")]
+)
+
+
+def normalized_source(config: GlobalConfig) -> SourceConfig:
+    """Return the explicit source contract for either configuration generation."""
+    if isinstance(config, GlobalConfigV1):
+        return McapHfSourceConfig(**config.huggingface.model_dump())
+    return config.source
+
+
+def privacy_classification(config: GlobalConfig) -> PrivacyClassification:
+    """Return the fixed privacy classification for the selected source backend."""
+    return normalized_source(config).privacy_classification
+
+
 def load_config(path: Path) -> GlobalConfig:
     """Load configuration and resolve paths relative to its JSON file."""
     config_path = path.resolve()
@@ -798,7 +912,7 @@ def load_config(path: Path) -> GlobalConfig:
         if isinstance(section_data, dict) and isinstance(section_data.get(field), str):
             value = Path(section_data[field])
             section_data[field] = value if value.is_absolute() else (base / value).resolve()
-    return GlobalConfig.model_validate(data)
+    return GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
 
 def validate_config_schema_and_runtime(path: Path) -> GlobalConfig:
@@ -809,5 +923,5 @@ def validate_config_schema_and_runtime(path: Path) -> GlobalConfig:
     value = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ConfigRootError("configuration must be a top-level JSON object")
-    Draft202012Validator(GlobalConfig.model_json_schema()).validate(value)
+    Draft202012Validator(GLOBAL_CONFIG_ADAPTER.json_schema()).validate(value)
     return load_config(config_path)

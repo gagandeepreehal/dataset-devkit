@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from dataset_devkit.config import GlobalConfig, load_config
+from dataset_devkit.config import GLOBAL_CONFIG_ADAPTER, load_config
 from test_config import minimal_config, write_config
 
 
@@ -48,7 +48,7 @@ def test_tag_heading_thresholds_are_strictly_ordered(field: str, value: float) -
     data["tags"][field] = value  # type: ignore[index]
 
     with pytest.raises(ValidationError, match="straight.*curvature.*turn"):
-        GlobalConfig.model_validate_json(json.dumps(data))
+        GLOBAL_CONFIG_ADAPTER.validate_json(json.dumps(data))
 
 
 def test_filter_ranges_and_contradictory_predicates_are_rejected() -> None:
@@ -61,7 +61,7 @@ def test_filter_ranges_and_contradictory_predicates_are_rejected() -> None:
     }
 
     with pytest.raises(ValidationError):
-        GlobalConfig.model_validate_json(json.dumps(data))
+        GLOBAL_CONFIG_ADAPTER.validate_json(json.dumps(data))
 
 
 def test_scenario_rules_have_exact_quota_and_no_contradictions() -> None:
@@ -80,4 +80,4 @@ def test_scenario_rules_have_exact_quota_and_no_contradictions() -> None:
     }
 
     with pytest.raises(ValidationError, match="overlap"):
-        GlobalConfig.model_validate_json(json.dumps(data))
+        GLOBAL_CONFIG_ADAPTER.validate_json(json.dumps(data))

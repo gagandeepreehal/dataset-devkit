@@ -5,7 +5,7 @@ import copy
 import pytest
 from pydantic import ValidationError
 
-from dataset_devkit.config import GlobalConfig
+from dataset_devkit.config import GLOBAL_CONFIG_ADAPTER
 
 
 def test_validity_configuration_has_explicit_strict_defaults(
@@ -52,7 +52,7 @@ def test_unknown_validity_and_sanity_policy_keys_are_rejected(
         data[section][key] = value
 
     with pytest.raises(ValidationError, match=key):
-        GlobalConfig.model_validate(data)
+        GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
 
 @pytest.mark.parametrize(
@@ -73,7 +73,7 @@ def test_frame_validity_contract_rejects_invalid_values(
     data["frame_validity"][field] = value
 
     with pytest.raises(ValidationError, match=field):
-        GlobalConfig.model_validate(data)
+        GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
 
 @pytest.mark.parametrize("policy", ["quarantine", "ignore", True])
@@ -84,4 +84,4 @@ def test_sanity_policy_is_exact_error_warn_or_off(
     data["sanity_checks"]["empty_selected_grid"] = policy
 
     with pytest.raises(ValidationError, match="empty_selected_grid"):
-        GlobalConfig.model_validate(data)
+        GLOBAL_CONFIG_ADAPTER.validate_python(data)

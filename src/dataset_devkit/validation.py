@@ -16,7 +16,7 @@ from typing import Any, Literal, cast
 
 from PIL import Image
 
-from dataset_devkit.config import GlobalConfig
+from dataset_devkit.config import GLOBAL_CONFIG_ADAPTER, GlobalConfig
 from dataset_devkit.export import NUSCENES_VERSION, OFFICIAL_TABLES
 from dataset_devkit.provenance import canonical_hash, canonical_json
 from dataset_devkit.publication import StagingLease, hash_regular_files_fd
@@ -2438,7 +2438,7 @@ def validate_dataset(
             # The exported JSON representation contains JSON strings for Path and
             # exact Decimal values; validate that representation using JSON-mode
             # coercions while the model itself remains strict for Python callers.
-            config = GlobalConfig.model_validate(config_value, strict=False)
+            config = GLOBAL_CONFIG_ADAPTER.validate_python(config_value, strict=False)
         except Exception as error:
             findings.append(
                 ValidationFinding(
