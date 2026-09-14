@@ -15,7 +15,11 @@ from dataset_devkit.decoded_manifest import (
     PrivacyContract,
     parse_decoded_control_plane,
 )
-from decoded_v2_fixture import decoded_source_config, write_decoded_fixture
+from decoded_v2_fixture import (
+    decoded_source_config,
+    rewrite_as_anonymizer_layout,
+    write_decoded_fixture,
+)
 
 
 def _rewrite_rows(path: Path, rows: list[dict[str, object]]) -> None:
@@ -67,6 +71,20 @@ def test_control_plane_filters_before_payload_selection(tmp_path: Path) -> None:
         DEFAULT_DECODED_CAMERAS
     )
     assert plan.recordings[0].artifact("gnss").path.endswith(".parquet")
+
+
+def test_control_plane_selects_anonymizer_camera_shards(tmp_path: Path) -> None:
+    fixture = write_decoded_fixture(tmp_path)
+    rewrite_as_anonymizer_layout(fixture)
+
+    plan = parse_decoded_control_plane(
+        fixture.root,
+        decoded_source_config(fixture.revision, [fixture.recording_id]),
+    )
+
+    frame_shards = plan.recordings[0].artifacts_of("camera_frames")
+    assert len(frame_shards) == len(DEFAULT_DECODED_CAMERAS)
+    assert all("/camera=" in item.path for item in frame_shards)
 
 
 @pytest.mark.parametrize(

@@ -161,22 +161,22 @@ type PoseFrame = Literal["web_mercator_v1", "recording_local_enu_v1"]
 class PrivacyGnssSample:
     recording_offset_ns: int
     is_valid: bool
-    local_east_m: float
-    local_north_m: float
-    local_up_m: float
-    roll_rad: float
-    pitch_rad: float
-    yaw_rad: float
-    published_east_m: float
-    published_north_m: float
-    latitude_deg: float
-    longitude_deg: float
-    height_m: float
+    local_east_m: float | None
+    local_north_m: float | None
+    local_up_m: float | None
+    roll_rad: float | None
+    pitch_rad: float | None
+    yaw_rad: float | None
+    published_east_m: float | None
+    published_north_m: float | None
+    latitude_deg: float | None
+    longitude_deg: float | None
+    height_m: float | None
     position_uncertainty: Mapping[str, Any]
     orientation_uncertainty: Mapping[str, Any]
     quality: Mapping[str, Any]
     local_enu_origin_offset_ns: Literal[0]
-    published_horizontal_resolution_m: float
+    published_horizontal_resolution_m: float | None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -273,7 +273,7 @@ class RecordingExtractionResult:
     source_path: Path
     staging_root: Path
     camera_batches: tuple[RawCameraBatch, ...]
-    gnss_samples: tuple[GnssSample, ...]
+    gnss_samples: tuple[GnssSample | PrivacyGnssSample, ...]
     selected_grid: GridSelection
     samples: tuple[ExtractedCameraSample, ...]
     ego_poses_by_timestamp: Mapping[int, EgoPose]

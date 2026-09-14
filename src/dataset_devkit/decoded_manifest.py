@@ -22,6 +22,7 @@ from dataset_devkit.repository_paths import RepositoryPathError, validate_repo_f
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _DATE_TOKEN = re.compile(r"(?:^|/)(?:date=)?\d{4}-\d{2}-\d{2}(?:/|$)")
+_CAMERA_PARTITION = re.compile(r"(?:^|/)camera=([^/]+)(?:/|$)")
 _ALL_CAMERAS = {*DEFAULT_DECODED_CAMERAS, "cam_front_tilted"}
 _ARTIFACT_KINDS = {
     "auxiliary_messages",
@@ -122,10 +123,13 @@ class DecodedRecordingEntry:
     fingerprint: DecodedSourceFingerprint
 
     def artifact(self, kind: str) -> DecodedArtifact:
-        matches = tuple(item for item in self.artifacts if item.kind == kind)
+        matches = self.artifacts_of(kind)
         if len(matches) != 1:
             raise DecodedManifestError(f"recording requires exactly one {kind!r} artifact")
         return matches[0]
+
+    def artifacts_of(self, kind: str) -> tuple[DecodedArtifact, ...]:
+        return tuple(item for item in self.artifacts if item.kind == kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +271,22 @@ def _bind_output(
     return artifact
 
 
+def _select_camera_frame_artifacts(
+    items: tuple[DecodedArtifact, ...], cameras: list[CameraName]
+) -> tuple[DecodedArtifact, ...]:
+    if len(items) == 1 and _CAMERA_PARTITION.search(items[0].path) is None:
+        return items
+    by_camera: dict[str, DecodedArtifact] = {}
+    for item in items:
+        match = _CAMERA_PARTITION.search(item.path)
+        if match is None or match.group(1) in by_camera:
+            raise DecodedManifestError("camera frame artifact partition is ambiguous")
+        by_camera[match.group(1)] = item
+    if set(cameras) - set(by_camera):
+        raise DecodedManifestError("recording lacks a selected camera frame artifact")
+    return tuple(by_camera[camera] for camera in cameras)
+
+
 def _parse_row(
     row: dict[str, object],
     source: DecodedHfSourceConfig,
@@ -387,11 +407,13 @@ def _parse_row(
     selected_artifacts: list[DecodedArtifact] = []
     for kind in sorted(required_kinds):
         items = all_artifacts.get(kind, ())
-        if len(items) != 1:
+        if kind == "camera_frames":
+            items = _select_camera_frame_artifacts(items, source.cameras)
+        elif len(items) != 1:
             raise DecodedManifestError(f"recording requires exactly one {kind!r} artifact")
-        item = items[0]
-        _bind_output(PublicArtifact(item.path, item.size, item.sha256), output_index)
-        selected_artifacts.append(item)
+        for item in items:
+            _bind_output(PublicArtifact(item.path, item.size, item.sha256), output_index)
+            selected_artifacts.append(item)
 
     identity = [
         {

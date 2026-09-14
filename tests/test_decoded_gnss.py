@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -97,6 +99,81 @@ def test_parse_privacy_gnss_reads_precise_fixture_rows(tmp_path: Path) -> None:
     assert samples[1].published_east_m == 8_000_010.0
 
 
+def test_parse_privacy_gnss_accepts_anonymizer_fields_json_schema(tmp_path: Path) -> None:
+    fixture = write_decoded_fixture(tmp_path)
+    source = next((fixture.root / "data/tables/gnss").rglob("*.parquet"))
+    flat_rows = pq.ParquetFile(source).read().to_pylist()
+    production_rows: list[dict[str, object]] = []
+    for row in flat_rows:
+        fields = {
+            key: value
+            for key, value in row.items()
+            if key not in {"recording_id", "recording_offset_ns"}
+        }
+        production_rows.append(
+            {
+                "recording_id": row["recording_id"],
+                "log_time_of_day_ns": 10_000_000_000 + row["recording_offset_ns"],
+                "log_time_offset_ns": row["recording_offset_ns"],
+                "publish_time_of_day_ns": 10_000_000_000 + row["recording_offset_ns"],
+                "publish_time_offset_ns": row["recording_offset_ns"],
+                "channel": "gnss",
+                "schema_hash": "a" * 64,
+                "sequence": len(production_rows),
+                "fields_json": json.dumps(fields, sort_keys=True),
+            }
+        )
+    pq.write_table(pa.Table.from_pylist(production_rows), source)
+
+    samples = parse_privacy_gnss(source)
+
+    assert [item.recording_offset_ns for item in samples] == [0, 1_000_000_000]
+    assert samples[1].local_east_m == 10.0
+
+
+def test_anonymizer_invalid_gnss_row_is_an_interpolation_barrier(tmp_path: Path) -> None:
+    fixture = write_decoded_fixture(tmp_path)
+    source = next((fixture.root / "data/tables/gnss").rglob("*.parquet"))
+    flat_rows = pq.ParquetFile(source).read().to_pylist()
+    production_rows: list[dict[str, object]] = []
+    for index, row in enumerate(flat_rows):
+        fields = {
+            key: value
+            for key, value in row.items()
+            if key not in {"recording_id", "recording_offset_ns"}
+        }
+        if index == 1:
+            fields.update(
+                {
+                    "is_valid": False,
+                    "local_enu": None,
+                    "enu": None,
+                    "lat_lon_ht": None,
+                    "published_horizontal_resolution_m": None,
+                }
+            )
+        production_rows.append(
+            {
+                "recording_id": row["recording_id"],
+                "log_time_of_day_ns": 10_000_000_000 + row["recording_offset_ns"],
+                "log_time_offset_ns": row["recording_offset_ns"],
+                "publish_time_of_day_ns": 10_000_000_000 + row["recording_offset_ns"],
+                "publish_time_offset_ns": row["recording_offset_ns"],
+                "channel": "gnss",
+                "schema_hash": "a" * 64,
+                "sequence": index,
+                "fields_json": json.dumps(fields, sort_keys=True),
+            }
+        )
+    pq.write_table(pa.Table.from_pylist(production_rows), source)
+
+    samples = parse_privacy_gnss(source)
+
+    assert not samples[1].is_valid
+    assert not interpolate_privacy_gnss(samples, 500_000_000).available
+    assert not interpolate_privacy_gnss(samples, 1_000_000_000).available
+
+
 def test_privacy_gnss_rejects_nonzero_origin_offset(tmp_path: Path) -> None:
     fixture = write_decoded_fixture(tmp_path)
     path = next((fixture.root / "data/tables/gnss").rglob("*.parquet"))
@@ -146,8 +223,8 @@ def test_local_translation_is_independent_of_global_context() -> None:
     shifted = tuple(
         replace(
             sample,
-            published_east_m=sample.published_east_m + 1_000_000.0,
-            published_north_m=sample.published_north_m - 500_000.0,
+            published_east_m=cast(float, sample.published_east_m) + 1_000_000.0,
+            published_north_m=cast(float, sample.published_north_m) - 500_000.0,
         )
         for sample in base
     )

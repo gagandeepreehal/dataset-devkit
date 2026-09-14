@@ -12,7 +12,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pyproj import Transformer
 
-from dataset_devkit.config import DEFAULT_DECODED_CAMERAS, DecodedHfSourceConfig
+from dataset_devkit.config import (
+    DEFAULT_DECODED_CAMERAS,
+    CameraName,
+    DecodedHfSourceConfig,
+)
 
 _TO_WGS84 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -64,10 +68,15 @@ def _write_table(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def write_tiny_videos_and_tables(
-    root: Path, recording_id: str
+    root: Path, recording_id: str, *, include_tilted: bool = False
 ) -> tuple[dict[str, dict[str, object]], dict[str, list[dict[str, object]]]]:
+    cameras = (
+        (*DEFAULT_DECODED_CAMERAS, "cam_front_tilted")
+        if include_tilted
+        else DEFAULT_DECODED_CAMERAS
+    )
     videos: dict[str, dict[str, object]] = {}
-    for camera_index, camera in enumerate(DEFAULT_DECODED_CAMERAS):
+    for camera_index, camera in enumerate(cameras):
         video_path = root / "data" / "videos" / camera / "bucket=fixture" / f"{recording_id}.mp4"
         _write_video(video_path, 10 + camera_index)
         videos[camera] = _artifact(root, video_path)
@@ -91,7 +100,7 @@ def write_tiny_videos_and_tables(
                 "width": 4,
                 "height": 4,
             }
-            for camera in DEFAULT_DECODED_CAMERAS
+            for camera in cameras
             for frame_index in range(2)
         ],
     )
@@ -122,7 +131,7 @@ def write_tiny_videos_and_tables(
                 "rotation_vector": [0.0, 0.0, 0.0],
                 "translation_vector": [0.0, 0.0, 0.0],
             }
-            for camera in DEFAULT_DECODED_CAMERAS
+            for camera in cameras
         ],
     )
 
@@ -268,17 +277,193 @@ def write_public_manifests(
     )
 
 
-def write_decoded_fixture(root: Path) -> DecodedFixture:
+def write_decoded_fixture(root: Path, *, include_tilted: bool = False) -> DecodedFixture:
     recording_id = "recording-code"
     revision = "0123456789abcdef0123456789abcdef01234567"
-    videos, artifacts = write_tiny_videos_and_tables(root, recording_id)
+    videos, artifacts = write_tiny_videos_and_tables(
+        root, recording_id, include_tilted=include_tilted
+    )
     write_recordings_parquet(root, recording_id, videos, artifacts)
     write_public_manifests(root, videos, artifacts)
     return DecodedFixture(root, revision, recording_id)
 
 
+def rewrite_as_anonymizer_layout(fixture: DecodedFixture) -> None:
+    """Rewrite fixture metadata to the production anonymizer's sharded schemas."""
+    catalog_path = fixture.root / "data/recordings.parquet"
+    catalog_row = pq.ParquetFile(catalog_path).read().to_pylist()[0]
+    simple_frame_path = Path(catalog_row["artifact_paths"]["camera_frames"][0])
+    simple_frames = pq.ParquetFile(fixture.root / simple_frame_path).read().to_pylist()
+    simple_calibration_path = Path(catalog_row["artifact_paths"]["calibration"][0])
+    simple_calibrations = pq.ParquetFile(
+        fixture.root / simple_calibration_path
+    ).read().to_pylist()
+    simple_gnss_path = Path(catalog_row["artifact_paths"]["gnss"][0])
+    simple_gnss = pq.ParquetFile(fixture.root / simple_gnss_path).read().to_pylist()
+
+    frame_artifacts: list[dict[str, object]] = []
+    for camera_index, camera in enumerate(DEFAULT_DECODED_CAMERAS):
+        path = (
+            fixture.root
+            / "data/tables/camera-frames"
+            / f"camera={camera}"
+            / "bucket=fixture"
+            / f"part-{fixture.recording_id}.parquet"
+        )
+        rows = []
+        for source in simple_frames:
+            if source["camera_name"] != camera:
+                continue
+            packet_index = int(source["frame_index"])
+            batch_offset = int(source["recording_offset_ns"])
+            camera_offset = (
+                batch_offset + camera_index * 10
+                if packet_index == 0
+                else batch_offset - camera_index * 10
+            )
+            rows.append(
+                {
+                    "schema_version": 2,
+                    "recording_id": fixture.recording_id,
+                    "camera_index": camera_index,
+                    "source_camera_name": camera,
+                    "camera_time_of_day_ns": 10_000_000_000 + camera_offset,
+                    "camera_time_offset_ns": camera_offset,
+                    "frame_id": packet_index + 100,
+                    "rec_frame_id": packet_index + 200,
+                    "rec_time_of_day_ns": 10_000_000_000 + batch_offset,
+                    "rec_time_offset_ns": batch_offset,
+                    "batch_time_of_day_ns": 10_000_000_000 + batch_offset,
+                    "batch_time_offset_ns": batch_offset,
+                    "declared_camera_count": len(DEFAULT_DECODED_CAMERAS),
+                    "full_batch": True,
+                    "log_time_of_day_ns": 10_000_000_000 + batch_offset,
+                    "log_time_offset_ns": batch_offset,
+                    "publish_time_of_day_ns": 10_000_000_000 + batch_offset,
+                    "publish_time_offset_ns": batch_offset,
+                    "channel": "rec_cameras",
+                    "schema_hash": "a" * 64,
+                    "sequence": packet_index,
+                    "message_index": packet_index,
+                    "format": "h265",
+                    "width": source["width"],
+                    "height": source["height"],
+                    "file_name": catalog_row["video_paths"][camera],
+                    "discontinuity_interval_id": 0,
+                    "packet_index": packet_index,
+                    "relative_pts_ns": batch_offset,
+                    "relative_dts_ns": batch_offset,
+                    "duration_ns": 1_000_000_000,
+                    "keyframe": packet_index == 0,
+                    "access_unit_sha256": "b" * 64,
+                    "nal_payload_sha256": "c" * 64,
+                }
+            )
+        _write_table(path, rows)
+        frame_artifacts.append(_artifact(fixture.root, path))
+
+    calibration_path = (
+        fixture.root
+        / "data/tables/calibrations/bucket=fixture"
+        / f"part-{fixture.recording_id}.parquet"
+    )
+    production_calibrations = []
+    for camera_index, source in enumerate(simple_calibrations):
+        intrinsic = {
+            key: source[key]
+            for key in (
+                "width",
+                "height",
+                "focal_length_x",
+                "focal_length_y",
+                "optical_center_x",
+                "optical_center_y",
+                "skew",
+                "rmse",
+                "distortion_coeffs",
+            )
+        }
+        extrinsic = {
+            key: source[key]
+            for key in ("rotation_vector", "translation_vector")
+        }
+        production_calibrations.append(
+            {
+                "recording_id": fixture.recording_id,
+                "camera": source["camera_name"],
+                "camera_index": camera_index,
+                "message_index": 0,
+                "time_of_day_ns": 10_000_000_000,
+                "time_offset_ns": 0,
+                "intrinsic_json": json.dumps(intrinsic, sort_keys=True),
+                "extrinsic_json": json.dumps(extrinsic, sort_keys=True),
+            }
+        )
+    _write_table(calibration_path, production_calibrations)
+
+    gnss_path = (
+        fixture.root
+        / "data/tables/gnss/bucket=fixture"
+        / f"production-{fixture.recording_id}.parquet"
+    )
+    production_gnss = []
+    for sequence, source in enumerate(simple_gnss):
+        offset = int(source["recording_offset_ns"])
+        fields = {
+            key: value
+            for key, value in source.items()
+            if key not in {"recording_id", "recording_offset_ns"}
+        }
+        production_gnss.append(
+            {
+                "recording_id": fixture.recording_id,
+                "log_time_of_day_ns": 10_000_000_000 + offset,
+                "log_time_offset_ns": offset,
+                "publish_time_of_day_ns": 10_000_000_000 + offset,
+                "publish_time_offset_ns": offset,
+                "channel": "gnss",
+                "schema_hash": "d" * 64,
+                "sequence": sequence,
+                "fields_json": json.dumps(fields, sort_keys=True),
+            }
+        )
+    _write_table(gnss_path, production_gnss)
+
+    artifacts = {
+        "camera_frames": frame_artifacts,
+        "calibration": [_artifact(fixture.root, calibration_path)],
+        "gnss": [_artifact(fixture.root, gnss_path)],
+    }
+    catalog_row["artifact_paths"] = {
+        kind: [item["path"] for item in values] for kind, values in artifacts.items()
+    }
+    catalog_row["artifact_sizes"] = {
+        kind: [item["size"] for item in values] for kind, values in artifacts.items()
+    }
+    catalog_row["artifact_sha256"] = {
+        kind: [item["sha256"] for item in values] for kind, values in artifacts.items()
+    }
+    _write_table(catalog_path, [catalog_row])
+
+    output_path = fixture.root / "data/manifests/output-files.parquet"
+    video_paths = set(catalog_row["video_paths"].values())
+    video_rows = [
+        row
+        for row in pq.ParquetFile(output_path).read().to_pylist()
+        if row["path"] in video_paths
+    ]
+    artifact_rows = [item for values in artifacts.values() for item in values]
+    _write_table(
+        output_path,
+        sorted([*video_rows, *artifact_rows], key=lambda item: str(item["path"])),
+    )
+
+
 def decoded_source_config(
-    revision: str, recording_ids: list[str]
+    revision: str,
+    recording_ids: list[str],
+    *,
+    cameras: list[CameraName] | None = None,
 ) -> DecodedHfSourceConfig:
     return DecodedHfSourceConfig(
         type="decoded_hf",
@@ -287,4 +472,5 @@ def decoded_source_config(
         recordings_path="data/recordings.parquet",
         recording_ids=recording_ids,
         splits=["train"],
+        cameras=list(DEFAULT_DECODED_CAMERAS) if cameras is None else cameras,
     )
