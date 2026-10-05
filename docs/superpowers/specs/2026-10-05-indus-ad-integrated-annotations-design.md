@@ -7,7 +7,7 @@
 **Target repository:** `gagandeepreehal/dataset-devkit`
 
 **Reference dataset:** `gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2`
-at immutable revision `d3cc48b81b5d26f9b295e76fb99a23dcffd8ad3b`
+at immutable revision `fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714`
 
 ## Purpose
 
@@ -36,6 +36,22 @@ declares four Viewer configurations: `videos`, `camera_annotations`, `gnss`, and
 - 1,469 privacy-transformed recording tables for each core sensor-table family;
 - 8,814 camera videos across the six default cameras plus 1,113 optional
   `cam_front_tilted` videos, for 9,927 videos total.
+
+Fresh authenticated reconciliation at the reference revision confirmed that the
+current Viewer marks all 9,927 non-null video cells `face_plate_blurred`; the 356
+remaining tilted-camera cells are genuinely missing. The immutable history shows
+the final receipt-bound V3 payload promotions before commit
+`d3cc48b81b5d26f9b295e76fb99a23dcffd8ad3b` updated the Viewer statuses.
+
+Two legacy files were not regenerated after that completed promotion:
+`data/metadata.jsonl` retains the earlier per-camera status values, and
+`data/manifests/video-privacy-release.json` retains the earlier 7,878/2,049
+counts and an obsolete Viewer SHA-256. They are not authoritative privacy-status
+inputs for `indus_ad_integrated_v1`. The adapter may use `data/metadata.jsonl`
+only for recording/video-path mapping, must ignore its legacy privacy-status
+fields, and must reject attempts to substitute the stale privacy-release manifest
+for the current pinned Viewer contract. This exception is explicit and closed to
+the reference lineage; other cross-file digest inconsistencies still fail closed.
 
 The reference camera annotation Viewer schema contains exact recording/frame
 identity, relative timing, semantic fractions, derived semantic category
@@ -92,7 +108,7 @@ Schema `2.1` adds one source discriminator:
     "type": "indus_ad_hf",
     "contract": "indus_ad_integrated_v1",
     "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
-    "revision": "d3cc48b81b5d26f9b295e76fb99a23dcffd8ad3b",
+    "revision": "fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714",
     "recording_ids": [],
     "splits": ["train"],
     "cameras": [
@@ -349,8 +365,10 @@ Required coverage includes:
 The final quality gate is the full pytest suite, Ruff, strict mypy, generated
 schema equality, `git diff --check`, wheel/sdist build, and fresh-environment
 CLI/import smoke. A separate authenticated metadata-only check against immutable
-revision `d3cc48b81b5d26f9b295e76fb99a23dcffd8ad3b` must validate the remote contract
-and build a selection plan without downloading video or dense payloads.
+revision `fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714` must validate the remote contract,
+confirm 9,927 `face_plate_blurred` Viewer video cells plus 356 genuine missing
+tilted-camera cells, and build a selection plan without downloading video or
+dense payloads.
 
 ## Documentation
 
