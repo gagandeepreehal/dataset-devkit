@@ -8,8 +8,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from PIL import Image
 
 from dataset_devkit.config import DEFAULT_DECODED_CAMERAS, IndusAdHfSourceConfig
 from dataset_devkit.indus_ad_contract import (
@@ -214,8 +216,14 @@ def write_indus_ad_fixture(root: Path) -> IndusAdFixture:
             pa.schema([pa.field("recording_id", pa.string())]),
         )
 
-    semantic_payload = b"semantic-fixture"
-    depth_payload = b"depth-fixture"
+    semantic_buffer = io.BytesIO()
+    Image.fromarray(np.zeros((4, 4), dtype=np.uint8), mode="L").save(
+        semantic_buffer, format="PNG"
+    )
+    semantic_payload = semantic_buffer.getvalue()
+    depth_buffer = io.BytesIO()
+    np.save(depth_buffer, np.zeros((4, 4), dtype=np.float32), allow_pickle=False)
+    depth_payload = depth_buffer.getvalue()
     semantic_shard = "data/annotations/camera/semantic/shard-fixture.tar"
     depth_shard = "data/annotations/camera/depth/shard-fixture.tar"
     semantic_member = f"{recording_id}/cam_front/frame-fixture.png"

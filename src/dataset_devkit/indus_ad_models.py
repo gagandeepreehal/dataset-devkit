@@ -63,6 +63,7 @@ class IndusAdArtifact:
     kind: ArtifactKind
     camera: CameraName | None = None
     sha256: str | None = None
+    frame_count: int | None = None
 
     def __post_init__(self) -> None:
         RepositoryFile(self.path, self.size, self.blob_id, self.sha256)
@@ -70,6 +71,13 @@ class IndusAdArtifact:
             raise ValueError("video artifacts require a camera")
         if self.kind != "video" and self.camera is not None and self.kind != "camera_frames":
             raise ValueError("camera is only valid for video or camera-frame artifacts")
+        if self.frame_count is not None and (
+            self.kind != "video"
+            or not isinstance(self.frame_count, int)
+            or isinstance(self.frame_count, bool)
+            or self.frame_count <= 0
+        ):
+            raise ValueError("frame_count is only valid as a positive video count")
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,8 +104,14 @@ class IndusAdRecordingEntry:
         ):
             raise ValueError("recording videos must have unique cameras")
 
-    def artifacts_of(self, kind: ArtifactKind) -> tuple[IndusAdArtifact, ...]:
+    def artifacts_of(self, kind: str) -> tuple[IndusAdArtifact, ...]:
         return tuple(item for item in self.artifacts if item.kind == kind)
+
+    def artifact(self, kind: str) -> IndusAdArtifact:
+        matches = self.artifacts_of(kind)
+        if len(matches) != 1:
+            raise ValueError(f"recording requires exactly one {kind!r} artifact")
+        return matches[0]
 
 
 @dataclass(frozen=True, slots=True)
