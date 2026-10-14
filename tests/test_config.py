@@ -8,8 +8,10 @@ import pytest
 from pydantic import ValidationError
 
 from dataset_devkit.config import (
+    GLOBAL_CONFIG_ADAPTER,
     DecodedHfSourceConfig,
     GlobalConfigV1,
+    GlobalConfigV21,
     load_config,
     privacy_classification,
 )
@@ -42,6 +44,64 @@ def minimal_decoded_config() -> dict[str, object]:
     del data["huggingface"]
     del data["topics"]
     return data
+
+
+def minimal_indus_ad_config() -> dict[str, object]:
+    data = minimal_config()
+    data["schema_version"] = "2.1"
+    data["source"] = {
+        "type": "indus_ad_hf",
+        "contract": "indus_ad_integrated_v1",
+        "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "recording_ids": [],
+        "splits": ["train"],
+        "cameras": ["cam_front"],
+        "annotation_layers": [
+            "camera_scalar",
+            "semantic_fractions",
+            "depth_summary",
+            "weather",
+        ],
+        "dense_assets": {"semantic": "none", "depth": "none"},
+        "gnss_annotation_source": None,
+    }
+    del data["huggingface"]
+    del data["topics"]
+    return data
+
+
+def test_indus_ad_v21_config_is_explicit_and_privacy_transformed(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path, minimal_indus_ad_config()))
+
+    assert isinstance(config, GlobalConfigV21)
+    assert config.source.type == "indus_ad_hf"
+    assert config.source.contract == "indus_ad_integrated_v1"
+    assert config.source.dense_assets.semantic == "none"
+    assert privacy_classification(config) == "privacy_transformed"
+
+
+@pytest.mark.parametrize("revision", ["main", "A" * 40, "f" * 39])
+def test_indus_ad_v21_rejects_mutable_or_noncanonical_revision(revision: str) -> None:
+    data = minimal_indus_ad_config()
+    data["source"]["revision"] = revision  # type: ignore[index]
+    with pytest.raises(ValidationError):
+        GLOBAL_CONFIG_ADAPTER.validate_python(data)
+
+
+def test_indus_ad_v21_requires_consistent_layers_and_selectors() -> None:
+    mutations: tuple[dict[str, object], ...] = (
+        {"recording_ids": [], "splits": []},
+        {"annotation_layers": ["semantic_fractions"]},
+        {"annotation_layers": ["camera_scalar", "gnss_scenarios"]},
+    )
+    for mutation in mutations:
+        data = minimal_indus_ad_config()
+        source = data["source"]
+        assert isinstance(source, dict)
+        source.update(mutation)
+        with pytest.raises(ValidationError):
+            GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
 
 def minimal_config() -> dict[str, object]:

@@ -15,7 +15,7 @@ from dataset_devkit.config import (
     load_config,
 )
 from dataset_devkit.schema import validate_config_schema_and_runtime
-from test_config import minimal_config, minimal_decoded_config
+from test_config import minimal_config, minimal_decoded_config, minimal_indus_ad_config
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "schema" / "dataset_config.schema.json"
@@ -66,6 +66,10 @@ def test_example_shape_is_valid_under_generated_json_schema() -> None:
 
 def test_decoded_shape_is_valid_under_generated_json_schema() -> None:
     assert not _schema_errors(minimal_decoded_config())
+
+
+def test_indus_ad_shape_is_valid_under_generated_json_schema() -> None:
+    assert not _schema_errors(minimal_indus_ad_config())
 
 
 def test_schema_v2_rejects_mcap_source_that_has_no_runtime_contract() -> None:

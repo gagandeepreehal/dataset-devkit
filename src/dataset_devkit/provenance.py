@@ -186,7 +186,98 @@ class DecodedSourceFingerprint:
         return self.digest
 
 
-type RecordingFingerprint = SourceFingerprint | DecodedSourceFingerprint
+@dataclass(frozen=True)
+class IndusAdSourceFingerprint:
+    repo_id: str
+    revision: str
+    contract: Literal["indus_ad_integrated_v1"]
+    recording_id: str
+    catalog_sha256: str
+    selected_artifacts_sha256: str
+    annotation_schema_sha256: str
+    total_size: int
+    source_type: Literal["indus_ad_hf"] = "indus_ad_hf"
+    privacy_classification: Literal["privacy_transformed"] = "privacy_transformed"
+
+    def __post_init__(self) -> None:
+        invalid = (
+            re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*",
+                self.repo_id,
+            )
+            is None
+            or re.fullmatch(r"[0-9a-f]{40}", self.revision) is None
+            or self.contract != "indus_ad_integrated_v1"
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                for digest in (
+                    self.catalog_sha256,
+                    self.selected_artifacts_sha256,
+                    self.annotation_schema_sha256,
+                )
+            )
+            or not isinstance(self.total_size, int)
+            or isinstance(self.total_size, bool)
+            or self.total_size <= 0
+        )
+        try:
+            validate_safe_segment(self.recording_id)
+        except ValueError:
+            invalid = True
+        if invalid:
+            raise ValueError("invalid INDUS-AD source fingerprint values")
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: object) -> IndusAdSourceFingerprint:
+        expected = {
+            "repo_id",
+            "revision",
+            "contract",
+            "recording_id",
+            "catalog_sha256",
+            "selected_artifacts_sha256",
+            "annotation_schema_sha256",
+            "total_size",
+            "source_type",
+            "privacy_classification",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError("invalid INDUS-AD source fingerprint")
+        if (
+            value.get("source_type") != "indus_ad_hf"
+            or value.get("privacy_classification") != "privacy_transformed"
+            or value.get("contract") != "indus_ad_integrated_v1"
+        ):
+            raise ValueError("invalid INDUS-AD source fingerprint classification")
+        try:
+            return cls(
+                repo_id=cast(str, value["repo_id"]),
+                revision=cast(str, value["revision"]),
+                contract="indus_ad_integrated_v1",
+                recording_id=cast(str, value["recording_id"]),
+                catalog_sha256=cast(str, value["catalog_sha256"]),
+                selected_artifacts_sha256=cast(str, value["selected_artifacts_sha256"]),
+                annotation_schema_sha256=cast(str, value["annotation_schema_sha256"]),
+                total_size=cast(int, value["total_size"]),
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("invalid INDUS-AD source fingerprint values") from error
+
+    @property
+    def digest(self) -> str:
+        return canonical_hash(self.to_dict())
+
+    @property
+    def cache_key(self) -> str:
+        return self.digest
+
+
+type RecordingFingerprint = (
+    SourceFingerprint | DecodedSourceFingerprint | IndusAdSourceFingerprint
+)
 
 
 def fingerprint_to_dict(value: RecordingFingerprint) -> dict[str, object]:
@@ -207,6 +298,8 @@ def fingerprint_from_dict(value: object) -> RecordingFingerprint:
     source_type = value.get("source_type")
     if source_type == "decoded_hf":
         return DecodedSourceFingerprint.from_dict(value)
+    if source_type == "indus_ad_hf":
+        return IndusAdSourceFingerprint.from_dict(value)
     if source_type == "mcap_hf":
         expected = {
             "source_type",

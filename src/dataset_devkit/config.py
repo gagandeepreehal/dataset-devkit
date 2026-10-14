@@ -713,6 +713,14 @@ DecodedModality = Literal[
     "semantic",
     "depth",
 ]
+DenseAssetMode = Literal["none", "selected_frames"]
+IndusAdAnnotationLayer = Literal[
+    "camera_scalar",
+    "semantic_fractions",
+    "depth_summary",
+    "weather",
+    "gnss_scenarios",
+]
 PrivacyClassification = Literal["restricted_raw", "privacy_transformed"]
 
 DEFAULT_DECODED_CAMERAS: tuple[CameraName, ...] = (
@@ -769,7 +777,69 @@ class DecodedHfSourceConfig(HuggingFaceIdentityConfig):
         return self
 
 
-type SourceConfig = McapHfSourceConfig | DecodedHfSourceConfig
+class DenseAssetSelection(StrictModel):
+    semantic: DenseAssetMode = "none"
+    depth: DenseAssetMode = "none"
+
+
+class GnssAnnotationSourceConfig(HuggingFaceIdentityConfig):
+    contract: Literal["indus_ad_gnss_annotations_v1"]
+    expected_source_revision: str
+
+    @field_validator("expected_source_revision")
+    @classmethod
+    def validate_expected_source_revision(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            raise ValueError("expected_source_revision must be a full lowercase commit SHA")
+        return value
+
+
+class IndusAdHfSourceConfig(HuggingFaceIdentityConfig):
+    type: Literal["indus_ad_hf"]
+    contract: Literal["indus_ad_integrated_v1"]
+    recording_ids: list[SafeSegment] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    splits: list[SafeSegment] = Field(
+        default_factory=list, json_schema_extra={"uniqueItems": True}
+    )
+    cameras: list[CameraName] = Field(
+        default_factory=lambda: list(DEFAULT_DECODED_CAMERAS),
+        json_schema_extra={"uniqueItems": True},
+    )
+    annotation_layers: list[IndusAdAnnotationLayer] = Field(
+        json_schema_extra={"uniqueItems": True}
+    )
+    dense_assets: DenseAssetSelection = Field(default_factory=DenseAssetSelection)
+    gnss_annotation_source: GnssAnnotationSourceConfig | None = None
+    privacy_classification: Literal["privacy_transformed"] = "privacy_transformed"
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> IndusAdHfSourceConfig:
+        if not self.recording_ids and not self.splits:
+            raise ValueError("integrated source requires recording_ids or splits")
+        for name, values in (
+            ("cameras", self.cameras),
+            ("recording IDs", self.recording_ids),
+            ("splits", self.splits),
+            ("annotation layers", self.annotation_layers),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"integrated {name} must be unique")
+        camera_derived = {"semantic_fractions", "depth_summary", "weather"}
+        if camera_derived.intersection(self.annotation_layers) and (
+            "camera_scalar" not in self.annotation_layers
+        ):
+            raise ValueError("camera-derived layers require camera_scalar")
+        has_gnss_layer = "gnss_scenarios" in self.annotation_layers
+        if has_gnss_layer != (self.gnss_annotation_source is not None):
+            raise ValueError(
+                "gnss_scenarios and gnss_annotation_source must be configured together"
+            )
+        return self
+
+
+type SourceConfig = McapHfSourceConfig | DecodedHfSourceConfig | IndusAdHfSourceConfig
 
 
 class _GlobalConfigCommon(StrictModel):
@@ -859,7 +929,12 @@ class GlobalConfigV2(_GlobalConfigCommon):
     source: DecodedHfSourceConfig
 
 
-type GlobalConfig = GlobalConfigV1 | GlobalConfigV2
+class GlobalConfigV21(_GlobalConfigCommon):
+    schema_version: Literal["2.1"]
+    source: IndusAdHfSourceConfig
+
+
+type GlobalConfig = GlobalConfigV1 | GlobalConfigV2 | GlobalConfigV21
 
 GLOBAL_CONFIG_ADAPTER: TypeAdapter[GlobalConfig] = TypeAdapter(
     Annotated[GlobalConfig, Field(discriminator="schema_version")]
