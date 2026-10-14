@@ -52,7 +52,7 @@ def minimal_indus_ad_config() -> dict[str, object]:
     data["source"] = {
         "type": "indus_ad_hf",
         "contract": "indus_ad_integrated_v1",
-        "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
+        "repo_id": "gagandeepreehal/indus-ad",
         "revision": "0123456789abcdef0123456789abcdef01234567",
         "recording_ids": [],
         "splits": ["train"],

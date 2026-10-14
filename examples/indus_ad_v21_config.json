@@ -3,8 +3,8 @@
   "source": {
     "type": "indus_ad_hf",
     "contract": "indus_ad_integrated_v1",
-    "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
-    "revision": "fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714",
+    "repo_id": "gagandeepreehal/indus-ad",
+    "revision": "2d46a81376ded440506bd1646c0a5197589ba27b",
     "recording_ids": [],
     "splits": ["train"],
     "cameras": [

@@ -4,10 +4,12 @@
 
 **Date:** 2026-10-05
 
+**Live contract retarget approved:** 2026-10-15
+
 **Target repository:** `gagandeepreehal/dataset-devkit`
 
-**Reference dataset:** `gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2`
-at immutable revision `fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714`
+**Reference dataset:** `gagandeepreehal/indus-ad`
+at immutable revision `2d46a81376ded440506bd1646c0a5197589ba27b`
 
 ## Purpose
 
@@ -25,7 +27,8 @@ always `restricted_raw`; only the decoded integrated source is
 
 ## Verified reference state
 
-The reference dataset revision was resolved on 2026-10-05. Its public metadata
+The reference dataset revision was re-resolved after the repository rename on
+2026-10-15. Its public metadata
 declares four Viewer configurations: `videos`, `camera_annotations`, `gnss`, and
 `semantic_depth`. Its immutable tree contains:
 
@@ -43,15 +46,14 @@ remaining tilted-camera cells are genuinely missing. The immutable history shows
 the final receipt-bound V3 payload promotions before commit
 `d3cc48b81b5d26f9b295e76fb99a23dcffd8ad3b` updated the Viewer statuses.
 
-Two legacy files were not regenerated after that completed promotion:
-`data/metadata.jsonl` retains the earlier per-camera status values, and
-`data/manifests/video-privacy-release.json` retains the earlier 7,878/2,049
-counts and an obsolete Viewer SHA-256. They are not authoritative privacy-status
-inputs for `indus_ad_integrated_v1`. The adapter may use `data/metadata.jsonl`
-only for recording/video-path mapping, must ignore its legacy privacy-status
-fields, and must reject attempts to substitute the stale privacy-release manifest
-for the current pinned Viewer contract. This exception is explicit and closed to
-the reference lineage; other cross-file digest inconsistencies still fail closed.
+Commit `0229c5d2837dbc2d701e0df3a7485ba13e8365a9` repaired the release control
+plane after the repository became `gagandeepreehal/indus-ad`. At the pinned
+reference revision, `data/metadata.jsonl`, the videos Viewer, and
+`data/manifests/video-privacy-release.json` now agree on 9,927 blurred videos and
+356 missing tilted-camera slots. The manifest binds exact byte counts and
+SHA-256 values for metadata, video integrity, and the Viewer. The adapter must
+validate this agreement and every advertised digest; no file is permitted to
+override a disagreement in another control.
 
 The reference camera annotation Viewer schema contains exact recording/frame
 identity, relative timing, semantic fractions, derived semantic category
@@ -107,8 +109,8 @@ Schema `2.1` adds one source discriminator:
   "source": {
     "type": "indus_ad_hf",
     "contract": "indus_ad_integrated_v1",
-    "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
-    "revision": "fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714",
+    "repo_id": "gagandeepreehal/indus-ad",
+    "revision": "2d46a81376ded440506bd1646c0a5197589ba27b",
     "recording_ids": [],
     "splits": ["train"],
     "cameras": [
@@ -365,7 +367,7 @@ Required coverage includes:
 The final quality gate is the full pytest suite, Ruff, strict mypy, generated
 schema equality, `git diff --check`, wheel/sdist build, and fresh-environment
 CLI/import smoke. A separate authenticated metadata-only check against immutable
-revision `fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714` must validate the remote contract,
+revision `2d46a81376ded440506bd1646c0a5197589ba27b` must validate the remote contract,
 confirm 9,927 `face_plate_blurred` Viewer video cells plus 356 genuine missing
 tilted-camera cells, and build a selection plan without downloading video or
 dense payloads.

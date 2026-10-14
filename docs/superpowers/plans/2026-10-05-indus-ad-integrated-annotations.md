@@ -15,9 +15,9 @@
 - Preserve schema `1.0` `mcap_hf` as `restricted_raw`; decoding MCAP is never described as anonymization.
 - Preserve schema `2.0` `decoded_hf` behavior and exported bytes.
 - Schema `2.1` accepts only `source.type = "indus_ad_hf"`, `contract = "indus_ad_integrated_v1"`, and an exact lowercase 40-character revision.
-- The reference revision is `fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714`.
+- The reference revision is `2d46a81376ded440506bd1646c0a5197589ba27b`.
 - The pinned Viewer is authoritative for V3 video status: 9,927 non-null `face_plate_blurred` cells and 356 genuine missing tilted-camera cells.
-- Ignore privacy-status values in legacy `data/metadata.jsonl`; never use stale `data/manifests/video-privacy-release.json` to override the pinned V3 Viewer.
+- Require `data/metadata.jsonl`, the pinned videos Viewer, and `data/manifests/video-privacy-release.json` to agree on privacy status and exact control-file digests.
 - Build poses, trajectories, speed, distance, curvature, filtering, and scene selection only from precise per-recording `local_enu` and recording-relative nanoseconds.
 - Join camera annotations exactly; no basename, date, coordinate, or fuzzy-time matching.
 - Keep semantic, depth, weather, and GNSS-derived values visibly classified as machine-generated weak pseudo-labels.
@@ -203,14 +203,14 @@ data/manifests/video-integrity.jsonl
 data/manifests/video-privacy-release.json
 ```
 
-The Viewer video fixture must contain six non-null `face_plate_blurred` video cells, one missing tilted cell, and no embedded video bytes. Deliberately retain stale mixed status values in fixture `metadata.jsonl` and the old privacy-release manifest so tests prove they cannot override the current Viewer.
+The Viewer video fixture must contain six non-null `face_plate_blurred` video cells, one missing tilted cell, and no embedded video bytes. Its metadata, integrity rows, and privacy-release manifest must match the repaired live control plane and bind exact hashes.
 
 - [ ] **Step 2: Write failing catalog and privacy-authority tests**
 
-Add tests for exact selection and the known legacy exception:
+Add tests for exact selection and cross-control agreement:
 
 ```python
-def test_contract_uses_pinned_viewer_not_stale_legacy_status(tmp_path: Path) -> None:
+def test_contract_requires_repaired_privacy_controls_to_agree(tmp_path: Path) -> None:
     fixture = write_indus_ad_fixture(tmp_path)
     plan = parse_indus_ad_contract(fixture.root, fixture.source, fixture.tree)
 
@@ -226,7 +226,7 @@ def test_contract_rejects_one_nonnull_viewer_cell_not_marked_blurred(tmp_path: P
         parse_indus_ad_contract(fixture.root, fixture.source, fixture.tree)
 ```
 
-Also cover duplicate recording IDs, missing video paths, unknown path families, tree size disagreement, unexpected Viewer columns/types, unsafe/date-bearing paths, absent selected cameras, unmatched selectors, and stale-manifest substitution.
+Also cover duplicate recording IDs, missing video paths, unknown path families, tree size disagreement, unexpected Viewer columns/types, unsafe/date-bearing paths, absent selected cameras, unmatched selectors, and manifest/status/digest disagreement.
 
 - [ ] **Step 3: Run the contract tests and verify failure**
 
@@ -280,9 +280,9 @@ Freeze mappings with `MappingProxyType` and validate every safe segment, path, s
 
 - [ ] **Step 5: Implement `parse_indus_ad_contract`**
 
-Use exact Arrow schemas for the live video Viewer, camera annotation Viewer, and dense index. Normalize `metadata.jsonl` video paths by prefixing `data/`, but discard every `*_video_privacy_status` value from that file. Require every non-null Viewer video cell to have `face_plate_blurred`, require missing tilted cells to have status `missing`, bind every path/size/blob ID to the supplied pinned tree, and derive table paths by exact recording suffix plus one-and-only-one matching path per required family.
+Use exact Arrow schemas for the live video Viewer, camera annotation Viewer, and dense index. Normalize `metadata.jsonl` video paths by prefixing `data/`. Require every non-null Viewer and metadata video cell to have `face_plate_blurred`, require missing tilted cells to have status `missing`, verify the privacy manifest's counts and control-file SHA-256 values, bind every path/size/blob ID to the supplied pinned tree, and derive table paths by exact recording suffix plus one-and-only-one matching path per required family.
 
-Compute `annotation_schema_sha256` from canonical Arrow field/type/nullability descriptions. Build recording fingerprints from canonical catalog rows and the sorted selected artifact identity set. Reject the legacy manifest as a privacy authority; its values may be reported as non-authoritative audit context only.
+Compute `annotation_schema_sha256` from canonical Arrow field/type/nullability descriptions. Build recording fingerprints from canonical catalog rows and the sorted selected artifact identity set. Treat the repaired privacy manifest as an integrity binding, not as permission to overlook Viewer or metadata disagreement.
 
 - [ ] **Step 6: Run tests and commit the contract adapter**
 
@@ -614,8 +614,8 @@ Emit exact keys:
 {
   "schema_version": 1,
   "contract": "indus_ad_integrated_v1",
-  "source_repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
-  "source_revision": "fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714",
+  "source_repo_id": "gagandeepreehal/indus-ad",
+  "source_revision": "2d46a81376ded440506bd1646c0a5197589ba27b",
   "annotation_schema_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "selected_layers": [],
   "camera_rows": 0,
@@ -758,21 +758,21 @@ It must fail if any `.mp4`, `.tar`, semantic payload, depth payload, or per-reco
 
 ```bash
 .venv/bin/python tools/check_indus_ad_contract.py \
-  --repo-id gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2 \
-  --revision fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714
+  --repo-id gagandeepreehal/indus-ad \
+  --revision 2d46a81376ded440506bd1646c0a5197589ba27b
 ```
 
 Expected counts: 1,469 recordings, 9,927 videos, 9,927 `face_plate_blurred`, 356 missing tilted-camera slots, and 34,306 camera annotation rows.
 
 - [ ] **Step 4: Document exact usage and caveats**
 
-Document the schema `2.1` example, pinned revision requirement, current Viewer authority, stale legacy status exception, six default/one optional cameras, exact join keys, metadata-only dense default, optional GNSS companion, SDK calls, and extension paths. State explicitly that model-generated annotations are weak pseudo-labels, all current non-null V3 videos are marked blurred, residual privacy risk remains, and raw MCAP is restricted/non-anonymized.
+Document the schema `2.1` example, pinned revision requirement, repaired cross-control privacy agreement, six default/one optional cameras, exact join keys, metadata-only dense default, optional GNSS companion, SDK calls, and extension paths. State explicitly that model-generated annotations are weak pseudo-labels, all current non-null V3 videos are marked blurred, residual privacy risk remains, and raw MCAP is restricted/non-anonymized.
 
 - [ ] **Step 5: Run docs/API tests and authenticated live gate**
 
 ```bash
 .venv/bin/pytest tests/test_public_api.py tests/test_examples.py tests/test_indus_ad_live_check.py -q
-.venv/bin/python tools/check_indus_ad_contract.py --repo-id gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2 --revision fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714
+.venv/bin/python tools/check_indus_ad_contract.py --repo-id gagandeepreehal/indus-ad --revision 2d46a81376ded440506bd1646c0a5197589ba27b
 ```
 
 Expected: tests PASS; live checker reports the exact reference counts and downloads no production payload.
@@ -854,8 +854,8 @@ Expected: wheel and sdist build; CLI help and imports succeed. Use a fresh tempo
 
 ```bash
 .venv/bin/python tools/check_indus_ad_contract.py \
-  --repo-id gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2 \
-  --revision fa8ca03be1c2dfc1b9ef09a0208a82682ecf9714
+  --repo-id gagandeepreehal/indus-ad \
+  --revision 2d46a81376ded440506bd1646c0a5197589ba27b
 ```
 
 Expected: exact reference counts, current schema digest, no payload downloads, and exit `0`. This establishes metadata compatibility only; it does not re-run anonymization or download the corpus.
@@ -879,7 +879,7 @@ If no acceptance fixes were required, do not create an empty commit. Confirm tha
 
 - [ ] Every selected source revision and optional companion revision is immutable.
 - [ ] All 9,927 current non-null Viewer video cells validate as `face_plate_blurred`; 356 tilted cells validate as missing.
-- [ ] Legacy stale status fields cannot override the V3 Viewer contract.
+- [ ] Metadata, Viewer, integrity rows, and privacy-manifest counts/digests agree exactly.
 - [ ] Annotation rows join exactly to selected source/output identities.
 - [ ] Dense archives remain untouched unless `selected_frames` is configured.
 - [ ] Dense extraction passes adversarial archive tests and content verification.
