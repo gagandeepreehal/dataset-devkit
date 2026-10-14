@@ -13,7 +13,11 @@ from typing import cast
 
 import pyarrow.parquet as pq
 
-from dataset_devkit.config import DenseAssetSelection, IndusAdHfSourceConfig
+from dataset_devkit.config import (
+    DenseAssetSelection,
+    GlobalConfigV21,
+    IndusAdHfSourceConfig,
+)
 from dataset_devkit.huggingface_acquisition import (
     AcquisitionError,
     DownloadFile,
@@ -118,9 +122,7 @@ class AcquiredIndusAdRecording:
     files: Mapping[str, Path]
     annotations: IndusAdAnnotationBundle
     dense_mode: DenseAssetSelection
-    materialize_dense_assets: Callable[
-        [frozenset[str]], tuple[MaterializedDenseAsset, ...]
-    ]
+    materialize_dense_assets: Callable[[frozenset[str]], tuple[MaterializedDenseAsset, ...]]
 
     def path(self, repo_path: str) -> Path:
         try:
@@ -153,6 +155,12 @@ class IndusAdHfAcquirer:
         self._control_files: dict[str, Path] = {}
         self._annotations = IndusAdAnnotationBundle()
 
+    @classmethod
+    def from_config(cls, config: GlobalConfigV21) -> IndusAdHfAcquirer:
+        if not isinstance(config.source, IndusAdHfSourceConfig):
+            raise AcquisitionError("INDUS-AD acquirer requires an indus_ad_hf source")
+        return cls(source=config.source, cache_dir=config.paths.cache_dir)
+
     def _acquire_one(self, identity: RepositoryFile, namespace: str) -> Path:
         cache_identity = canonical_hash(
             {
@@ -169,9 +177,7 @@ class IndusAdHfAcquirer:
         receipt = directory / "receipt.json"
         with _recording_lock(directory):
             if final.exists():
-                digest = _verify_tree_file(
-                    path=final, local_root=directory, identity=identity
-                )
+                digest = _verify_tree_file(path=final, local_root=directory, identity=identity)
                 if not receipt.exists():
                     _atomic_write(
                         receipt,
@@ -195,9 +201,7 @@ class IndusAdHfAcquirer:
             )
             digest = _verify_tree_file(path=returned, local_root=scratch, identity=identity)
             os.replace(returned, final)
-            promoted = _verify_tree_file(
-                path=final, local_root=directory, identity=identity
-            )
+            promoted = _verify_tree_file(path=final, local_root=directory, identity=identity)
             if promoted != digest:
                 raise IntegrityError("promoted INDUS-AD artifact changed identity")
             _atomic_write(
@@ -221,8 +225,7 @@ class IndusAdHfAcquirer:
         dense_indexes = sorted(
             path
             for path in self._tree
-            if path.startswith("data/annotations/camera/dense-index/")
-            and path.endswith(".parquet")
+            if path.startswith("data/annotations/camera/dense-index/") and path.endswith(".parquet")
         )
         controls = [
             METADATA_PATH,
@@ -240,9 +243,7 @@ class IndusAdHfAcquirer:
         root = _ensure_beneath(
             self.cache_dir,
             "indus-ad-control-view",
-            canonical_hash(
-                {"repo_id": self.source.repo_id, "revision": self.source.revision}
-            ),
+            canonical_hash({"repo_id": self.source.repo_id, "revision": self.source.revision}),
         )
         for repo_path, cached in self._control_files.items():
             destination = root / repo_path
@@ -250,9 +251,9 @@ class IndusAdHfAcquirer:
             if not destination.exists():
                 shutil.copyfile(cached, destination)
         self._plan = parse_indus_ad_contract(root, self.source, tree)
-        annotation_table = pq.ParquetFile(
-            self._control_files[CAMERA_ANNOTATION_VIEWER_PATH]
-        ).read(columns=["recording_id", "recording_offset_ns"])
+        annotation_table = pq.ParquetFile(self._control_files[CAMERA_ANNOTATION_VIEWER_PATH]).read(
+            columns=["recording_id", "recording_offset_ns"]
+        )
         durations: dict[str, int] = {}
         for row in annotation_table.to_pylist():
             recording_id = cast(str, row["recording_id"])
@@ -295,20 +296,15 @@ class IndusAdHfAcquirer:
         acquired_entry = replace(
             entry,
             videos=tuple(
-                replace(video, frame_count=counts.get(video.camera))
-                for video in entry.videos
+                replace(video, frame_count=counts.get(video.camera)) for video in entry.videos
             ),
         )
         annotations = IndusAdAnnotationBundle(
             camera=tuple(
-                item
-                for item in self._annotations.camera
-                if item.recording_id == entry.recording_id
+                item for item in self._annotations.camera if item.recording_id == entry.recording_id
             ),
             gnss=tuple(
-                item
-                for item in self._annotations.gnss
-                if item.recording_id == entry.recording_id
+                item for item in self._annotations.gnss if item.recording_id == entry.recording_id
             ),
             dense_refs=tuple(
                 item
@@ -335,9 +331,7 @@ class IndusAdHfAcquirer:
             if not selected_refs:
                 return ()
             archive_paths = {
-                shard_path: self._acquire_one(
-                    self._tree[shard_path], "indus-ad-dense-archive"
-                )
+                shard_path: self._acquire_one(self._tree[shard_path], "indus-ad-dense-archive")
                 for shard_path in sorted({ref.shard_path for ref in selected_refs})
             }
             return materialize_selected_dense_assets(
