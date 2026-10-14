@@ -77,7 +77,7 @@ def _camera_annotation_row(recording_id: str) -> dict[str, object]:
         "window_id": "window-fixture",
         "decoded_width": 4,
         "decoded_height": 4,
-        "semantic_fractions": [{"class_id": 1, "fraction": 1.0}],
+        "semantic_fractions": [{"class_id": 13, "fraction": 0.25}],
         "weather_label": "clear",
         "weather_uncertain": False,
     }
@@ -111,6 +111,15 @@ def _camera_annotation_row(recording_id: str) -> dict[str, object]:
         "overexposed_fraction",
     ):
         row[name] = 0.5
+    row["weather_clear_probability"] = 1.0
+    for name in (
+        "weather_overcast_probability",
+        "weather_rain_probability",
+        "weather_fog_probability",
+        "weather_low_light_probability",
+        "weather_uncertain_mixed_probability",
+    ):
+        row[name] = 0.0
     return row
 
 
