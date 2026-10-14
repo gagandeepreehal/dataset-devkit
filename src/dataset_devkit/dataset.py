@@ -49,7 +49,7 @@ def _validated_source_metadata(value: object) -> JsonRecord:
     source_type = value.get("source_type")
     expected = (
         ("privacy_transformed", "recording_local_enu_v1", 1.0)
-        if source_type == "decoded_hf"
+        if source_type in {"decoded_hf", "indus_ad_hf"}
         else ("restricted_raw", "web_mercator_v1", None)
         if source_type == "mcap_hf"
         else None
@@ -64,17 +64,11 @@ def _validated_source_metadata(value: object) -> JsonRecord:
     return cast(JsonRecord, value)
 
 
-def _safe_asset_filename(
-    value: object, *, directory: str, part_count: int, label: str
-) -> str:
+def _safe_asset_filename(value: object, *, directory: str, part_count: int, label: str) -> str:
     if not isinstance(value, str):
         raise DatasetFormatError(f"{label} filename must be a string")
     path = PurePosixPath(value)
-    if (
-        path.is_absolute()
-        or len(path.parts) != part_count
-        or path.parts[0] != directory
-    ):
+    if path.is_absolute() or len(path.parts) != part_count or path.parts[0] != directory:
         raise DatasetFormatError(f"unsafe {label} filename")
     try:
         for part in path.parts:
@@ -143,29 +137,21 @@ class Dataset:
             indexes[name] = MappingProxyType(index)
         camera_index: dict[tuple[str, str], str] = {}
         for calibration in tables["calibrated_sensor"]:
-            sensor_token = _required_string(
-                calibration, "sensor_token", "calibrated_sensor"
-            )
+            sensor_token = _required_string(calibration, "sensor_token", "calibrated_sensor")
             if sensor_token not in indexes["sensor"]:
                 raise DatasetFormatError("calibrated_sensor references a missing sensor")
         for item in tables["sample_data"]:
             sample_token = _required_string(item, "sample_token", "sample_data")
-            calibration_token = _required_string(
-                item, "calibrated_sensor_token", "sample_data"
-            )
+            calibration_token = _required_string(item, "calibrated_sensor_token", "sample_data")
             ego_pose_token = _required_string(item, "ego_pose_token", "sample_data")
             if sample_token not in indexes["sample"]:
                 raise DatasetFormatError("sample_data references a missing sample")
             if calibration_token not in indexes["calibrated_sensor"]:
-                raise DatasetFormatError(
-                    "sample_data references a missing calibrated_sensor"
-                )
+                raise DatasetFormatError("sample_data references a missing calibrated_sensor")
             if ego_pose_token not in indexes["ego_pose"]:
                 raise DatasetFormatError("sample_data references a missing ego_pose")
             calibration = indexes["calibrated_sensor"][calibration_token]
-            sensor_token = _required_string(
-                calibration, "sensor_token", "calibrated_sensor"
-            )
+            sensor_token = _required_string(calibration, "sensor_token", "calibrated_sensor")
             sensor = indexes["sensor"][sensor_token]
             channel = _required_string(sensor, "channel", "sensor")
             if not channel.startswith("CAM_"):
@@ -189,7 +175,12 @@ class Dataset:
             "pipeline_audit",
         ):
             extensions[name] = _load_json(root / "mz_extensions" / f"{name}.json")
-        _validated_source_metadata(extensions["source"])
+        source_metadata = _validated_source_metadata(extensions["source"])
+        if source_metadata["source_type"] == "indus_ad_hf":
+            for name in ("camera", "gnss_scenarios", "dense_assets", "join_audit"):
+                extensions[f"indus_ad/{name}"] = _load_json(
+                    root / "mz_extensions" / "indus_ad" / f"{name}.json"
+                )
         object.__setattr__(self, "_tables", MappingProxyType(tables))
         object.__setattr__(self, "_token_index", MappingProxyType(indexes))
         object.__setattr__(self, "_extensions", MappingProxyType(extensions))
@@ -498,3 +489,62 @@ class Dataset:
         if not isinstance(value, dict):
             raise DatasetFormatError("pipeline audit extension is malformed")
         return deepcopy(cast(JsonRecord, value))
+
+    def indus_ad_annotations(
+        self,
+        layer: str,
+        *,
+        scene_token: str | None = None,
+        sample_data_token: str | None = None,
+    ) -> tuple[JsonRecord, ...]:
+        """Return selected weak pseudo-label rows from one integrated layer."""
+        if layer not in {"camera", "gnss_scenarios", "dense_assets"}:
+            raise DatasetFormatError("unknown INDUS-AD annotation layer")
+        value = self._extensions.get(f"indus_ad/{layer}")
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != 1
+            or value.get("label_kind") != "weak_pseudo_label"
+            or not isinstance(value.get("rows"), list)
+            or any(not isinstance(item, dict) for item in value["rows"])
+        ):
+            raise DatasetFormatError("INDUS-AD annotation extension is unavailable or malformed")
+        rows = cast(list[JsonRecord], value["rows"])
+        selected = [
+            item
+            for item in rows
+            if (scene_token is None or item.get("scene_token") == scene_token)
+            and (sample_data_token is None or item.get("sample_data_token") == sample_data_token)
+        ]
+        return deepcopy(tuple(selected))
+
+    def indus_ad_join_audit(self) -> tuple[JsonRecord, ...]:
+        """Return per-recording integrated annotation join counts."""
+        value = self._extensions.get("indus_ad/join_audit")
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != 1
+            or not isinstance(value.get("recordings"), list)
+            or any(not isinstance(item, dict) for item in value["recordings"])
+        ):
+            raise DatasetFormatError("INDUS-AD join audit is unavailable or malformed")
+        return deepcopy(cast(tuple[JsonRecord, ...], tuple(value["recordings"])))
+
+    def indus_ad_dense_asset(self, row: Mapping[str, object]) -> Path | None:
+        """Resolve a materialized dense asset while containing it to the dataroot."""
+        value = row.get("asset_path")
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise DatasetFormatError("INDUS-AD dense asset path is malformed")
+        relative = PurePosixPath(value)
+        if (
+            relative.is_absolute()
+            or relative.parts[:3] != ("mz_extensions", "indus_ad", "assets")
+            or ".." in relative.parts
+        ):
+            raise DatasetFormatError("INDUS-AD dense asset path is unsafe")
+        path = cast(Path, self.dataroot).joinpath(*relative.parts)
+        if not path.is_file():
+            raise DatasetFormatError("INDUS-AD dense asset is missing")
+        return path

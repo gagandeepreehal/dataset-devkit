@@ -21,6 +21,8 @@ from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import CameraCalibration, EgoPose, StagedImage
 from dataset_devkit.features import SceneFeatures
 from dataset_devkit.identifiers import validate_safe_segment
+from dataset_devkit.indus_ad_export import build_indus_ad_export
+from dataset_devkit.indus_ad_join import JoinedIndusAdAnnotations
 from dataset_devkit.provenance import (
     RecordingFingerprint,
     canonical_hash,
@@ -56,9 +58,7 @@ OFFICIAL_TABLES = (
     "sample_annotation",
     "map",
 )
-_EMPTY_TABLES = frozenset(
-    {"category", "attribute", "visibility", "instance", "sample_annotation"}
-)
+_EMPTY_TABLES = frozenset({"category", "attribute", "visibility", "instance", "sample_annotation"})
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
@@ -119,14 +119,10 @@ class _SafeDatarootWriter:
                 raise ValueError("staging writer root differs from staging lease")
             lease.assert_bound()
             self._root_fd = lease.duplicate_root_fd()
-            check_fd, self._chain_identities = _open_absolute_directory(
-                self.root, create=False
-            )
+            check_fd, self._chain_identities = _open_absolute_directory(self.root, create=False)
             os.close(check_fd)
         else:
-            self._root_fd, self._chain_identities = _open_absolute_directory(
-                self.root, create=True
-            )
+            self._root_fd, self._chain_identities = _open_absolute_directory(self.root, create=True)
         self._closed = False
         try:
             has_entries = bool(os.listdir(self._root_fd))
@@ -236,13 +232,9 @@ class _SafeDatarootWriter:
                 child_fd: int | None = None
                 try:
                     child_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=directory_fd)
-                    listed = os.stat(
-                        component, dir_fd=directory_fd, follow_symlinks=False
-                    )
+                    listed = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
                     opened = os.fstat(child_fd)
-                    if not stat.S_ISDIR(listed.st_mode) or _identity(listed) != _identity(
-                        opened
-                    ):
+                    if not stat.S_ISDIR(listed.st_mode) or _identity(listed) != _identity(opened):
                         raise ValueError("output directory identity changed")
                 except OSError as error:
                     if child_fd is not None:
@@ -292,9 +284,7 @@ class _SafeDatarootWriter:
             os.close(file_fd)
             file_fd = None
             try:
-                read_fd = os.open(
-                    filename, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd
-                )
+                read_fd = os.open(filename, os.O_RDONLY | _FILE_NOFOLLOW, dir_fd=directory_fd)
             except OSError as error:
                 raise ValueError("exported file changed before verification") from error
             try:
@@ -340,6 +330,7 @@ class ExportEvidence:
     privacy_classification: str = "restricted_raw"
     pose_frame: str = "web_mercator_v1"
     global_horizontal_resolution_m: float | None = None
+    indus_ad_annotations: JoinedIndusAdAnnotations = JoinedIndusAdAnnotations()
 
 
 @dataclass(frozen=True)
@@ -360,9 +351,7 @@ class _ExportIndex:
     samples_by_scene: Mapping[tuple[str, str], tuple[SampleRecord, ...]]
     sample_data_by_scene: Mapping[tuple[str, str], tuple[SampleDataRecord, ...]]
     sample_data_by_sample: Mapping[str, tuple[SampleDataRecord, ...]]
-    sample_data_by_scene_channel: Mapping[
-        tuple[str, str, str], tuple[SampleDataRecord, ...]
-    ]
+    sample_data_by_scene_channel: Mapping[tuple[str, str, str], tuple[SampleDataRecord, ...]]
     channels_by_scene: Mapping[tuple[str, str], tuple[str, ...]]
 
 
@@ -402,9 +391,9 @@ def _build_export_index(graphs: Sequence[RecordingSceneResult]) -> _ExportIndex:
     samples_by_scene_lists: dict[tuple[str, str], list[SampleRecord]] = defaultdict(list)
     data_by_scene_lists: dict[tuple[str, str], list[SampleDataRecord]] = defaultdict(list)
     data_by_sample_lists: dict[str, list[SampleDataRecord]] = defaultdict(list)
-    data_by_scene_channel_lists: dict[
-        tuple[str, str, str], list[SampleDataRecord]
-    ] = defaultdict(list)
+    data_by_scene_channel_lists: dict[tuple[str, str, str], list[SampleDataRecord]] = defaultdict(
+        list
+    )
     sample_tokens: set[str] = set()
     sample_data_tokens: set[str] = set()
     for graph in graphs:
@@ -428,17 +417,13 @@ def _build_export_index(graphs: Sequence[RecordingSceneResult]) -> _ExportIndex:
             sample_data_tokens.add(item.token)
             data_by_scene_lists[(digest, item.scene_token)].append(item)
             data_by_sample_lists[item.sample_token].append(item)
-            data_by_scene_channel_lists[(digest, item.scene_token, item.channel)].append(
-                item
-            )
+            data_by_scene_channel_lists[(digest, item.scene_token, item.channel)].append(item)
     samples_by_scene = {
         key: tuple(sorted(values, key=lambda item: (item.timestamp_ns, item.token)))
         for key, values in samples_by_scene_lists.items()
     }
     data_by_scene = {
-        key: tuple(
-            sorted(values, key=lambda item: (item.channel, item.timestamp_ns, item.token))
-        )
+        key: tuple(sorted(values, key=lambda item: (item.channel, item.timestamp_ns, item.token)))
         for key, values in data_by_scene_lists.items()
     }
     return _ExportIndex(
@@ -514,8 +499,7 @@ def _logical_audit_payload(
             for sample in item.samples
         ],
         "observations": [
-            _validity_observation_payload(observation)
-            for observation in item.observations
+            _validity_observation_payload(observation) for observation in item.observations
         ],
         "valid": item.valid,
         "final_candidate": final_candidate,
@@ -528,8 +512,7 @@ def _recording_validity_payload(
     report: ValidityReport,
 ) -> dict[str, object]:
     final_ids = {
-        (item.grid_target_timestamp_ns, item.batch_timestamp_ns)
-        for item in report.final_candidates
+        (item.grid_target_timestamp_ns, item.batch_timestamp_ns) for item in report.final_candidates
     }
     audit_only_ids = {
         (item.grid_target_timestamp_ns, item.batch_timestamp_ns)
@@ -540,9 +523,7 @@ def _recording_validity_payload(
         "source_path": str(report.source_path),
         "policy": report.invalid_sample_policy,
         "valid": report.valid,
-        "observations": [
-            _validity_observation_payload(item) for item in report.observations
-        ],
+        "observations": [_validity_observation_payload(item) for item in report.observations],
         "grid_audits": [
             {
                 "grid_target_timestamp_ns": item.grid_target_timestamp_ns,
@@ -552,8 +533,7 @@ def _recording_validity_payload(
                     for name, timestamp in item.camera_timestamps
                 ],
                 "observations": [
-                    _validity_observation_payload(observation)
-                    for observation in item.observations
+                    _validity_observation_payload(observation) for observation in item.observations
                 ],
                 "valid": item.valid,
             }
@@ -729,9 +709,7 @@ def preflight_recording_export(graph: RecordingSceneResult) -> None:
             samples = index.samples_by_scene.get(identity, ())
             if len(samples) != scene.nbr_samples or not samples:
                 raise ValueError("scene sample count differs during export preflight")
-            _assert_converted_chain(
-                [item.timestamp_ns for item in samples], "sample chain"
-            )
+            _assert_converted_chain([item.timestamp_ns for item in samples], "sample chain")
             for channel in index.channels_by_scene.get(identity, ()):
                 normalized = _normalized_channel(channel)
                 previous = normalized_channels.setdefault(normalized, channel)
@@ -773,9 +751,7 @@ def _compatibility_mask() -> bytes:
     return stream.getvalue()
 
 
-def _copy_image(
-    writer: _SafeDatarootWriter, relative: str, staged: StagedImage
-) -> str:
+def _copy_image(writer: _SafeDatarootWriter, relative: str, staged: StagedImage) -> str:
     parts = relative.split("/")
     if len(parts) != 3 or parts[0] != "samples":
         raise ValueError("unsafe exported image filename")
@@ -813,9 +789,7 @@ def _validate_boundary(evidence: ExportEvidence) -> None:
     )
     for graph in evidence.graphs:
         validate_scene_graph(graph)
-    selected = {
-        (item.scene_token, item.source_digest) for item in evidence.split.assignments
-    }
+    selected = {(item.scene_token, item.source_digest) for item in evidence.split.assignments}
     feature_selected = {
         (item.scene_token, item.source.digest) for item in evidence.selection.selected_scenes
     }
@@ -832,8 +806,7 @@ def _validate_boundary(evidence: ExportEvidence) -> None:
         len(validity_by_source) != len(evidence.validity_reports)
         or set(validity_by_source) != graph_sources
         or any(
-            validity_by_source[graph.source.digest][0] != graph.source
-            for graph in evidence.graphs
+            validity_by_source[graph.source.digest][0] != graph.source for graph in evidence.graphs
         )
     ):
         raise ValueError("validity evidence coverage differs from exported recordings")
@@ -848,9 +821,7 @@ def _validate_boundary(evidence: ExportEvidence) -> None:
 def _selected_records(
     evidence: ExportEvidence,
 ) -> tuple[tuple[tuple[RecordingSceneResult, SceneRecord], ...], _ExportIndex]:
-    selected = {
-        (item.scene_token, item.source_digest) for item in evidence.split.assignments
-    }
+    selected = {(item.scene_token, item.source_digest) for item in evidence.split.assignments}
     index = _build_export_index(evidence.graphs)
     scenes = [
         (index.graphs_by_source[source_digest], scene)
@@ -868,21 +839,17 @@ def _selected_records(
 def _assert_converted_chain(timestamps_ns: Sequence[int], label: str) -> None:
     converted = tuple(_microseconds(value) for value in timestamps_ns)
     if any(
-        current <= previous
-        for previous, current in zip(converted, converted[1:], strict=False)
+        current <= previous for previous, current in zip(converted, converted[1:], strict=False)
     ):
         raise ValueError(f"{label} has a microsecond conversion collision or order hazard")
 
 
-def _export_into(
-    writer: _SafeDatarootWriter, evidence: ExportEvidence
-) -> ExportResult:
+def _export_into(writer: _SafeDatarootWriter, evidence: ExportEvidence) -> ExportResult:
     root = writer.root
     namespace = evidence.resolved_config.scenes.dataset_namespace
     selected_scenes, export_index = _selected_records(evidence)
     feature_by_identity = {
-        (item.scene_token, item.source.digest): item
-        for item in evidence.selection.selected_scenes
+        (item.scene_token, item.source.digest): item for item in evidence.selection.selected_scenes
     }
 
     selected_channels_by_source: dict[str, set[str]] = defaultdict(set)
@@ -967,9 +934,7 @@ def _export_into(
                     "timestamp": _microseconds(sample.timestamp_ns),
                     "prev": scene_samples[index - 1].token if index else "",
                     "next": (
-                        scene_samples[index + 1].token
-                        if index + 1 < len(scene_samples)
-                        else ""
+                        scene_samples[index + 1].token if index + 1 < len(scene_samples) else ""
                     ),
                     "scene_token": scene.token,
                 }
@@ -1060,8 +1025,7 @@ def _export_into(
                         "after": _jsonable(interpolation.after),
                         "pose_frame": interpolation.pose_frame or evidence.pose_frame,
                         "translation_xyz_m": _jsonable(
-                            interpolation.translation_xyz_m
-                            or item.ego_pose.translation_xyz_m
+                            interpolation.translation_xyz_m or item.ego_pose.translation_xyz_m
                         ),
                         "published_east_m": interpolation.published_east_m,
                         "published_north_m": interpolation.published_north_m,
@@ -1177,9 +1141,7 @@ def _export_into(
         token for _, scene in selected_scenes for token in scene.annotation_refs
     }
     selected_window_tokens = {
-        scene.annotation_window_ref
-        for _, scene in selected_scenes
-        if scene.annotation_window_ref
+        scene.annotation_window_ref for _, scene in selected_scenes if scene.annotation_window_ref
     }
     annotation_payload = {
         "scenes": annotation_scene_refs,
@@ -1209,9 +1171,7 @@ def _export_into(
         "schema_version": 2,
         "recordings": [
             _recording_validity_payload(source, report)
-            for source, report in sorted(
-                evidence.validity_reports, key=lambda item: item[0].digest
-            )
+            for source, report in sorted(evidence.validity_reports, key=lambda item: item[0].digest)
         ],
         "scenes": validity_extension,
     }
@@ -1256,15 +1216,43 @@ def _export_into(
             "rule_audits": _jsonable(evidence.selection.rule_audits),
             "unselected": _jsonable(evidence.selection.unselected),
         },
-        "graph_scene_sequence": pipeline_graph_scene_sequence(
-            evidence.graphs, evidence.selection
-        ),
+        "graph_scene_sequence": pipeline_graph_scene_sequence(evidence.graphs, evidence.selection),
     }
     _write_json(
         writer,
         ("mz_extensions", "pipeline_audit.json"),
         pipeline_audit,
     )
+    if evidence.source_type == "indus_ad_hf":
+        indus_ad = build_indus_ad_export(evidence.indus_ad_annotations)
+        _write_json(
+            writer,
+            ("mz_extensions", "indus_ad", "camera.json"),
+            indus_ad.camera,
+        )
+        _write_json(
+            writer,
+            ("mz_extensions", "indus_ad", "gnss_scenarios.json"),
+            indus_ad.gnss_scenarios,
+        )
+        _write_json(
+            writer,
+            ("mz_extensions", "indus_ad", "dense_assets.json"),
+            indus_ad.dense_assets,
+        )
+        _write_json(
+            writer,
+            ("mz_extensions", "indus_ad", "join_audit.json"),
+            indus_ad.join_audit,
+        )
+        for asset in indus_ad.assets:
+            content = asset.source_path.read_bytes()
+            if (
+                len(content) != asset.expected_size
+                or hashlib.sha256(content).hexdigest() != asset.expected_sha256
+            ):
+                raise ValueError("dense asset changed after verified materialization")
+            writer.write(tuple(asset.relative_path.split("/")), content)
     manifest_bytes = _write_json(
         writer,
         ("mz_extensions", "content_manifest.json"),
