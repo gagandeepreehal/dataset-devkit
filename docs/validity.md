@@ -1,6 +1,6 @@
 # Validity, sanity, quarantine, and publication gating
 
-Task 4 consumes a real immutable `RecordingExtractionResult`; it does not reconstruct camera or
+Validity evaluation consumes an immutable `RecordingExtractionResult`; it does not reconstruct camera or
 GNSS state from a toy policy input. `evaluate_validity(result, config)` returns deterministic grid
 and logical-sample audits keyed by target timestamp, selected batch timestamp, and exact source
 camera names/timestamps. One selected batch is one logical sample containing all per-camera image
@@ -140,7 +140,7 @@ zero recording identities. With `allow_partial_export=true`, the returned result
 successful recording identities when every failure report persisted and `cleanup_complete` is
 `true`; failed recordings remain quarantined and unauthorized. Incomplete quarantine persistence
 or any cleanup debt forces the blocked exception and zero authorization regardless of that flag.
-With no failures and `cleanup_complete=true`, every successful input is authorized. Task 5 scene
+With no failures and `cleanup_complete=true`, every successful input is authorized. Scene
 construction consumes only the successful recording's
 `final_candidates`; tag/split construction and nuScenes export or publication remain outside this
 boundary. The production boundary immediately validates that every enabled observation
@@ -151,7 +151,7 @@ frames were correctly excluded.
 
 Independent failure handling continues after scene construction. Feature computation and the
 per-recording export preflight (owned JPEG identity/hash/dimensions, calibration, pose, timestamp,
-and Task 8 structure) quarantine only the attributable source. The default/partial authorization
+and export structure) quarantine only the attributable source. The default/partial authorization
 gate is rerun after those stages; global selection, relational validation, and publication failures
 remain whole-build failures.
 

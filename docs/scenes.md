@@ -1,8 +1,8 @@
 # Deterministic scenes and annotation windows
 
-Task 5 consumes one successful recording policy result at a time. Its only sample input is
+Scene construction consumes one successful recording policy result at a time. Its only sample input is
 `ValidityReport.final_candidates`. Invalid retained audit samples, dropped invalid samples, and
-grid misses remain in the Task 4 report and can never become scenes. The builder also takes the
+grid misses remain in the validity report and can never become scenes. The builder also takes the
 exact discriminated Hugging Face source fingerprint. Local source and staging paths are preserved
 as references but are never token inputs.
 
@@ -13,11 +13,11 @@ section also requires a stable `dataset_namespace` UUID, positive minimum/maximu
 positive minimum sample count, nonnegative maximum sample gap, and nonnegative inter-scene skip.
 `min_duration_s` cannot exceed `max_duration_s`. The annotation section contains the safely
 resolved JSONL `path`, nonnegative nearest-match tolerance, and nonnegative before/after windows.
-`load_config` is authoritative: it parses Task 5 time literals from their exact decimal JSON text
+`load_config` is authoritative: it parses scene time literals from their exact decimal JSON text
 and converts them to exact integer nanoseconds. Scientific notation is supported. Values just
 below or above an integer nanosecond are rejected rather than rounded through a binary float.
 Other configuration float fields retain their existing strict-float behavior. Direct
-`GlobalConfig.model_validate` callers must supply `Decimal` instances for Task 5 time fields;
+model validation callers must supply `Decimal` instances for scene time fields;
 JSON numeric strings are not accepted, and the generated schema exposes numbers only.
 
 ## Valid runs and automatic segmentation
@@ -73,7 +73,7 @@ distance is `outside_tolerance`. Audits preserve the nearest sample timestamp, s
 sample/error fields, so it cannot accidentally claim an out-of-contract sample reference.
 
 A matched logical sample is the stable window anchor. The requested before/after interval is
-clipped to that sample's valid run, so it cannot cross a Task 4 invalid span, grid gap, configured
+clipped to that sample's valid run, so it cannot cross an invalid span, grid gap, configured
 maximum gap, or recording boundary. Windows whose time boundaries overlap or touch are merged.
 The merged window retains every source annotation token in line order and unions labels in first
 appearance order. Annotation scenes may be shorter than automatic duration/sample minima.
@@ -112,9 +112,9 @@ staged image, calibration, and ego-pose reference. Each record also carries its 
 within-channel ordinal. Its UUID and exact `samples/<source-digest>/<channel>/<uuid>.jpg` POSIX
 filename are recomputed during validation, and the staged camera name/index/timestamp must match
 the record exactly. Filenames are globally unique. Chains never cross scenes. Human labels remain
-separate; Task 6 computed tags are not present.
+separate from computed tags, which are derived later.
 
-Every graph embeds immutable `source_samples` records derived from Task 4 final candidates. Each
+Every graph embeds immutable `source_samples` records derived from final valid candidates. Each
 record contains one logical timestamp, its canonical sorted nonempty expected camera-channel set,
 the selected batch timestamp, and its valid-run identity. Sample data carries the complete immutable
 staged-image evidence rather than only a local path. Validation binds each sample's batch timestamp

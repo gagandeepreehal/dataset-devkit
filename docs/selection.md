@@ -1,6 +1,6 @@
 # Features, filtering, and scenario selection
 
-Task 6 consumes only a validated `RecordingSceneResult`. It does not read extraction candidates,
+Feature computation consumes only a validated `RecordingSceneResult`. It does not read extraction candidates,
 change human annotations, split a dataset, or export nuScenes. Human labels remain in
 `human_labels`; derived values remain in the sorted immutable `computed_tags` tuple.
 
@@ -51,15 +51,15 @@ curvature is `>=` its minimum only after the straight and turn checks. No hidden
 these boundaries.
 
 Source-GNSS ratio, expected/present camera coverage, and synchronization error are computed from
-the sealed Task 5 evidence. The sync population contains one grid error per source sample plus one
+the validated scene evidence. The sync population contains one grid error per source sample plus one
 camera error per present camera record; it is independent of the trajectory reference channel.
 The seal also covers real pose timestamps, final translation/quaternion values, and complete GNSS
 interpolation/source identity and validity evidence consumed by feature derivation.
-Task 6 raises `StructuralExtractionError` for missing,
+Feature computation raises `StructuralExtractionError` for missing,
 nonfinite, inconsistent, or non-increasing reference evidence; such failures are not filter
 rejections.
-Task 5 also seals canonical global tuple order for scenes, samples, sample-data, annotations,
-matches, windows, unassigned records, and source samples. Task 6 validates that boundary, then
+Scene validation also enforces canonical tuple order for scenes, samples, sample-data, annotations,
+matches, windows, unassigned records, and source samples. Feature computation validates that boundary, then
 indexes samples by scene and sample-data by sample/scene in one linear pass; it never rescans all
 recording records for each scene.
 

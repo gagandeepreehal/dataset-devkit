@@ -3,19 +3,15 @@
 Copy `examples/indus_ad_v21_config.json` and `examples/annotations.jsonl` to your
 working directory. Review the recording/split selection, cameras, scene rules,
 quotas, and output paths before running `dataset-devkit build --config CONFIG`.
-Production media processing and caches belong on `mzcloud`.
 
 Schema `2.1` selects `source.type: "indus_ad_hf"` and
-`contract: "indus_ad_integrated_v1"`. The example pins
-`gagandeepreehal/indus-ad` at
-`2d46a81376ded440506bd1646c0a5197589ba27b`. Revisions must be full lowercase commit
-SHAs. Six untilted cameras are selected by default; `cam_front_tilted` is optional.
+`contract: "indus_ad_integrated_v1"`. The [example configuration](../examples/indus_ad_v21_config.json)
+pins the source revision. Six untilted cameras are selected by default;
+`cam_front_tilted` is optional.
 
 The adapter verifies agreement among metadata, video Viewer, video integrity, and
 privacy-release controls. Acquired video bytes must match both the pinned tree
 identity and the integrity-manifest SHA-256, including when reused from cache.
-The reference release contains 1,469 recordings, 9,927
-non-null videos marked `face_plate_blurred`, and 356 missing tilted-camera slots.
 These status and integrity checks do not independently measure residual privacy
 risk. Original MCAP remains `restricted_raw` and has no anonymization claim.
 
@@ -44,10 +40,11 @@ The read-only SDK returns immutable annotation records:
 ```python
 from dataset_devkit.dataset import Dataset
 
-dataset = Dataset("OUTPUT/v1.0-trainval")
-camera = dataset.camera_annotation("FRAME_ID")
-rows = dataset.camera_annotations(recording_id="RECORDING_ID", camera_name="cam_front")
-semantic = dataset.dense_asset("FRAME_ID", "semantic")
+dataset = Dataset("DATASET")
+rows = dataset.camera_annotations(camera_name="cam_front")
+if rows:
+    camera = dataset.camera_annotation(rows[0].frame_id)
+    semantic = dataset.dense_asset(rows[0].frame_id, "semantic")
 contract = dataset.indus_ad_contract()
 ```
 
@@ -75,5 +72,5 @@ immutable `revision`, `contract: "indus_ad_gnss_annotations_v1"`, and
 `expected_source_revision` equal to the integrated dataset revision. Its Parquet
 files below `data/` must follow the exact companion schema. The adapter verifies
 their source revision, recording ownership, relative bounds, and unique window
-identities against the selected sensor recording. This path is covered by local
-fixtures; a production companion release is not configured in the example.
+identities against the selected sensor recording. A production companion release
+is not configured in the example.
