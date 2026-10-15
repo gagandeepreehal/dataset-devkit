@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "dataset-devkit"
 version = "0.1.0"
-description = "Deterministic native pipeline for robotics dataset generation"
+description = "INDUS AD DEVKIT: reproducible driving dataset generation"
 readme = "README.md"
 license = {file = "LICENSE.md"}
 license-files = ["LICENSE.md", "NOTICE"]
 requires-python = ">=3.12"
-authors = [{name = "mz-datagen maintainers"}]
+authors = [{name = "INDUS AD DEVKIT maintainers"}]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Operating System :: POSIX",

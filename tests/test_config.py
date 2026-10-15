@@ -20,7 +20,7 @@ from dataset_devkit.config import (
 def decoded_source() -> dict[str, object]:
     return {
         "type": "decoded_hf",
-        "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
+        "repo_id": "owner/decoded-v2",
         "revision": "0123456789abcdef0123456789abcdef01234567",
         "recordings_path": "data/recordings.parquet",
         "recording_ids": ["recording-code"],
@@ -125,7 +125,7 @@ def minimal_config() -> dict[str, object]:
     return {
         "schema_version": "1.0",
         "huggingface": {
-            "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-monocam",
+            "repo_id": "owner/restricted-raw-mcap",
             "revision": "a" * 40,
             "manifest_path": "manifest.jsonl",
         },
@@ -249,7 +249,7 @@ def test_load_config_is_strict_and_resolves_relative_paths(tmp_path: Path) -> No
 
     assert isinstance(config, GlobalConfigV1)
     assert config.huggingface.repo_id == (
-        "gagandeepreehal/minuszero-indian-autonomous-driving-monocam"
+        "owner/restricted-raw-mcap"
     )
     assert config.huggingface.revision == "a" * 40
     assert config.huggingface.manifest_path == "manifest.jsonl"
@@ -423,7 +423,7 @@ def test_ordinary_urls_and_secret_named_paths_are_allowed(tmp_path: Path) -> Non
     config = load_config(write_config(tmp_path, data))
 
     assert isinstance(config, GlobalConfigV1)
-    assert config.huggingface.repo_id.endswith("/minuszero-indian-autonomous-driving-monocam")
+    assert config.huggingface.repo_id.endswith("/restricted-raw-mcap")
     assert config.annotations.path.name == "annotations.jsonl"
 
 

@@ -90,7 +90,7 @@ from dataset_devkit.config import (
 def decoded_source() -> dict[str, object]:
     return {
         "type": "decoded_hf",
-        "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
+        "repo_id": "owner/decoded-v2",
         "revision": "0123456789abcdef0123456789abcdef01234567",
         "recordings_path": "data/recordings.parquet",
         "recording_ids": ["recording-code"],

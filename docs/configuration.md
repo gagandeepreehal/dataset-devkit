@@ -9,8 +9,9 @@ For integrated INDUS-AD with annotations, start with
 [`examples/indus_ad_v21_config.json`](../examples/indus_ad_v21_config.json) and
 [the integrated workflow](indus-ad.md). For the older decoded V2 layout, use
 [`examples/decoded_v2_config.json`](../examples/decoded_v2_config.json); the all-zero revision is a
-fixture placeholder and must be replaced with a verified release commit. The legacy MCAP example
-is [`examples/dataset_config.json`](../examples/dataset_config.json). The generated
+fixture placeholder; replace its repository ID and revision with a verified source. The legacy MCAP example
+is [`examples/dataset_config.json`](../examples/dataset_config.json), also with placeholder
+repository and revision values. The generated
 [`schema/dataset_config.schema.json`](../schema/dataset_config.schema.json) supports editor and CI
 validation, while `load_config` remains authoritative for runtime and cross-field checks.
 

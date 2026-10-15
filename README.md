@@ -1,11 +1,11 @@
-# Minus Zero Dataset DevKit
+# INDUS AD DEVKIT
 
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 ![Status: Alpha](https://img.shields.io/badge/status-alpha-orange)
 ![Platform: POSIX](https://img.shields.io/badge/platform-POSIX-lightgrey)
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE.md)
 
-Build reproducible, nuScenes-compatible subsets from Minus Zero driving datasets.
+Build reproducible, nuScenes-compatible subsets from INDUS-AD driving datasets.
 The devkit selects camera frames and driving scenes, interpolates GNSS poses,
 applies scenario quotas, and exports validated train/test splits with provenance.
 
@@ -62,7 +62,8 @@ dataset-devkit build --config dataset_config.json
 
 The human annotation file is optional input content but must exist at its configured
 path. Remove the template's MCAP example row if you are not supplying human labels.
-The older decoded V2 example uses an all-zero revision placeholder that must be replaced.
+The legacy MCAP and decoded V2 examples use placeholder repository IDs and all-zero
+revisions; replace both with a source matching the corresponding contract.
 
 The pipeline verifies selected artifacts, samples frames, builds scenes, applies
 filters and seeded scenario quotas, and assigns train/test splits. Strict quota

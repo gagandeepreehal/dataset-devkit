@@ -7,7 +7,7 @@
 ## Goal
 
 Add a decoded Hugging Face backend to `dataset-devkit` for the privacy-rebuilt
-Minus Zero V2 dataset. The backend consumes anonymized MP4 video and the new
+decoded V2 dataset. The backend consumes anonymized MP4 video and the new
 date-free GNSS representation directly, while retaining the existing MCAP
 backend as an explicitly restricted raw-source workflow.
 
@@ -72,7 +72,7 @@ A decoded V2 configuration uses JSON:
   "schema_version": "2.0",
   "source": {
     "type": "decoded_hf",
-    "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
+    "repo_id": "owner/decoded-v2",
     "revision": "0123456789abcdef0123456789abcdef01234567",
     "recordings_path": "data/recordings.parquet",
     "recording_ids": ["recording-code"],
