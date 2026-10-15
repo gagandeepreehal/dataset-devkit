@@ -2,7 +2,7 @@
   "schema_version": "2.0",
   "source": {
     "type": "decoded_hf",
-    "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-dataset-v2",
+    "repo_id": "owner/decoded-v2",
     "revision": "0000000000000000000000000000000000000000",
     "recordings_path": "data/recordings.parquet",
     "recording_ids": [],

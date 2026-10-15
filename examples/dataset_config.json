@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0",
   "huggingface": {
-    "repo_id": "gagandeepreehal/minuszero-indian-autonomous-driving-monocam",
-    "revision": "b13c3bd3a049c73b560910ef5dbc60cbd28c441b",
+    "repo_id": "owner/restricted-raw-mcap",
+    "revision": "0000000000000000000000000000000000000000",
     "manifest_path": "manifest.jsonl"
   },
   "paths": {

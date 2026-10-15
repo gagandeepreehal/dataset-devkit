@@ -29,7 +29,7 @@ def create_parser() -> argparse.ArgumentParser:
     """Create the public CLI parser."""
     parser = argparse.ArgumentParser(
         prog="dataset-devkit",
-        description="Build, validate, and inspect deterministic robotics datasets.",
+        description="INDUS AD DEVKIT: build, validate, and inspect driving datasets.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 

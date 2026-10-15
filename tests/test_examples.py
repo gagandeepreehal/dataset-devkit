@@ -14,9 +14,9 @@ def test_shipped_example_configuration_is_valid() -> None:
 
     assert config.schema_version == "1.0"
     assert config.huggingface.repo_id == (
-        "gagandeepreehal/minuszero-indian-autonomous-driving-monocam"
+        "owner/restricted-raw-mcap"
     )
-    assert config.huggingface.revision == "b13c3bd3a049c73b560910ef5dbc60cbd28c441b"
+    assert config.huggingface.revision == "0" * 40
     assert config.huggingface.manifest_path == "manifest.jsonl"
     assert all(config.mcap_compatibility.model_dump().values())
 
