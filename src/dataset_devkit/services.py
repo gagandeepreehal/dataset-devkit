@@ -127,6 +127,11 @@ class InspectionSummary:
     source_type: str
     privacy_classification: str
     pose_frame: str
+    camera_annotation_count: int = 0
+    gnss_annotation_count: int = 0
+    dense_asset_count: int = 0
+    annotation_contract: str | None = None
+    annotation_source_revision: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -144,6 +149,11 @@ class InspectionSummary:
             "source_type": self.source_type,
             "privacy_classification": self.privacy_classification,
             "pose_frame": self.pose_frame,
+            "camera_annotation_count": self.camera_annotation_count,
+            "gnss_annotation_count": self.gnss_annotation_count,
+            "dense_asset_count": self.dense_asset_count,
+            "annotation_contract": self.annotation_contract,
+            "annotation_source_revision": self.annotation_source_revision,
         }
 
 
@@ -661,6 +671,9 @@ def inspect_dataset(
     validation = dataset.validation_report()
     manifest = json.loads((Path(dataroot) / "mz_extensions/content_manifest.json").read_text())
     source = dataset.source_metadata()
+    annotation_contract = (
+        dataset.indus_ad_contract() if source["source_type"] == "indus_ad_hf" else {}
+    )
     try:
         state = validation["state"]
         content_hash = manifest["root_sha256"]
@@ -684,4 +697,9 @@ def inspect_dataset(
         str(source["source_type"]),
         str(source["privacy_classification"]),
         str(source["pose_frame"]),
+        int(annotation_contract.get("camera_rows", 0)),
+        int(annotation_contract.get("gnss_rows", 0)),
+        int(annotation_contract.get("dense_rows", 0)),
+        annotation_contract.get("contract"),
+        annotation_contract.get("source_revision"),
     )

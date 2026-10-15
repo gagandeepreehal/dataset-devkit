@@ -201,7 +201,8 @@ class WeatherWeakLabel:
         for value in (self.confidence, self.margin):
             if value is not None and (not math.isfinite(value) or not 0.0 <= value <= 1.0):
                 raise ValueError("invalid weather confidence or margin")
-        if self.label is not None and self.label not in expected:
+        published_labels = expected | {"rain_wet_road", "fog_haze", "low_light_night"}
+        if self.label is not None and self.label not in published_labels:
             raise ValueError("invalid weather label")
         object.__setattr__(self, "probabilities", MappingProxyType(values))
 

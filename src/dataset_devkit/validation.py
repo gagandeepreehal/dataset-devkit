@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 from contextlib import suppress
 from dataclasses import dataclass
@@ -14,10 +15,16 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
+import pyarrow.parquet as pq
 from PIL import Image
 
 from dataset_devkit.config import GLOBAL_CONFIG_ADAPTER, GlobalConfig
 from dataset_devkit.export import NUSCENES_VERSION, OFFICIAL_TABLES
+from dataset_devkit.indus_ad_export import (
+    camera_annotation_schema,
+    dense_asset_schema,
+    gnss_annotation_schema,
+)
 from dataset_devkit.provenance import (
     DecodedSourceFingerprint,
     IndusAdSourceFingerprint,
@@ -1058,104 +1065,180 @@ def _validate_split_extension(
 def _validate_indus_ad_extensions(
     root: Path,
     *,
-    recording_sources: set[str],
+    fingerprints: dict[str, IndusAdSourceFingerprint],
     scenes: set[str],
+    samples: set[str],
     sample_data: set[str],
     findings: list[ValidationFinding],
+    scene_sources: dict[str, str] | None = None,
+    sample_scenes: dict[str, str] | None = None,
+    data_samples: dict[str, str] | None = None,
 ) -> None:
     directory = root / "mz_extensions" / "indus_ad"
-    payloads = {
-        name: _load_json(directory / f"{name}.json", findings, f"indus_ad/{name}")
-        for name in ("camera", "gnss_scenarios", "dense_assets", "join_audit")
+    contract = _load_json(directory / "contract.json", findings, "indus_ad/contract")
+    contract_keys = {
+        "schema_version",
+        "contract",
+        "source_repo_id",
+        "source_revision",
+        "annotation_schema_sha256",
+        "selected_layers",
+        "camera_rows",
+        "gnss_rows",
+        "dense_rows",
+        "join_audit",
+        "weak_label_provenance",
     }
-    malformed = False
-    for name in ("camera", "gnss_scenarios", "dense_assets"):
-        payload = payloads[name]
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != {"schema_version", "label_kind", "rows"}
-            or payload.get("schema_version") != 1
-            or payload.get("label_kind") != "weak_pseudo_label"
-            or not isinstance(payload.get("rows"), list)
-        ):
-            malformed = True
-    camera_rows = (
-        cast(list[dict[str, Any]], payloads["camera"].get("rows"))
-        if isinstance(payloads["camera"], dict) and isinstance(payloads["camera"].get("rows"), list)
-        else []
+    contract_bad = (
+        not isinstance(contract, dict)
+        or set(contract) != contract_keys
+        or contract.get("schema_version") != 1
+        or contract.get("contract") != "indus_ad_integrated_v1"
+        or contract.get("weak_label_provenance") != "machine_generated_weak_pseudo_label"
     )
-    gnss_rows = (
-        cast(list[dict[str, Any]], payloads["gnss_scenarios"].get("rows"))
-        if isinstance(payloads["gnss_scenarios"], dict)
-        and isinstance(payloads["gnss_scenarios"].get("rows"), list)
-        else []
-    )
-    dense_rows = (
-        cast(list[dict[str, Any]], payloads["dense_assets"].get("rows"))
-        if isinstance(payloads["dense_assets"], dict)
-        and isinstance(payloads["dense_assets"].get("rows"), list)
-        else []
-    )
-    for row in camera_rows:
-        malformed = malformed or (
-            not isinstance(row, dict)
-            or row.get("source_digest") not in recording_sources
-            or row.get("scene_token") not in scenes
-            or row.get("sample_data_token") not in sample_data
-            or row.get("provenance") != "machine_generated_weak_pseudo_label"
-        )
-    for row in gnss_rows:
-        scene_tokens = row.get("scene_tokens") if isinstance(row, dict) else None
-        malformed = malformed or (
-            not isinstance(row, dict)
-            or row.get("source_digest") not in recording_sources
-            or not isinstance(scene_tokens, list)
-            or any(token not in scenes for token in scene_tokens)
-            or row.get("provenance") != "machine_generated_weak_pseudo_label"
-        )
-    for row in dense_rows:
-        asset_path = row.get("asset_path") if isinstance(row, dict) else None
-        malformed = malformed or (
-            not isinstance(row, dict)
-            or row.get("source_digest") not in recording_sources
-            or row.get("scene_token") not in scenes
-            or row.get("sample_data_token") not in sample_data
-            or (asset_path is not None and not isinstance(asset_path, str))
-        )
-        if isinstance(asset_path, str):
-            path = PurePosixPath(asset_path)
-            expected_prefix = ("mz_extensions", "indus_ad", "assets")
-            if path.is_absolute() or path.parts[:3] != expected_prefix or ".." in path.parts:
-                malformed = True
-                continue
-            local = root.joinpath(*path.parts)
-            try:
-                data = local.read_bytes()
-            except OSError:
-                malformed = True
-                continue
-            malformed = malformed or (
-                len(data) != row.get("payload_bytes")
-                or hashlib.sha256(data).hexdigest() != row.get("payload_sha256")
+    if isinstance(contract, dict) and fingerprints:
+        contract_bad = contract_bad or (
+            any(item.repo_id != contract.get("source_repo_id") for item in fingerprints.values())
+            or any(
+                item.revision != contract.get("source_revision") for item in fingerprints.values()
             )
-    audit = payloads["join_audit"]
-    if (
-        not isinstance(audit, dict)
-        or set(audit) != {"schema_version", "recordings"}
-        or audit.get("schema_version") != 1
-        or not isinstance(audit.get("recordings"), list)
-    ):
-        malformed = True
-    forbidden = {"latitude", "longitude", "latitude_deg", "longitude_deg"}
-    if any(key in json.dumps(payloads, sort_keys=True) for key in forbidden):
-        malformed = True
-    if malformed:
+            or any(
+                item.annotation_schema_sha256 != contract.get("annotation_schema_sha256")
+                for item in fingerprints.values()
+            )
+        )
+    if contract_bad:
         findings.append(
             ValidationFinding(
                 "error",
-                "indus_ad_extension",
-                "mz_extensions/indus_ad",
-                "integrated weak-label extensions are malformed or cross-linked",
+                "extension_value",
+                "indus_ad/contract",
+                "integrated annotation contract differs from source fingerprints",
+            )
+        )
+    expected_schemas = {
+        "camera_annotations": camera_annotation_schema(),
+        "gnss_annotations": gnss_annotation_schema(),
+        "dense_assets": dense_asset_schema(),
+    }
+    rows: dict[str, list[dict[str, Any]]] = {}
+    for name, expected in expected_schemas.items():
+        try:
+            parquet = pq.ParquetFile(directory / f"{name}.parquet")
+            if not parquet.schema_arrow.remove_metadata().equals(expected, check_metadata=False):
+                raise ValueError("schema differs")
+            rows[name] = cast(list[dict[str, Any]], parquet.read().to_pylist())
+        except Exception:
+            findings.append(
+                ValidationFinding(
+                    "error",
+                    "extension_schema",
+                    f"indus_ad/{name}",
+                    "integrated extension Parquet is missing or has the wrong schema",
+                )
+            )
+            rows[name] = []
+    camera_rows = rows["camera_annotations"]
+    gnss_rows = rows["gnss_annotations"]
+    dense_rows = rows["dense_assets"]
+    from dataset_devkit.dataset import (
+        _camera_annotation_record,
+        _dense_asset_record,
+        _gnss_annotation_record,
+    )
+
+    try:
+        for camera_row in camera_rows:
+            _camera_annotation_record(camera_row)
+        for gnss_row in gnss_rows:
+            _gnss_annotation_record(gnss_row)
+        for dense_row in dense_rows:
+            _dense_asset_record(dense_row)
+    except (ValueError, TypeError, KeyError, OverflowError):
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_value",
+                "indus_ad",
+                "integrated annotation values violate their typed contract",
+            )
+        )
+    if isinstance(contract, dict) and any(
+        contract.get(key) != len(value)
+        for key, value in (
+            ("camera_rows", camera_rows),
+            ("gnss_rows", gnss_rows),
+            ("dense_rows", dense_rows),
+        )
+    ):
+        findings.append(
+            ValidationFinding("error", "extension_value", "indus_ad", "row counts differ")
+        )
+    camera_ids = [row.get("frame_id") for row in camera_rows]
+    dense_ids = [(row.get("frame_id"), row.get("kind")) for row in dense_rows]
+    gnss_ids = [(row.get("recording_id"), row.get("window_index")) for row in gnss_rows]
+    bad = (
+        len(camera_ids) != len(set(camera_ids))
+        or len(dense_ids) != len(set(dense_ids))
+        or len(gnss_ids) != len(set(gnss_ids))
+    )
+    provenance = "machine_generated_weak_pseudo_label"
+    for row in camera_rows:
+        fingerprint = fingerprints.get(cast(str, row.get("source_digest")))
+        bad = bad or (
+            fingerprint is None
+            or row.get("recording_id") != fingerprint.recording_id
+            or row.get("scene_token") not in scenes
+            or row.get("sample_token") not in samples
+            or row.get("sample_data_token") not in sample_data
+            or row.get("weak_label_provenance") != provenance
+            or (
+                scene_sources is not None
+                and scene_sources.get(cast(str, row.get("scene_token"))) != row.get("source_digest")
+            )
+            or (
+                sample_scenes is not None
+                and sample_scenes.get(cast(str, row.get("sample_token"))) != row.get("scene_token")
+            )
+            or (
+                data_samples is not None
+                and data_samples.get(cast(str, row.get("sample_data_token")))
+                != row.get("sample_token")
+            )
+        )
+    for row in gnss_rows:
+        fingerprint = fingerprints.get(cast(str, row.get("source_digest")))
+        scene_tokens = row.get("scene_tokens")
+        sample_tokens = row.get("sample_tokens")
+        bad = bad or (
+            fingerprint is None
+            or row.get("recording_id") != fingerprint.recording_id
+            or not isinstance(scene_tokens, list)
+            or not isinstance(sample_tokens, list)
+            or any(token not in scenes for token in scene_tokens or [])
+            or any(token not in samples for token in sample_tokens or [])
+            or row.get("weak_label_provenance") != provenance
+        )
+    camera_frames = set(camera_ids)
+    for row in dense_rows:
+        fingerprint = fingerprints.get(cast(str, row.get("source_digest")))
+        digest = row.get("payload_sha256")
+        bad = bad or (
+            fingerprint is None
+            or row.get("recording_id") != fingerprint.recording_id
+            or row.get("frame_id") not in camera_frames
+            or row.get("scene_token") not in scenes
+            or row.get("sample_data_token") not in sample_data
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        )
+    if bad:
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_reference",
+                "indus_ad",
+                "integrated annotation identities or references are invalid",
             )
         )
 
@@ -1248,6 +1331,7 @@ def _extensions(
     log_to_source: dict[str, str] = {}
     source_repo_paths: dict[str, str] = {}
     source_types_by_digest: dict[str, str] = {}
+    indus_ad_fingerprints: dict[str, IndusAdSourceFingerprint] = {}
     channels_by_source: dict[str, dict[str, str]] = {}
     recording_keys = {"source", "source_digest", "log_token", "channels"}
     legacy_source_keys = {"repo_id", "revision", "repo_path", "sha256", "size"}
@@ -1323,6 +1407,8 @@ def _extensions(
                     if isinstance(parsed_source, DecodedSourceFingerprint)
                     else "mcap_hf"
                 )
+                if isinstance(parsed_source, IndusAdSourceFingerprint):
+                    indus_ad_fingerprints[source] = parsed_source
                 channels_by_source[source] = {
                     cast(str, row["normalized"]): cast(str, row["original"]) for row in channel_rows
                 }
@@ -2225,10 +2311,14 @@ def _extensions(
     if source_type == "indus_ad_hf":
         _validate_indus_ad_extensions(
             root,
-            recording_sources=recording_sources,
+            fingerprints=indus_ad_fingerprints,
             scenes=scenes,
+            samples=samples,
             sample_data=sample_data,
             findings=findings,
+            scene_sources=scene_to_source,
+            sample_scenes={row["token"]: row["scene_token"] for row in tables["sample"]},
+            data_samples={row["token"]: row["sample_token"] for row in tables["sample_data"]},
         )
     pipeline_audit = loaded["pipeline_audit"]
     _validate_pipeline_audit(

@@ -74,6 +74,7 @@ def test_join_binds_exact_selected_camera_dense_and_gnss_rows(
     )
     camera = replace(camera_bundle.camera[0], recording_offset_ns=sample_data.timestamp_ns)
     dense = parse_dense_indexes([fixture.dense_index], camera_annotations=camera_bundle.camera)
+    dense = tuple(replace(ref, recording_offset_ns=sample_data.timestamp_ns) for ref in dense)
     gnss = GnssScenarioAnnotation(
         fixture.recording_id,
         0,

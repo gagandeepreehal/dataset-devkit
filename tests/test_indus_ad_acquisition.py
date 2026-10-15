@@ -5,12 +5,15 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from dataset_devkit.config import DenseAssetSelection
+from dataset_devkit.config import DenseAssetSelection, GnssAnnotationSourceConfig
 from dataset_devkit.huggingface_acquisition import AcquisitionError, IntegrityError
 from dataset_devkit.indus_ad_acquisition import IndusAdHfAcquirer
-from indus_ad_fixture import write_indus_ad_fixture
+from dataset_devkit.indus_ad_annotations import gnss_scenario_schema
+from indus_ad_fixture import _repo_tree, write_executable_indus_ad_fixture, write_indus_ad_fixture
 
 
 def _downloader(source_root: Path, calls: list[str]) -> Callable[..., str]:
@@ -52,9 +55,7 @@ def test_acquirer_materializes_only_explicit_selected_frames(tmp_path: Path) -> 
     fixture = write_indus_ad_fixture(tmp_path / "source")
     source = fixture.source.model_copy(
         update={
-            "dense_assets": DenseAssetSelection(
-                semantic="selected_frames", depth="selected_frames"
-            )
+            "dense_assets": DenseAssetSelection(semantic="selected_frames", depth="selected_frames")
         }
     )
     calls: list[str] = []
@@ -108,3 +109,61 @@ def test_acquirer_rejects_download_path_escape(tmp_path: Path) -> None:
 
     with pytest.raises(AcquisitionError, match="outside"):
         acquirer.load_plan()
+
+
+def test_acquirer_verifies_pinned_gnss_companion(tmp_path: Path) -> None:
+    fixture = write_executable_indus_ad_fixture(tmp_path / "source")
+    companion_root = tmp_path / "companion"
+    (companion_root / "data").mkdir(parents=True)
+    path = companion_root / "data/annotations.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "schema_version": "indus_ad_gnss_annotations_v1",
+                    "source_revision": fixture.source.revision,
+                    "recording_id": fixture.recording_id,
+                    "window_index": 0,
+                    "window_start_offset_ns": 0,
+                    "window_end_offset_ns": 1_000_000_000,
+                    "motion_label": "moving",
+                    "validity_tags": ["valid"],
+                    "quality_tags": ["good"],
+                    "anomaly_candidate": False,
+                    "anomaly_reasons": [],
+                    "confidence": 0.9,
+                    "run_id": "test-run",
+                }
+            ],
+            schema=gnss_scenario_schema(),
+        ),
+        path,
+    )
+    companion = GnssAnnotationSourceConfig(
+        repo_id="owner/gnss",
+        revision="7" * 40,
+        contract="indus_ad_gnss_annotations_v1",
+        expected_source_revision=fixture.source.revision,
+    )
+    source = fixture.source.model_copy(
+        update={
+            "gnss_annotation_source": companion,
+            "annotation_layers": [*fixture.source.annotation_layers, "gnss_scenarios"],
+        }
+    )
+    calls: list[str] = []
+
+    def download(**kwargs: object) -> str:
+        root = companion_root if kwargs["repo_id"] == companion.repo_id else fixture.root
+        return _downloader(root, calls)(**kwargs)
+
+    acquirer = IndusAdHfAcquirer(
+        source=source,
+        cache_dir=tmp_path / "cache",
+        list_tree=lambda repo_id, revision: fixture.tree,
+        companion_list_tree=lambda repo_id, revision: _repo_tree(companion_root),
+        download_file=download,
+    )
+    bundle = acquirer.acquire(acquirer.load_plan().recordings[0])
+    assert bundle.annotations.gnss[0].window_index == 0
+    assert bundle.annotations.availability["gnss"].state == "available"

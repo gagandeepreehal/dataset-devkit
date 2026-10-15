@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -31,6 +32,7 @@ from dataset_devkit.huggingface_acquisition import (
 from dataset_devkit.indus_ad_annotations import (
     parse_camera_annotations,
     parse_dense_indexes,
+    parse_gnss_scenarios,
 )
 from dataset_devkit.indus_ad_contract import (
     CAMERA_ANNOTATION_VIEWER_PATH,
@@ -54,6 +56,25 @@ from dataset_devkit.indus_ad_models import (
 from dataset_devkit.provenance import canonical_hash
 
 ListRepositoryTree = Callable[[str, str], tuple[RepositoryFile, ...]]
+
+
+def _default_companion_tree(repo_id: str, revision: str) -> tuple[RepositoryFile, ...]:
+    from huggingface_hub import HfApi, RepoFile
+
+    return tuple(
+        RepositoryFile(
+            item.path,
+            item.size,
+            item.blob_id,
+            None if item.lfs is None else item.lfs.sha256,
+        )
+        for item in HfApi().list_repo_tree(
+            repo_id, recursive=True, revision=revision, repo_type="dataset"
+        )
+        if isinstance(item, RepoFile)
+        and item.path.startswith("data/")
+        and item.path.endswith(".parquet")
+    )
 
 
 def _git_blob_id(data: bytes) -> str:
@@ -81,7 +102,7 @@ def _default_list_tree(repo_id: str, revision: str) -> tuple[RepositoryFile, ...
     for item in api.list_repo_tree(
         repo_id,
         recursive=True,
-        expand=True,
+        expand=False,
         revision=revision,
         repo_type="dataset",
     ):
@@ -107,11 +128,10 @@ def _verify_tree_file(
     verified = _verify_file(path, local_root)
     if verified.size != identity.size:
         raise IntegrityError("downloaded size differs from pinned repository tree")
-    data = path.read_bytes()
     if identity.sha256 is not None:
         if verified.sha256 != identity.sha256:
             raise IntegrityError("downloaded SHA-256 differs from pinned repository tree")
-    elif _git_blob_id(data) != identity.blob_id:
+    elif _git_blob_id(path.read_bytes()) != identity.blob_id:
         raise IntegrityError("downloaded blob ID differs from pinned repository tree")
     return verified.sha256
 
@@ -141,10 +161,14 @@ class IndusAdHfAcquirer:
         cache_dir: Path,
         list_tree: ListRepositoryTree | None = None,
         download_file: DownloadFile | None = None,
+        companion_list_tree: ListRepositoryTree | None = None,
     ) -> None:
         self.source = source
-        self.cache_dir = cache_dir.absolute()
+        self.cache_dir = cache_dir.resolve()
         self.list_tree = _default_list_tree if list_tree is None else list_tree
+        self.companion_list_tree = (
+            _default_companion_tree if companion_list_tree is None else companion_list_tree
+        )
         if download_file is None:
             from huggingface_hub import hf_hub_download
 
@@ -235,11 +259,15 @@ class IndusAdHfAcquirer:
             VIDEO_PRIVACY_PATH,
             *dense_indexes,
         ]
-        self._control_files = {
-            path: self._acquire_one(self._tree[path], "indus-ad-control")
-            for path in controls
-            if path in self._tree
-        }
+        available_controls = tuple(path for path in controls if path in self._tree)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            acquired_controls = tuple(
+                executor.map(
+                    lambda path: self._acquire_one(self._tree[path], "indus-ad-control"),
+                    available_controls,
+                )
+            )
+        self._control_files = dict(zip(available_controls, acquired_controls, strict=True))
         root = _ensure_beneath(
             self.cache_dir,
             "indus-ad-control-view",
@@ -250,7 +278,7 @@ class IndusAdHfAcquirer:
             destination.parent.mkdir(parents=True, exist_ok=True)
             if not destination.exists():
                 shutil.copyfile(cached, destination)
-        self._plan = parse_indus_ad_contract(root, self.source, tree)
+        plan = parse_indus_ad_contract(root, self.source, tree)
         annotation_table = pq.ParquetFile(self._control_files[CAMERA_ANNOTATION_VIEWER_PATH]).read(
             columns=["recording_id", "recording_offset_ns"]
         )
@@ -275,7 +303,8 @@ class IndusAdHfAcquirer:
                 "dense": AnnotationAvailability("available", "dense_indexes_loaded"),
             },
         )
-        return self._plan
+        self._plan = plan
+        return plan
 
     def acquire(self, entry: IndusAdRecordingEntry) -> AcquiredIndusAdRecording:
         self.load_plan()
@@ -299,10 +328,36 @@ class IndusAdHfAcquirer:
                 replace(video, frame_count=counts.get(video.camera)) for video in entry.videos
             ),
         )
+        frame_evidence: dict[tuple[str, int, int], tuple[int, int]] = {}
+        for artifact in entry.artifacts_of("camera_frames"):
+            for row in pq.ParquetFile(files[artifact.path]).read().to_pylist():
+                camera_name = row.get("camera_name", row.get("source_camera_name"))
+                frame_index = row.get("frame_index", row.get("packet_index"))
+                offset = row.get("recording_offset_ns", row.get("camera_time_offset_ns"))
+                if row.get("recording_id") != entry.recording_id:
+                    raise AcquisitionError("camera frame table recording identity differs")
+                key = (str(camera_name), int(frame_index), int(offset))
+                if key in frame_evidence:
+                    raise AcquisitionError("camera frame evidence contains duplicate identities")
+                frame_evidence[key] = (int(row["width"]), int(row["height"]))
+        selected_cameras = {video.camera for video in entry.videos}
+        camera_annotations = tuple(
+            item
+            for item in self._annotations.camera
+            if item.recording_id == entry.recording_id and item.camera_name in selected_cameras
+        )
+        for annotation in camera_annotations:
+            dimensions = frame_evidence.get(
+                (
+                    annotation.camera_name,
+                    annotation.frame_index,
+                    annotation.recording_offset_ns,
+                )
+            )
+            if dimensions != (annotation.decoded_width, annotation.decoded_height):
+                raise AcquisitionError("camera annotation differs from source frame evidence")
         annotations = IndusAdAnnotationBundle(
-            camera=tuple(
-                item for item in self._annotations.camera if item.recording_id == entry.recording_id
-            ),
+            camera=camera_annotations,
             gnss=tuple(
                 item for item in self._annotations.gnss if item.recording_id == entry.recording_id
             ),
@@ -313,6 +368,51 @@ class IndusAdHfAcquirer:
             ),
             availability=self._annotations.availability,
         )
+        companion = self.source.gnss_annotation_source
+        if companion is not None:
+            if companion.expected_source_revision != self.source.revision:
+                raise AcquisitionError("GNSS companion source revision differs")
+            companion_tree = self.companion_list_tree(companion.repo_id, companion.revision)
+            if not companion_tree:
+                raise AcquisitionError("GNSS companion contains no annotation Parquet files")
+            companion_acquirer = IndusAdHfAcquirer(
+                source=self.source.model_copy(
+                    update={
+                        "repo_id": companion.repo_id,
+                        "revision": companion.revision,
+                    }
+                ),
+                cache_dir=self.cache_dir,
+                download_file=self.download_file,
+            )
+            gnss_table = pq.ParquetFile(files[entry.artifact("gnss").path]).read(
+                columns=["recording_offset_ns"]
+            )
+            duration = max(gnss_table.column(0).to_pylist())
+            gnss_annotations = tuple(
+                annotation
+                for identity in sorted(companion_tree, key=lambda item: item.path)
+                for annotation in parse_gnss_scenarios(
+                    companion_acquirer._acquire_one(identity, "indus-ad-gnss-companion"),
+                    expected_recordings={entry.recording_id: duration},
+                    expected_source_revision=self.source.revision,
+                    selected_recording_ids=frozenset({entry.recording_id}),
+                )
+            )
+            identities = [(item.recording_id, item.window_index) for item in gnss_annotations]
+            if len(identities) != len(set(identities)):
+                raise AcquisitionError("GNSS companion contains duplicate annotation windows")
+            annotations = replace(
+                annotations,
+                gnss=gnss_annotations,
+                availability={
+                    **annotations.availability,
+                    "gnss": AnnotationAvailability(
+                        "available" if gnss_annotations else "missing",
+                        "companion_verified" if gnss_annotations else "no_recording_windows",
+                    ),
+                },
+            )
 
         def materialize(frame_ids: frozenset[str]) -> tuple[MaterializedDenseAsset, ...]:
             enabled = {

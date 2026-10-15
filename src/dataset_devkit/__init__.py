@@ -3,6 +3,11 @@
 from dataset_devkit.config import validate_config_schema_and_runtime
 from dataset_devkit.dataset import Dataset, DatasetFormatError
 from dataset_devkit.export import ExportEvidence, ExportResult, export_dataset
+from dataset_devkit.indus_ad_export import (
+    CameraAnnotationRecord,
+    DenseAssetRecord,
+    GnssAnnotationRecord,
+)
 from dataset_devkit.services import (
     BuildResult,
     BuildRuntime,
@@ -24,6 +29,9 @@ from dataset_devkit.validation import (
 )
 
 __all__ = [
+    "CameraAnnotationRecord",
+    "DenseAssetRecord",
+    "GnssAnnotationRecord",
     "Dataset",
     "DatasetFormatError",
     "ExportEvidence",

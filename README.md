@@ -86,6 +86,12 @@ and descriptor-relative, no-follow filesystem operations.
 
 ## Source dataset setup
 
+The integrated INDUS-AD release uses schema `2.1` and the separate `indus_ad_hf`
+backend. Start with [examples/indus_ad_v21_config.json](examples/indus_ad_v21_config.json).
+It pins the source commit and adds camera, semantic-fraction, depth-summary, and
+weather weak pseudo-labels to selected output frames. Dense semantic/depth assets
+default to metadata only. See [the integrated workflow](docs/indus-ad.md).
+
 Minus Zero dataset releases are hosted as Hugging Face dataset repositories. Every source uses an
 exact repository name and full 40-character commit SHA; branch and tag names are rejected.
 

@@ -30,6 +30,7 @@ class JoinedGnssAnnotation:
     annotation: GnssScenarioAnnotation
     source_digest: str
     scene_tokens: tuple[str, ...]
+    sample_tokens: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,7 +133,21 @@ def join_indus_ad_annotations(
             and gnss_annotation.window_end_offset_ns > scene.first_timestamp_ns
         )
         if scene_tokens:
-            gnss.append(JoinedGnssAnnotation(gnss_annotation, graph.source.digest, scene_tokens))
+            sample_tokens = tuple(
+                sample.token
+                for sample in graph.samples
+                if sample.scene_token in scene_tokens
+                and gnss_annotation.window_start_offset_ns <= sample.timestamp_ns
+                and gnss_annotation.window_end_offset_ns > sample.timestamp_ns
+            )
+            gnss.append(
+                JoinedGnssAnnotation(
+                    gnss_annotation,
+                    graph.source.digest,
+                    scene_tokens,
+                    sample_tokens,
+                )
+            )
 
     materialized_by_identity = {item.ref.identity: item for item in materialized}
     if len(materialized_by_identity) != len(materialized):
@@ -150,6 +165,14 @@ def join_indus_ad_annotations(
         joined_camera = camera_by_frame.get(ref.frame_id)
         if joined_camera is None:
             continue
+        annotation = joined_camera.annotation
+        if (
+            ref.recording_id,
+            ref.camera_name,
+            ref.frame_index,
+            ref.recording_offset_ns,
+        ) != annotation.source_frame_identity:
+            raise ValueError("dense reference differs from its camera source-frame identity")
         payload = materialized_by_identity.get(ref.identity)
         dense.append(
             JoinedDenseAsset(

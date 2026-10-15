@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import shutil
 import tarfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -155,9 +156,7 @@ def write_indus_ad_fixture(root: Path) -> IndusAdFixture:
             integrity[f"{camera}_video_sha256"] = _sha256(path)
             viewer[f"{camera}_video"] = {
                 "bytes": None,
-                "path": (
-                    f"hf://datasets/{repo_id}@{video_revision}/data/{file_name}"
-                ),
+                "path": (f"hf://datasets/{repo_id}@{video_revision}/data/{file_name}"),
             }
             status = "face_plate_blurred"
         else:
@@ -195,21 +194,29 @@ def write_indus_ad_fixture(root: Path) -> IndusAdFixture:
         )
         _write_table(
             table_path,
-            [{"recording_id": recording_id, "recording_offset_ns": 0}],
+            [
+                {
+                    "recording_id": recording_id,
+                    "recording_offset_ns": 0,
+                    "camera_name": camera,
+                    "frame_index": 0,
+                    "width": 4,
+                    "height": 4,
+                }
+            ],
             pa.schema(
                 [
                     pa.field("recording_id", pa.string()),
                     pa.field("recording_offset_ns", pa.int64()),
+                    pa.field("camera_name", pa.string()),
+                    pa.field("frame_index", pa.int64()),
+                    pa.field("width", pa.int64()),
+                    pa.field("height", pa.int64()),
                 ]
             ),
         )
     for family in ("calibrations", "gnss"):
-        table_path = (
-            root
-            / f"data/tables/{family}"
-            / "bucket=aa"
-            / f"part-{recording_id}.parquet"
-        )
+        table_path = root / f"data/tables/{family}" / "bucket=aa" / f"part-{recording_id}.parquet"
         _write_table(
             table_path,
             [{"recording_id": recording_id}],
@@ -217,9 +224,7 @@ def write_indus_ad_fixture(root: Path) -> IndusAdFixture:
         )
 
     semantic_buffer = io.BytesIO()
-    Image.fromarray(np.zeros((4, 4), dtype=np.uint8), mode="L").save(
-        semantic_buffer, format="PNG"
-    )
+    Image.fromarray(np.zeros((4, 4), dtype=np.uint8), mode="L").save(semantic_buffer, format="PNG")
     semantic_payload = semantic_buffer.getvalue()
     depth_buffer = io.BytesIO()
     np.save(depth_buffer, np.zeros((4, 4), dtype=np.float32), allow_pickle=False)
@@ -314,3 +319,37 @@ def write_indus_ad_fixture(root: Path) -> IndusAdFixture:
 
 def refreshed_tree(fixture: IndusAdFixture) -> IndusAdFixture:
     return replace(fixture, tree=_repo_tree(fixture.root))
+
+
+def write_executable_indus_ad_fixture(root: Path) -> IndusAdFixture:
+    from decoded_v2_fixture import write_tiny_videos_and_tables
+
+    fixture = write_indus_ad_fixture(root)
+    donor = root.parent / "tiny-sensor-donor"
+    videos, tables = write_tiny_videos_and_tables(donor, fixture.recording_id)
+    integrity_path = root / VIDEO_INTEGRITY_PATH
+    integrity = json.loads(integrity_path.read_text())
+    for camera in DEFAULT_DECODED_CAMERAS:
+        source_path = donor / str(videos[camera]["path"])
+        destination = root / "data" / str(integrity[f"{camera}_video_file_name"])
+        shutil.copyfile(source_path, destination)
+        integrity[f"{camera}_video_byte_size"] = destination.stat().st_size
+        integrity[f"{camera}_video_sha256"] = _sha256(destination)
+    integrity_path.write_text(json.dumps(integrity, sort_keys=True) + "\n")
+    frames = pq.ParquetFile(donor / str(tables["camera_frames"][0]["path"])).read()
+    for camera in DEFAULT_DECODED_CAMERAS:
+        destination = next(
+            (root / "data/tables/camera-frames").glob(f"camera={camera}/bucket=aa/*.parquet")
+        )
+        rows = [row for row in frames.to_pylist() if row["camera_name"] == camera]
+        _write_table(destination, rows, frames.schema)
+    for donor_family, target_family in (("calibration", "calibrations"), ("gnss", "gnss")):
+        destination = next((root / f"data/tables/{target_family}").rglob("*.parquet"))
+        shutil.copyfile(donor / str(tables[donor_family][0]["path"]), destination)
+    privacy_path = root / VIDEO_PRIVACY_PATH
+    privacy = json.loads(privacy_path.read_text())
+    for identity in privacy["files"]:
+        path = root / identity["path"]
+        identity.update(bytes=path.stat().st_size, sha256=_sha256(path))
+    privacy_path.write_text(json.dumps(privacy, sort_keys=True))
+    return refreshed_tree(fixture)

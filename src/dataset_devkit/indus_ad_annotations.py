@@ -82,9 +82,7 @@ def _validate_schema(path: Path, expected: pa.Schema, label: str) -> pq.ParquetF
     if parquet.schema_arrow.metadata:
         scan_forbidden_metadata(
             {
-                key.decode("utf-8", errors="strict"): value.decode(
-                    "utf-8", errors="strict"
-                )
+                key.decode("utf-8", errors="strict"): value.decode("utf-8", errors="strict")
                 for key, value in parquet.schema_arrow.metadata.items()
             },
             f"{label}.schema_metadata",
@@ -250,9 +248,7 @@ def parse_dense_indexes(
     paths: Sequence[Path], *, camera_annotations: Sequence[CameraAnnotation]
 ) -> tuple[DenseAssetRef, ...]:
     """Parse dense member references without opening any referenced archive."""
-    frame_bindings = {
-        item.source_frame_identity: item.frame_id for item in camera_annotations
-    }
+    frame_bindings = {item.source_frame_identity: item.frame_id for item in camera_annotations}
     if len(frame_bindings) != len(camera_annotations):
         raise IndusAdAnnotationError("camera annotations contain duplicate source bindings")
     result: list[DenseAssetRef] = []
@@ -289,9 +285,7 @@ def parse_dense_indexes(
                     height=_required_int(row["height"], "height"),
                     member_path=_required_string(row["member_path"], "member_path"),
                     payload_bytes=_required_int(row["payload_bytes"], "payload_bytes"),
-                    payload_sha256=_required_string(
-                        row["payload_sha256"], "payload_sha256"
-                    ),
+                    payload_sha256=_required_string(row["payload_sha256"], "payload_sha256"),
                     shard_path=_required_string(row["shard_path"], "shard_path"),
                 )
             except ValueError as error:
@@ -328,6 +322,7 @@ def parse_gnss_scenarios(
     *,
     expected_recordings: Mapping[str, int],
     expected_source_revision: str,
+    selected_recording_ids: frozenset[str] | None = None,
 ) -> tuple[GnssScenarioAnnotation, ...]:
     """Parse privacy-minimized recording-relative GNSS weak labels."""
     parquet = _validate_schema(path, gnss_scenario_schema(), "GNSS annotations")
@@ -341,6 +336,8 @@ def parse_gnss_scenarios(
         ):
             raise IndusAdAnnotationError("GNSS annotation contract identity differs")
         recording_id = _required_string(row["recording_id"], "recording_id")
+        if selected_recording_ids is not None and recording_id not in selected_recording_ids:
+            continue
         duration = expected_recordings.get(recording_id)
         if duration is None:
             raise IndusAdAnnotationError("GNSS annotation belongs to a foreign recording")

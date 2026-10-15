@@ -261,9 +261,7 @@ def _repo_video_path(value: object, source: IndusAdHfSourceConfig) -> str | None
     if value.startswith("hf://"):
         parsed = urlsplit(value)
         expected_prefix = f"datasets/{source.repo_id}@"
-        if parsed.netloc != "datasets" or not parsed.path.startswith(
-            f"/{source.repo_id}@"
-        ):
+        if parsed.netloc != "datasets" or not parsed.path.startswith(f"/{source.repo_id}@"):
             raise IndusAdContractError("Viewer video URL targets a foreign repository")
         marker = "/data/"
         if marker not in parsed.path:
@@ -384,9 +382,7 @@ def _one_recording_table(
         and (camera is None or f"/camera={camera}/" in path)
     ]
     if len(matches) != 1:
-        raise IndusAdContractError(
-            f"recording requires exactly one {prefix.rstrip('/')} table"
-        )
+        raise IndusAdContractError(f"recording requires exactly one {prefix.rstrip('/')} table")
     return matches[0]
 
 
@@ -409,9 +405,7 @@ def parse_indus_ad_contract(
     metadata = _index_rows(_load_jsonl(root, METADATA_PATH, tree), "metadata")
     integrity = _index_rows(_load_jsonl(root, VIDEO_INTEGRITY_PATH, tree), "integrity")
     viewer_table = _load_parquet(root, VIDEO_VIEWER_PATH, video_viewer_schema(), tree)
-    viewer = _index_rows(
-        cast(list[dict[str, object]], viewer_table.to_pylist()), "videos Viewer"
-    )
+    viewer = _index_rows(cast(list[dict[str, object]], viewer_table.to_pylist()), "videos Viewer")
     annotation_table = _load_parquet(
         root,
         CAMERA_ANNOTATION_VIEWER_PATH,
@@ -421,8 +415,7 @@ def parse_indus_ad_contract(
     dense_paths = sorted(
         path
         for path in tree
-        if path.startswith("data/annotations/camera/dense-index/")
-        and path.endswith(".parquet")
+        if path.startswith("data/annotations/camera/dense-index/") and path.endswith(".parquet")
     )
     if not dense_paths:
         raise IndusAdContractError("repository lacks dense indexes")
@@ -433,6 +426,19 @@ def parse_indus_ad_contract(
     if len(metadata) != privacy.get("recording_count"):
         raise IndusAdContractError("privacy manifest recording count differs")
 
+    recording_tables: dict[str, dict[str, RepositoryFile]] = {
+        recording_id: {} for recording_id in metadata
+    }
+    identity_lengths = {len(recording_id) for recording_id in metadata}
+    for path, identity in tree.items():
+        if not path.startswith("data/tables/"):
+            continue
+        stem = PurePosixPath(path).stem
+        for length in identity_lengths:
+            candidate = stem[-length:]
+            if candidate in recording_tables:
+                recording_tables[candidate][path] = identity
+
     privacy_counts = {"face_plate_blurred": 0, "missing": 0}
     entries: list[IndusAdRecordingEntry] = []
     for recording_id in sorted(metadata):
@@ -442,9 +448,7 @@ def parse_indus_ad_contract(
         videos: list[IndusAdArtifact] = []
         for camera in _CAMERAS:
             viewer_path = _viewer_video_path(video_row.get(f"{camera}_video"), source)
-            metadata_path = _repo_video_path(
-                meta.get(f"{camera}_video_file_name"), source
-            )
+            metadata_path = _repo_video_path(meta.get(f"{camera}_video_file_name"), source)
             integrity_path = _repo_video_path(
                 integrity_row.get(f"{camera}_video_file_name"), source
             )
@@ -491,10 +495,11 @@ def parse_indus_ad_contract(
         selected_by_split = not source.splits or "train" in source.splits
         if not (selected_by_id and selected_by_split):
             continue
+        recording_tree = recording_tables[recording_id]
         artifacts: list[IndusAdArtifact] = []
         for camera in source.cameras:
             path = _one_recording_table(
-                tree,
+                recording_tree,
                 "data/tables/camera-frames/",
                 recording_id,
                 camera=camera,
@@ -503,14 +508,12 @@ def parse_indus_ad_contract(
         artifacts.extend(
             [
                 _artifact(
-                    _one_recording_table(
-                        tree, "data/tables/calibrations/", recording_id
-                    ),
+                    _one_recording_table(recording_tree, "data/tables/calibrations/", recording_id),
                     "calibration",
                     tree,
                 ),
                 _artifact(
-                    _one_recording_table(tree, "data/tables/gnss/", recording_id),
+                    _one_recording_table(recording_tree, "data/tables/gnss/", recording_id),
                     "gnss",
                     tree,
                 ),

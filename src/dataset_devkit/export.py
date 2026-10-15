@@ -16,14 +16,15 @@ from uuid import UUID, uuid5
 
 from PIL import Image
 
-from dataset_devkit.config import GlobalConfig, ScenariosConfig, SplitConfig
+from dataset_devkit.config import GlobalConfig, GlobalConfigV21, ScenariosConfig, SplitConfig
 from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import CameraCalibration, EgoPose, StagedImage
 from dataset_devkit.features import SceneFeatures
 from dataset_devkit.identifiers import validate_safe_segment
-from dataset_devkit.indus_ad_export import build_indus_ad_export
+from dataset_devkit.indus_ad_export import serialize_indus_ad_extensions
 from dataset_devkit.indus_ad_join import JoinedIndusAdAnnotations
 from dataset_devkit.provenance import (
+    IndusAdSourceFingerprint,
     RecordingFingerprint,
     canonical_hash,
     canonical_json,
@@ -1224,35 +1225,37 @@ def _export_into(writer: _SafeDatarootWriter, evidence: ExportEvidence) -> Expor
         pipeline_audit,
     )
     if evidence.source_type == "indus_ad_hf":
-        indus_ad = build_indus_ad_export(evidence.indus_ad_annotations)
-        _write_json(
-            writer,
-            ("mz_extensions", "indus_ad", "camera.json"),
-            indus_ad.camera,
+        if not isinstance(evidence.resolved_config, GlobalConfigV21):
+            raise ValueError("integrated evidence requires schema 2.1 configuration")
+        fingerprints = tuple(
+            graph.source
+            for graph in selected_graphs
+            if isinstance(graph.source, IndusAdSourceFingerprint)
+        )
+        if len(fingerprints) != len(selected_graphs):
+            raise ValueError("integrated evidence contains a foreign source fingerprint")
+        indus_ad = serialize_indus_ad_extensions(
+            evidence.indus_ad_annotations,
+            evidence.resolved_config,
+            fingerprints,
         )
         _write_json(
             writer,
-            ("mz_extensions", "indus_ad", "gnss_scenarios.json"),
-            indus_ad.gnss_scenarios,
+            ("mz_extensions", "indus_ad", "contract.json"),
+            indus_ad.contract,
         )
-        _write_json(
-            writer,
-            ("mz_extensions", "indus_ad", "dense_assets.json"),
+        writer.write(
+            ("mz_extensions", "indus_ad", "camera_annotations.parquet"),
+            indus_ad.camera_annotations,
+        )
+        writer.write(
+            ("mz_extensions", "indus_ad", "gnss_annotations.parquet"),
+            indus_ad.gnss_annotations,
+        )
+        writer.write(
+            ("mz_extensions", "indus_ad", "dense_assets.parquet"),
             indus_ad.dense_assets,
         )
-        _write_json(
-            writer,
-            ("mz_extensions", "indus_ad", "join_audit.json"),
-            indus_ad.join_audit,
-        )
-        for asset in indus_ad.assets:
-            content = asset.source_path.read_bytes()
-            if (
-                len(content) != asset.expected_size
-                or hashlib.sha256(content).hexdigest() != asset.expected_sha256
-            ):
-                raise ValueError("dense asset changed after verified materialization")
-            writer.write(tuple(asset.relative_path.split("/")), content)
     manifest_bytes = _write_json(
         writer,
         ("mz_extensions", "content_manifest.json"),

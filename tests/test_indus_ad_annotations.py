@@ -23,9 +23,7 @@ def _rewrite_camera(path: Path, mutation: object) -> None:
     rows = table.to_pylist()
     assert callable(mutation)
     mutation(rows[0])
-    pq.write_table(
-        pa.Table.from_pylist(rows, schema=camera_annotation_schema()), path
-    )
+    pq.write_table(pa.Table.from_pylist(rows, schema=camera_annotation_schema()), path)
 
 
 def test_camera_parser_preserves_weak_label_values(tmp_path: Path) -> None:
@@ -42,6 +40,17 @@ def test_camera_parser_preserves_weak_label_values(tmp_path: Path) -> None:
     assert row.weather.probabilities["clear"] == 1.0
     assert row.provenance == "machine_generated_weak_pseudo_label"
     assert bundle.availability["gnss"].state == "not_selected"
+
+
+@pytest.mark.parametrize("label", ["rain_wet_road", "fog_haze", "low_light_night"])
+def test_camera_parser_accepts_published_weather_vocabulary(tmp_path: Path, label: str) -> None:
+    fixture = write_indus_ad_fixture(tmp_path)
+    _rewrite_camera(fixture.camera_annotations, lambda row: row.update(weather_label=label))
+    bundle = parse_camera_annotations(
+        fixture.camera_annotations,
+        expected_recordings={fixture.recording_id: fixture.duration_ns},
+    )
+    assert bundle.camera[0].weather.label == label
 
 
 @pytest.mark.parametrize(
@@ -61,9 +70,7 @@ def test_camera_parser_preserves_weak_label_values(tmp_path: Path) -> None:
         ),
     ],
 )
-def test_camera_parser_rejects_invalid_weak_label_rows(
-    tmp_path: Path, mutation: object
-) -> None:
+def test_camera_parser_rejects_invalid_weak_label_rows(tmp_path: Path, mutation: object) -> None:
     fixture = write_indus_ad_fixture(tmp_path)
     _rewrite_camera(fixture.camera_annotations, mutation)
 
@@ -97,9 +104,7 @@ def test_dense_parser_binds_refs_without_opening_archives(tmp_path: Path) -> Non
         expected_recordings={fixture.recording_id: fixture.duration_ns},
     )
 
-    refs = parse_dense_indexes(
-        [fixture.dense_index], camera_annotations=bundle.camera
-    )
+    refs = parse_dense_indexes([fixture.dense_index], camera_annotations=bundle.camera)
 
     assert {item.kind for item in refs} == {"semantic", "depth"}
     assert {item.frame_id for item in refs} == {"frame-fixture"}

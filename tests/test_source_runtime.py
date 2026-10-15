@@ -35,7 +35,11 @@ from dataset_devkit.services import BuildOperationalError, BuildRuntime, build_d
 from dataset_devkit.source_runtime import McapAcquirerProtocol, prepare_source
 from dataset_devkit.validation import validate_dataset as validate_output
 from decoded_v2_fixture import decoded_source_config, write_decoded_fixture
-from indus_ad_fixture import IndusAdFixture, write_indus_ad_fixture
+from indus_ad_fixture import (
+    IndusAdFixture,
+    write_executable_indus_ad_fixture,
+    write_indus_ad_fixture,
+)
 
 
 def _decoded_config(base: GlobalConfig, tmp_path: Path) -> GlobalConfigV2:
@@ -128,6 +132,67 @@ def test_prepare_source_dispatches_integrated_indus_backend(
     assert batch.recordings[0].indus_ad_annotations is not None
     assert batch.recordings[0].materialize_dense_assets is not None
     assert decoded_called is False
+
+
+def test_integrated_backend_builds_and_validates_tiny_selected_labels(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config, _ = _indus_config(config_factory(), tmp_path)
+    fixture = write_executable_indus_ad_fixture(tmp_path / "executable-indus")
+    annotations = tmp_path / "empty-annotations.jsonl"
+    annotations.write_text("")
+    config = config.model_copy(
+        update={
+            "source": fixture.source,
+            "annotations": config.annotations.model_copy(update={"path": annotations}),
+            "scenes": config.scenes.model_copy(
+                update={
+                    "mode": "automatic",
+                    "min_duration_s": Decimal("0.1"),
+                    "max_duration_s": Decimal("10"),
+                    "min_samples": 2,
+                    "max_sample_gap_ms": Decimal("1000"),
+                    "skip_between_scenes_s": Decimal("0"),
+                }
+            ),
+            "gnss": config.gnss.model_copy(
+                update={
+                    "position_sigma_max_m": 10.0,
+                    "orientation_variance_max": 10.0,
+                    "sync_gap_max_ms": 2000.0,
+                }
+            ),
+            "frame_validity": config.frame_validity.model_copy(
+                update={
+                    "required_cameras": list(DEFAULT_DECODED_CAMERAS),
+                    "camera_timestamp_gap_max_ms": 2000.0,
+                }
+            ),
+            "tags": config.tags.model_copy(update={"reference_camera_channel": "cam_front"}),
+            "filters": FiltersConfig(),
+            "scenarios": ScenariosConfig(
+                seed=7,
+                strict_quotas=True,
+                rules=[ScenarioRuleConfig(name="all", quota=1)],
+            ),
+            "quarantine": config.quarantine.model_copy(
+                update={"directory": tmp_path / "quarantine"}
+            ),
+        }
+    )
+    runtime = BuildRuntime(
+        indus_ad_acquirer_factory=lambda value: _local_indus_acquirer(value, fixture),
+        official_smoke=False,
+    )
+
+    result = build_dataset(config, runtime=runtime)
+
+    dataset = Dataset(result.dataroot)
+    assert result.source_type == "indus_ad_hf"
+    assert result.scene_count == 1
+    assert dataset.camera_annotation("frame-fixture").annotation.recording_offset_ns == 0
+    assert dataset.indus_ad_contract()["camera_rows"] == 1
+    assert validate_output(result.dataroot, official_smoke=False).succeeded
 
 
 def test_prepare_source_dispatches_decoded_backend(
