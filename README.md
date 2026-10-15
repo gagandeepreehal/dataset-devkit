@@ -12,9 +12,39 @@ applies scenario quotas, and exports validated train/test splits with provenance
 Integrated INDUS-AD support includes camera, semantic, depth, weather, and optional
 GNSS weak pseudo-labels. These model outputs remain separate from human labels.
 
+![Publisher-provided example of six camera perspectives in Bengaluru traffic](docs/assets/indus-ad-surround-view.png)
+
+*Illustrative surround view from the INDUS-AD dataset card; not a calibrated camera-layout diagram
+or independent evidence of anonymization performance. [Image source and license](docs/assets/SOURCES.md).*
+
 > Compatibility refers to the nuScenes file structure and supported loader behavior.
 > This project is independent of Motional and does not reproduce the nuScenes
 > sensor suite, annotations, maps, or benchmarks.
+
+## Source dataset
+
+[INDUS-AD on Hugging Face](https://huggingface.co/datasets/gagandeepreehal/indus-ad)
+contains multi-camera driving recordings from Bengaluru, India, with camera timing,
+calibration, transformed GNSS/pose tables, and sampled semantic, depth, weather, and
+image-quality pseudo-labels joined by `recording_id`.
+
+| Dataset-card snapshot | Value |
+| --- | --- |
+| Recordings | 1,469 |
+| Camera videos | 9,927 MP4s |
+| Recording timeline (longest camera per recording) | 85.31 hours |
+| Summed camera-view duration | 588.57 hours across cameras, not distinct driving hours |
+| Camera positions | Six surround cameras; tilted-front video in 1,113 recordings |
+| Sampled camera annotation rows | 34,306; not labels for every video frame |
+
+Figures come from the [dataset card snapshot](https://huggingface.co/datasets/gagandeepreehal/indus-ad/blob/8983a2b9852d7109b97c5c29dd0482fa9e7e92bb/README.md),
+checked 16 October 2026. Its `train` split is a storage/API label, not an authored benchmark split.
+The devkit creates its own derived train/test split. Dataset access requires manual approval;
+the card reports privacy/legal and launch approval as pending.
+
+![INDUS-AD video, GNSS and motion, pseudo-labels, and dense semantic/depth layers joined by recording ID](docs/assets/indus-ad-dataset-layers.png)
+
+*Publisher-provided dataset-layer diagram. [Image source and license](docs/assets/SOURCES.md).*
 
 ## Setup
 
