@@ -1,11 +1,14 @@
 # Configuration
 
 `dataset_config.json` is validated by the strict, versioned Pydantic `GlobalConfig` model. Schema
-`"1.0"` is the legacy MCAP form and schema `"2.0"` adds an explicit discriminated source. Unknown
+`"1.0"` is the legacy MCAP form, schema `"2.0"` selects decoded V2, and schema `"2.1"`
+selects integrated INDUS-AD. Unknown
 keys are rejected and relative local paths resolve from the directory containing the configuration
 file.
 
-Public consumers should start with
+For integrated INDUS-AD with annotations, start with
+[`examples/indus_ad_v21_config.json`](../examples/indus_ad_v21_config.json) and
+[the integrated workflow](indus-ad.md). For the older decoded V2 layout, use
 [`examples/decoded_v2_config.json`](../examples/decoded_v2_config.json); the all-zero revision is a
 fixture placeholder and must be replaced with a verified release commit. The legacy MCAP example
 is [`examples/dataset_config.json`](../examples/dataset_config.json). The generated
@@ -14,7 +17,8 @@ validation, while `load_config` remains authoritative for runtime and cross-fiel
 
 ## Hugging Face sources
 
-Both inputs are Hugging Face dataset repositories pinned to immutable commits:
+All source backends use Hugging Face dataset repositories pinned to immutable commits.
+The following example describes the decoded V2 backend:
 
 ```json
 {
@@ -35,7 +39,7 @@ Both inputs are Hugging Face dataset repositories pinned to immutable commits:
 }
 ```
 
-`decoded_hf` is the only schema `"2.0"` backend. It is the recommended public-consumer backend and
+`decoded_hf` is the only schema `"2.0"` backend. It
 is fixed to `privacy_classification: "privacy_transformed"`. `recording_ids` and `splits` are
 intersected; at least one must select data. The six untilted cameras are the default. The seventh
 supported camera, `cam_front_tilted`, is opt-in. Video, GNSS, and calibration are required

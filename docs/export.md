@@ -121,6 +121,14 @@ anonymizer.
 
 ## Read-only SDK
 
+Integrated schema 2.1 output adds `mz_extensions/indus_ad/contract.json`,
+`camera_annotations.parquet`, `gnss_annotations.parquet`, and `dense_assets.parquet`.
+Its immutable SDK APIs are `camera_annotation(frame_id)`,
+`camera_annotations(recording_id=..., camera_name=...)`,
+`gnss_annotation(recording_id, window_index)`, `gnss_annotations(recording_id=...)`,
+`dense_asset(frame_id, kind)`, and `indus_ad_contract()` (a defensive dictionary copy).
+See [the integrated workflow](indus-ad.md) for the source contract and verification limits.
+
 `Dataset(dataroot, version="v1.0-trainval")` accepts `str` or `Path`, loads every official table
 and extension, and rejects malformed JSON, unsafe versions or filenames, missing tokens, and
 duplicate tokens. Its stable methods are:
