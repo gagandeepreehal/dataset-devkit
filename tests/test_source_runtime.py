@@ -14,6 +14,7 @@ from dataset_devkit.config import (
     FiltersConfig,
     GlobalConfig,
     GlobalConfigV2,
+    GlobalConfigV21,
     ScenarioRuleConfig,
     ScenariosConfig,
 )
@@ -28,11 +29,17 @@ from dataset_devkit.decoded_manifest import (
     DecodedSelectionPlan,
 )
 from dataset_devkit.extraction.cache import ExtractionResultCache
+from dataset_devkit.indus_ad_acquisition import IndusAdHfAcquirer
 from dataset_devkit.provenance import extraction_config_hash
 from dataset_devkit.services import BuildOperationalError, BuildRuntime, build_dataset
 from dataset_devkit.source_runtime import McapAcquirerProtocol, prepare_source
 from dataset_devkit.validation import validate_dataset as validate_output
 from decoded_v2_fixture import decoded_source_config, write_decoded_fixture
+from indus_ad_fixture import (
+    IndusAdFixture,
+    write_executable_indus_ad_fixture,
+    write_indus_ad_fixture,
+)
 
 
 def _decoded_config(base: GlobalConfig, tmp_path: Path) -> GlobalConfigV2:
@@ -48,16 +55,12 @@ def _decoded_config(base: GlobalConfig, tmp_path: Path) -> GlobalConfigV2:
     }
     return GlobalConfigV2(
         schema_version="2.0",
-        source=decoded_source_config(
-            fixture.revision, [fixture.recording_id]
-        ),
+        source=decoded_source_config(fixture.revision, [fixture.recording_id]),
         **common,
     )
 
 
-def _local_decoded_acquirer(
-    config: GlobalConfigV2, remote: Path
-) -> DecodedHfAcquirer:
+def _local_decoded_acquirer(config: GlobalConfigV2, remote: Path) -> DecodedHfAcquirer:
     def download(**kwargs: object) -> str:
         filename = str(kwargs["filename"])
         target = Path(str(kwargs["local_dir"])) / filename
@@ -69,6 +72,127 @@ def _local_decoded_acquirer(
     return DecodedHfAcquirer(
         source=config.source, cache_dir=config.paths.cache_dir, download_file=download
     )
+
+
+def _indus_config(base: GlobalConfig, tmp_path: Path) -> tuple[GlobalConfigV21, IndusAdFixture]:
+    fixture = write_indus_ad_fixture(tmp_path / "indus-remote")
+    common = base.model_dump()
+    common.pop("schema_version")
+    common.pop("huggingface")
+    common.pop("topics")
+    common["paths"] = {
+        "work_dir": tmp_path / "indus-work",
+        "cache_dir": tmp_path / "indus-cache",
+        "output_dir": tmp_path / "indus-output",
+    }
+    return (
+        GlobalConfigV21(schema_version="2.1", source=fixture.source, **common),
+        fixture,
+    )
+
+
+def _local_indus_acquirer(config: GlobalConfigV21, fixture: IndusAdFixture) -> IndusAdHfAcquirer:
+    def download(**kwargs: object) -> str:
+        filename = str(kwargs["filename"])
+        target = Path(str(kwargs["local_dir"])) / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(fixture.root / filename, target)
+        return str(target)
+
+    return IndusAdHfAcquirer(
+        source=config.source,
+        cache_dir=config.paths.cache_dir,
+        list_tree=lambda repo_id, revision: fixture.tree,
+        download_file=download,
+    )
+
+
+def test_prepare_source_dispatches_integrated_indus_backend(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config, fixture = _indus_config(config_factory(), tmp_path)
+    decoded_called = False
+
+    def decoded_factory(_config: object) -> DecodedHfAcquirer:
+        nonlocal decoded_called
+        decoded_called = True
+        raise AssertionError("decoded fallback invoked")
+
+    runtime = BuildRuntime(
+        decoded_acquirer_factory=decoded_factory,
+        indus_ad_acquirer_factory=lambda value: _local_indus_acquirer(value, fixture),
+        official_smoke=False,
+    )
+
+    batch = prepare_source(config, runtime)
+
+    assert batch.source_type == "indus_ad_hf"
+    assert batch.privacy_classification == "privacy_transformed"
+    assert batch.pose_frame == "recording_local_enu_v1"
+    assert batch.recordings[0].indus_ad_annotations is not None
+    assert batch.recordings[0].materialize_dense_assets is not None
+    assert decoded_called is False
+
+
+def test_integrated_backend_builds_and_validates_tiny_selected_labels(
+    tmp_path: Path, config_factory: Callable[[], GlobalConfig]
+) -> None:
+    config, _ = _indus_config(config_factory(), tmp_path)
+    fixture = write_executable_indus_ad_fixture(tmp_path / "executable-indus")
+    annotations = tmp_path / "empty-annotations.jsonl"
+    annotations.write_text("")
+    config = config.model_copy(
+        update={
+            "source": fixture.source,
+            "annotations": config.annotations.model_copy(update={"path": annotations}),
+            "scenes": config.scenes.model_copy(
+                update={
+                    "mode": "automatic",
+                    "min_duration_s": Decimal("0.1"),
+                    "max_duration_s": Decimal("10"),
+                    "min_samples": 2,
+                    "max_sample_gap_ms": Decimal("1000"),
+                    "skip_between_scenes_s": Decimal("0"),
+                }
+            ),
+            "gnss": config.gnss.model_copy(
+                update={
+                    "position_sigma_max_m": 10.0,
+                    "orientation_variance_max": 10.0,
+                    "sync_gap_max_ms": 2000.0,
+                }
+            ),
+            "frame_validity": config.frame_validity.model_copy(
+                update={
+                    "required_cameras": list(DEFAULT_DECODED_CAMERAS),
+                    "camera_timestamp_gap_max_ms": 2000.0,
+                }
+            ),
+            "tags": config.tags.model_copy(update={"reference_camera_channel": "cam_front"}),
+            "filters": FiltersConfig(),
+            "scenarios": ScenariosConfig(
+                seed=7,
+                strict_quotas=True,
+                rules=[ScenarioRuleConfig(name="all", quota=1)],
+            ),
+            "quarantine": config.quarantine.model_copy(
+                update={"directory": tmp_path / "quarantine"}
+            ),
+        }
+    )
+    runtime = BuildRuntime(
+        indus_ad_acquirer_factory=lambda value: _local_indus_acquirer(value, fixture),
+        official_smoke=False,
+    )
+
+    result = build_dataset(config, runtime=runtime)
+
+    dataset = Dataset(result.dataroot)
+    assert result.source_type == "indus_ad_hf"
+    assert result.scene_count == 1
+    assert dataset.camera_annotation("frame-fixture").annotation.recording_offset_ns == 0
+    assert dataset.indus_ad_contract()["camera_rows"] == 1
+    assert validate_output(result.dataroot, official_smoke=False).succeeded
 
 
 def test_prepare_source_dispatches_decoded_backend(
@@ -84,9 +208,7 @@ def test_prepare_source_dispatches_decoded_backend(
 
     runtime = BuildRuntime(
         mcap_acquirer_factory=mcap_factory,
-        decoded_acquirer_factory=lambda value: _local_decoded_acquirer(
-            value, tmp_path / "remote"
-        ),
+        decoded_acquirer_factory=lambda value: _local_decoded_acquirer(value, tmp_path / "remote"),
         official_smoke=False,
     )
 
@@ -116,9 +238,7 @@ def test_decoded_privacy_failure_never_calls_mcap_factory(
         def load_plan(self) -> DecodedSelectionPlan:
             raise DecodedManifestError("privacy contract differs")
 
-        def acquire(
-            self, _entry: DecodedRecordingEntry
-        ) -> AcquiredDecodedRecording:
+        def acquire(self, _entry: DecodedRecordingEntry) -> AcquiredDecodedRecording:
             raise AssertionError("acquire called after privacy failure")
 
     runtime = BuildRuntime(
@@ -166,9 +286,7 @@ def test_decoded_backend_runs_through_common_build_orchestration(
                     "camera_timestamp_gap_max_ms": 2_000.0,
                 }
             ),
-            "tags": config.tags.model_copy(
-                update={"reference_camera_channel": "cam_front"}
-            ),
+            "tags": config.tags.model_copy(update={"reference_camera_channel": "cam_front"}),
             "filters": FiltersConfig(),
             "scenarios": ScenariosConfig(
                 seed=7,
@@ -184,9 +302,7 @@ def test_decoded_backend_runs_through_common_build_orchestration(
         }
     )
     runtime = BuildRuntime(
-        decoded_acquirer_factory=lambda value: _local_decoded_acquirer(
-            value, tmp_path / "remote"
-        ),
+        decoded_acquirer_factory=lambda value: _local_decoded_acquirer(value, tmp_path / "remote"),
         official_smoke=False,
     )
     batch = prepare_source(config, runtime)
@@ -206,9 +322,7 @@ def test_decoded_backend_runs_through_common_build_orchestration(
         "schema_version": 1,
         "source_type": "decoded_hf",
     }
-    gnss = json.loads(
-        (result.dataroot / "mz_extensions/gnss.json").read_text(encoding="utf-8")
-    )[0]
+    gnss = json.loads((result.dataroot / "mz_extensions/gnss.json").read_text(encoding="utf-8"))[0]
     pose = dataset.ego_pose(gnss["sample_data_token"])
     assert pose["translation"] == pytest.approx(gnss["translation_xyz_m"])
     assert gnss["published_horizontal_resolution_m"] == 1.0

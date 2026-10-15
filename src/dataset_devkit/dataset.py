@@ -10,8 +10,27 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, cast
 
+import pyarrow.parquet as pq
+
+from dataset_devkit.config import CameraName
 from dataset_devkit.export import NUSCENES_VERSION, OFFICIAL_TABLES
 from dataset_devkit.identifiers import validate_safe_segment
+from dataset_devkit.indus_ad_export import (
+    CameraAnnotationRecord,
+    DenseAssetRecord,
+    GnssAnnotationRecord,
+    camera_annotation_schema,
+    dense_asset_schema,
+    gnss_annotation_schema,
+)
+from dataset_devkit.indus_ad_models import (
+    CameraAnnotation,
+    DenseAssetRef,
+    GnssScenarioAnnotation,
+    ImageQualitySummary,
+    SemanticFraction,
+    WeatherWeakLabel,
+)
 
 
 class DatasetFormatError(ValueError):
@@ -49,7 +68,7 @@ def _validated_source_metadata(value: object) -> JsonRecord:
     source_type = value.get("source_type")
     expected = (
         ("privacy_transformed", "recording_local_enu_v1", 1.0)
-        if source_type == "decoded_hf"
+        if source_type in {"decoded_hf", "indus_ad_hf"}
         else ("restricted_raw", "web_mercator_v1", None)
         if source_type == "mcap_hf"
         else None
@@ -64,17 +83,147 @@ def _validated_source_metadata(value: object) -> JsonRecord:
     return cast(JsonRecord, value)
 
 
-def _safe_asset_filename(
-    value: object, *, directory: str, part_count: int, label: str
-) -> str:
+def _parquet_rows(path: Path, schema: object) -> list[JsonRecord]:
+    try:
+        parquet = pq.ParquetFile(path)
+        if not parquet.schema_arrow.remove_metadata().equals(
+            cast(Any, schema), check_metadata=False
+        ):
+            raise DatasetFormatError(f"INDUS-AD extension schema differs: {path.name}")
+        return cast(list[JsonRecord], parquet.read().to_pylist())
+    except DatasetFormatError:
+        raise
+    except Exception as error:
+        raise DatasetFormatError(f"malformed INDUS-AD extension: {path.name}") from error
+
+
+def _camera_annotation_record(row: JsonRecord) -> CameraAnnotationRecord:
+    category_names = (
+        "drivable",
+        "lane_marking",
+        "person_rider",
+        "two_wheeler",
+        "four_wheeler",
+        "building",
+        "vegetation",
+        "sky",
+    )
+    weather_names = (
+        "clear",
+        "overcast",
+        "rain",
+        "fog",
+        "low_light",
+        "uncertain_mixed",
+    )
+    quality_names = (
+        "luminance_mean",
+        "luminance_p05",
+        "luminance_p95",
+        "contrast_std",
+        "saturation_mean",
+        "laplacian_variance",
+        "dark_fraction",
+        "overexposed_fraction",
+    )
+    semantic = row["semantic_fractions"]
+    if not isinstance(semantic, list):
+        raise DatasetFormatError("camera semantic fractions are malformed")
+    annotation = CameraAnnotation(
+        cast(str, row["recording_id"]),
+        cast(CameraName, row["camera_name"]),
+        cast(int | None, row["selected_time_of_day_ns"]),
+        cast(int, row["recording_offset_ns"]),
+        cast(int, row["frame_index"]),
+        cast(str, row["frame_id"]),
+        cast(str, row["sample_kind"]),
+        cast(str, row["window_id"]),
+        cast(int, row["decoded_width"]),
+        cast(int, row["decoded_height"]),
+        tuple(
+            SemanticFraction(cast(int, item["class_id"]), cast(float, item["fraction"]))
+            for item in cast(list[JsonRecord], semantic)
+        ),
+        {name: cast(float | None, row[f"{name}_fraction"]) for name in category_names},
+        {name: cast(float | None, row[f"depth_{name}"]) for name in ("p10", "p50", "p90")},
+        WeatherWeakLabel(
+            {
+                name: cast(float | None, row[f"weather_{name}_probability"])
+                for name in weather_names
+            },
+            cast(str | None, row["weather_label"]),
+            cast(float | None, row["weather_confidence"]),
+            cast(float | None, row["weather_margin"]),
+            cast(bool | None, row["weather_uncertain"]),
+        ),
+        ImageQualitySummary({name: cast(float | None, row[name]) for name in quality_names}),
+    )
+    if row.get("weak_label_provenance") != annotation.provenance:
+        raise DatasetFormatError("camera weak-label provenance differs")
+    return CameraAnnotationRecord(
+        annotation,
+        cast(str, row["source_digest"]),
+        cast(str, row["scene_token"]),
+        cast(str, row["sample_token"]),
+        cast(str, row["sample_data_token"]),
+    )
+
+
+def _gnss_annotation_record(row: JsonRecord) -> GnssAnnotationRecord:
+    annotation = GnssScenarioAnnotation(
+        cast(str, row["recording_id"]),
+        cast(int, row["window_index"]),
+        cast(int, row["window_start_offset_ns"]),
+        cast(int, row["window_end_offset_ns"]),
+        cast(str, row["motion_label"]),
+        tuple(cast(list[str], row["validity_tags"])),
+        tuple(cast(list[str], row["quality_tags"])),
+        cast(bool, row["anomaly_candidate"]),
+        tuple(cast(list[str], row["anomaly_reasons"])),
+        cast(float, row["confidence"]),
+        "indus_ad_gnss_annotations_v1",
+        cast(str, row["run_id"]),
+    )
+    if row.get("weak_label_provenance") != annotation.provenance:
+        raise DatasetFormatError("GNSS weak-label provenance differs")
+    return GnssAnnotationRecord(
+        annotation,
+        cast(str, row["source_digest"]),
+        tuple(cast(list[str], row["scene_tokens"])),
+        tuple(cast(list[str], row["sample_tokens"])),
+    )
+
+
+def _dense_asset_record(row: JsonRecord) -> DenseAssetRecord:
+    ref = DenseAssetRef(
+        cast(str, row["recording_id"]),
+        cast(CameraName, row["camera_name"]),
+        cast(int, row["frame_index"]),
+        cast(int, row["recording_offset_ns"]),
+        cast(str, row["frame_id"]),
+        cast(Any, row["kind"]),
+        cast(str, row["dtype"]),
+        cast(int, row["width"]),
+        cast(int, row["height"]),
+        cast(str, row["member_path"]),
+        cast(int, row["payload_bytes"]),
+        cast(str, row["payload_sha256"]),
+        cast(str, row["shard_path"]),
+    )
+    return DenseAssetRecord(
+        ref,
+        cast(str, row["source_digest"]),
+        cast(str, row["scene_token"]),
+        cast(str, row["sample_data_token"]),
+        cast(bool, row["materialized"]),
+    )
+
+
+def _safe_asset_filename(value: object, *, directory: str, part_count: int, label: str) -> str:
     if not isinstance(value, str):
         raise DatasetFormatError(f"{label} filename must be a string")
     path = PurePosixPath(value)
-    if (
-        path.is_absolute()
-        or len(path.parts) != part_count
-        or path.parts[0] != directory
-    ):
+    if path.is_absolute() or len(path.parts) != part_count or path.parts[0] != directory:
         raise DatasetFormatError(f"unsafe {label} filename")
     try:
         for part in path.parts:
@@ -99,6 +248,9 @@ class Dataset:
     _token_index: Mapping[str, Mapping[str, JsonRecord]] = field(init=False, repr=False)
     _extensions: Mapping[str, object] = field(init=False, repr=False)
     _camera_index: Mapping[tuple[str, str], str] = field(init=False, repr=False)
+    _indus_camera: tuple[CameraAnnotationRecord, ...] = field(init=False, repr=False)
+    _indus_gnss: tuple[GnssAnnotationRecord, ...] = field(init=False, repr=False)
+    _indus_dense: tuple[DenseAssetRecord, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         root = Path(self.dataroot).resolve()
@@ -143,29 +295,21 @@ class Dataset:
             indexes[name] = MappingProxyType(index)
         camera_index: dict[tuple[str, str], str] = {}
         for calibration in tables["calibrated_sensor"]:
-            sensor_token = _required_string(
-                calibration, "sensor_token", "calibrated_sensor"
-            )
+            sensor_token = _required_string(calibration, "sensor_token", "calibrated_sensor")
             if sensor_token not in indexes["sensor"]:
                 raise DatasetFormatError("calibrated_sensor references a missing sensor")
         for item in tables["sample_data"]:
             sample_token = _required_string(item, "sample_token", "sample_data")
-            calibration_token = _required_string(
-                item, "calibrated_sensor_token", "sample_data"
-            )
+            calibration_token = _required_string(item, "calibrated_sensor_token", "sample_data")
             ego_pose_token = _required_string(item, "ego_pose_token", "sample_data")
             if sample_token not in indexes["sample"]:
                 raise DatasetFormatError("sample_data references a missing sample")
             if calibration_token not in indexes["calibrated_sensor"]:
-                raise DatasetFormatError(
-                    "sample_data references a missing calibrated_sensor"
-                )
+                raise DatasetFormatError("sample_data references a missing calibrated_sensor")
             if ego_pose_token not in indexes["ego_pose"]:
                 raise DatasetFormatError("sample_data references a missing ego_pose")
             calibration = indexes["calibrated_sensor"][calibration_token]
-            sensor_token = _required_string(
-                calibration, "sensor_token", "calibrated_sensor"
-            )
+            sensor_token = _required_string(calibration, "sensor_token", "calibrated_sensor")
             sensor = indexes["sensor"][sensor_token]
             channel = _required_string(sensor, "channel", "sensor")
             if not channel.startswith("CAM_"):
@@ -189,11 +333,88 @@ class Dataset:
             "pipeline_audit",
         ):
             extensions[name] = _load_json(root / "mz_extensions" / f"{name}.json")
-        _validated_source_metadata(extensions["source"])
+        source_metadata = _validated_source_metadata(extensions["source"])
+        indus_camera: tuple[CameraAnnotationRecord, ...] = ()
+        indus_gnss: tuple[GnssAnnotationRecord, ...] = ()
+        indus_dense: tuple[DenseAssetRecord, ...] = ()
+        if source_metadata["source_type"] == "indus_ad_hf":
+            directory = root / "mz_extensions" / "indus_ad"
+            contract = _load_json(directory / "contract.json")
+            if not isinstance(contract, dict):
+                raise DatasetFormatError("INDUS-AD contract is malformed")
+            extensions["indus_ad/contract"] = contract
+            indus_camera = tuple(
+                _camera_annotation_record(row)
+                for row in _parquet_rows(
+                    directory / "camera_annotations.parquet",
+                    camera_annotation_schema(),
+                )
+            )
+            indus_gnss = tuple(
+                _gnss_annotation_record(row)
+                for row in _parquet_rows(
+                    directory / "gnss_annotations.parquet",
+                    gnss_annotation_schema(),
+                )
+            )
+            indus_dense = tuple(
+                _dense_asset_record(row)
+                for row in _parquet_rows(directory / "dense_assets.parquet", dense_asset_schema())
+            )
+            if (
+                contract.get("camera_rows") != len(indus_camera)
+                or contract.get("gnss_rows") != len(indus_gnss)
+                or contract.get("dense_rows") != len(indus_dense)
+            ):
+                raise DatasetFormatError("INDUS-AD contract row counts differ")
+            if len({item.frame_id for item in indus_camera}) != len(indus_camera):
+                raise DatasetFormatError("duplicate INDUS-AD camera annotation identity")
+            if len({(item.recording_id, item.window_index) for item in indus_gnss}) != len(
+                indus_gnss
+            ):
+                raise DatasetFormatError("duplicate INDUS-AD GNSS annotation identity")
+            if len({(item.frame_id, item.kind) for item in indus_dense}) != len(indus_dense):
+                raise DatasetFormatError("duplicate INDUS-AD dense asset identity")
         object.__setattr__(self, "_tables", MappingProxyType(tables))
         object.__setattr__(self, "_token_index", MappingProxyType(indexes))
         object.__setattr__(self, "_extensions", MappingProxyType(extensions))
         object.__setattr__(self, "_camera_index", MappingProxyType(camera_index))
+        object.__setattr__(self, "_indus_camera", indus_camera)
+        object.__setattr__(self, "_indus_gnss", indus_gnss)
+        object.__setattr__(self, "_indus_dense", indus_dense)
+        if source_metadata["source_type"] == "indus_ad_hf":
+            from dataset_devkit.provenance import (
+                IndusAdSourceFingerprint,
+                fingerprint_from_dict,
+            )
+            from dataset_devkit.validation import (
+                ValidationFinding,
+                _validate_indus_ad_extensions,
+            )
+
+            fingerprints: dict[str, IndusAdSourceFingerprint] = {}
+            for recording in self.recordings():
+                fingerprint = fingerprint_from_dict(recording["source"])
+                if not isinstance(fingerprint, IndusAdSourceFingerprint):
+                    raise DatasetFormatError("integrated recording source type differs")
+                fingerprints[fingerprint.digest] = fingerprint
+            integrated_findings: list[ValidationFinding] = []
+            log_sources = {row["log_token"]: row["source_digest"] for row in self.recordings()}
+            _validate_indus_ad_extensions(
+                root,
+                fingerprints=fingerprints,
+                scenes=set(indexes["scene"]),
+                samples=set(indexes["sample"]),
+                sample_data=set(indexes["sample_data"]),
+                findings=integrated_findings,
+                scene_sources={
+                    row["token"]: log_sources.get(row["log_token"], "") for row in tables["scene"]
+                },
+                sample_scenes={row["token"]: row["scene_token"] for row in tables["sample"]},
+                data_samples={row["token"]: row["sample_token"] for row in tables["sample_data"]},
+            )
+            if integrated_findings:
+                raise DatasetFormatError("INDUS-AD extension validation failed")
 
     def table(self, table_name: str) -> tuple[JsonRecord, ...]:
         """Return one official table in deterministic file order."""
@@ -497,4 +718,64 @@ class Dataset:
         value = self._extensions["pipeline_audit"]
         if not isinstance(value, dict):
             raise DatasetFormatError("pipeline audit extension is malformed")
+        return deepcopy(cast(JsonRecord, value))
+
+    def camera_annotation(self, frame_id: str) -> CameraAnnotationRecord:
+        """Return the unique selected camera weak label for ``frame_id``."""
+        matches = tuple(item for item in self._indus_camera if item.frame_id == frame_id)
+        if len(matches) != 1:
+            raise DatasetFormatError("camera annotation identity is missing or ambiguous")
+        return matches[0]
+
+    def camera_annotations(
+        self,
+        *,
+        recording_id: str | None = None,
+        camera_name: str | None = None,
+    ) -> tuple[CameraAnnotationRecord, ...]:
+        """Return camera weak labels in deterministic export order."""
+        return tuple(
+            item
+            for item in self._indus_camera
+            if (recording_id is None or item.recording_id == recording_id)
+            and (camera_name is None or item.camera_name == camera_name)
+        )
+
+    def gnss_annotation(self, recording_id: str, window_index: int) -> GnssAnnotationRecord:
+        """Return one unique GNSS scenario weak label."""
+        matches = tuple(
+            item
+            for item in self._indus_gnss
+            if item.recording_id == recording_id and item.window_index == window_index
+        )
+        if len(matches) != 1:
+            raise DatasetFormatError("GNSS annotation identity is missing or ambiguous")
+        return matches[0]
+
+    def gnss_annotations(
+        self, *, recording_id: str | None = None
+    ) -> tuple[GnssAnnotationRecord, ...]:
+        """Return GNSS scenario weak labels in deterministic export order."""
+        return tuple(
+            item
+            for item in self._indus_gnss
+            if recording_id is None or item.recording_id == recording_id
+        )
+
+    def dense_asset(self, frame_id: str, kind: str) -> DenseAssetRecord:
+        """Return one semantic or depth asset identity for a selected frame."""
+        if kind not in {"semantic", "depth"}:
+            raise DatasetFormatError("dense asset kind must be semantic or depth")
+        matches = tuple(
+            item for item in self._indus_dense if item.frame_id == frame_id and item.kind == kind
+        )
+        if len(matches) != 1:
+            raise DatasetFormatError("dense asset identity is missing or ambiguous")
+        return matches[0]
+
+    def indus_ad_contract(self) -> JsonRecord:
+        """Return a defensive copy of the integrated source/export contract."""
+        value = self._extensions.get("indus_ad/contract")
+        if not isinstance(value, dict):
+            raise DatasetFormatError("INDUS-AD contract is unavailable")
         return deepcopy(cast(JsonRecord, value))

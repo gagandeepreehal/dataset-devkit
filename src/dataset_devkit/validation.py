@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 from contextlib import suppress
 from dataclasses import dataclass
@@ -14,12 +15,19 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
+import pyarrow.parquet as pq
 from PIL import Image
 
 from dataset_devkit.config import GLOBAL_CONFIG_ADAPTER, GlobalConfig
 from dataset_devkit.export import NUSCENES_VERSION, OFFICIAL_TABLES
+from dataset_devkit.indus_ad_export import (
+    camera_annotation_schema,
+    dense_asset_schema,
+    gnss_annotation_schema,
+)
 from dataset_devkit.provenance import (
     DecodedSourceFingerprint,
+    IndusAdSourceFingerprint,
     SourceFingerprint,
     canonical_hash,
     canonical_json,
@@ -402,9 +410,7 @@ def _images(
         location = f"map[{ordinal}]"
         filename = _safe_relative(record.get("filename"), prefix="maps", parts=2)
         if filename is None:
-            findings.append(
-                ValidationFinding("error", "filename", location, "unsafe map filename")
-            )
+            findings.append(ValidationFinding("error", "filename", location, "unsafe map filename"))
             continue
         try:
             path = root / filename
@@ -416,9 +422,7 @@ def _images(
                 if image.format != "PNG" or image.mode != "L" or image.size != (1, 1):
                     raise OSError("compatibility mask must be a 1x1 grayscale PNG")
         except (OSError, ValueError) as error:
-            findings.append(
-                ValidationFinding("error", "compatibility_map", location, str(error))
-            )
+            findings.append(ValidationFinding("error", "compatibility_map", location, str(error)))
 
 
 def _sha256_text(value: object) -> bool:
@@ -430,11 +434,7 @@ def _sha256_text(value: object) -> bool:
 
 
 def _finite_number(value: object) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _canonical_strings(value: object) -> bool:
@@ -453,10 +453,7 @@ def _finite_json_tree(value: object) -> bool:
     if isinstance(value, list):
         return all(_finite_json_tree(item) for item in value)
     if isinstance(value, dict):
-        return all(
-            isinstance(key, str) and _finite_json_tree(item)
-            for key, item in value.items()
-        )
+        return all(isinstance(key, str) and _finite_json_tree(item) for key, item in value.items())
     return False
 
 
@@ -474,8 +471,10 @@ def _regular_file_sha256(path: Path) -> str | None:
             after = os.fstat(descriptor)
         finally:
             os.close(descriptor)
+
         def identity(item: os.stat_result) -> tuple[int, int, int, int]:
             return item.st_dev, item.st_ino, item.st_size, item.st_nlink
+
         if identity(before) != identity(opened) or identity(opened) != identity(after):
             return None
         return digest.hexdigest()
@@ -492,9 +491,7 @@ def _validate_pipeline_audit(
     findings: list[ValidationFinding],
 ) -> list[dict[str, Any]] | None:
     def fail(message: str) -> None:
-        findings.append(
-            ValidationFinding("error", "pipeline_audit", "pipeline_audit", message)
-        )
+        findings.append(ValidationFinding("error", "pipeline_audit", "pipeline_audit", message))
 
     if not isinstance(pipeline_audit, dict):
         fail("pipeline audit report is malformed")
@@ -628,9 +625,7 @@ def _validate_pipeline_audit(
     rejected_ids = {(item["scene_token"], item["source_digest"]) for item in rejected}
     selected_ids = {(item["scene_token"], item["source_digest"]) for item in assignments}
     unselected_ids = {(item["scene_token"], item["source_digest"]) for item in unselected}
-    sequence_ids = {
-        (item["scene_token"], item["source_digest"]) for item in typed_sequence
-    }
+    sequence_ids = {(item["scene_token"], item["source_digest"]) for item in typed_sequence}
     selected_sources = {source for _, source in selected_ids}
     sequence_sources = {source for _, source in sequence_ids}
     filtered_ids = accepted_ids | rejected_ids
@@ -686,9 +681,7 @@ def _validate_pipeline_audit(
         if isinstance(item, dict)
     }
     if any(
-        split_by_id.get((item["scene_token"], item["source_digest"]), {}).get(
-            "primary_scenario"
-        )
+        split_by_id.get((item["scene_token"], item["source_digest"]), {}).get("primary_scenario")
         != item["primary_scenario"]
         for item in assignments
     ):
@@ -707,9 +700,7 @@ def _validate_split_extension(
     findings: list[ValidationFinding],
 ) -> None:
     def fail(message: str) -> None:
-        findings.append(
-            ValidationFinding("error", "split_integrity", "split", message)
-        )
+        findings.append(ValidationFinding("error", "split_integrity", "split", message))
 
     expected_keys = {
         "schema_version",
@@ -734,8 +725,7 @@ def _validate_split_extension(
     assignments = split["assignments"]
     if not isinstance(assignments, list) or any(
         not isinstance(item, dict)
-        or set(item)
-        != {"scene_token", "source_digest", "primary_scenario", "split", "rank"}
+        or set(item) != {"scene_token", "source_digest", "primary_scenario", "split", "rank"}
         for item in assignments
     ):
         fail("split assignments are malformed")
@@ -772,8 +762,7 @@ def _validate_split_extension(
         seed != config.split.seed
         or float(fraction) != config.split.test_fraction
         or stratify != config.split.stratify
-        or split.get("config_fingerprint")
-        != canonical_hash(config.split.model_dump(mode="json"))
+        or split.get("config_fingerprint") != canonical_hash(config.split.model_dump(mode="json"))
     ):
         fail("split configuration commitment differs from resolved config")
     population = len(typed)
@@ -829,9 +818,9 @@ def _validate_split_extension(
                 )
                 remainders.append((ideal - Decimal(floor), tie, scenario))
             remaining = target - sum(quotas.values())
-            for _, _, scenario in sorted(
-                remainders, key=lambda item: (-item[0], item[1], item[2])
-            )[:remaining]:
+            for _, _, scenario in sorted(remainders, key=lambda item: (-item[0], item[1], item[2]))[
+                :remaining
+            ]:
                 quotas[scenario] += 1
 
             for scenario in sorted(groups):
@@ -862,8 +851,7 @@ def _validate_split_extension(
                     recipients = [
                         name
                         for name in groups
-                        if quotas[name]
-                        < (len(groups[name]) - 1 if len(groups[name]) >= 2 else 1)
+                        if quotas[name] < (len(groups[name]) - 1 if len(groups[name]) >= 2 else 1)
                     ]
                     if recipients:
                         recipient = min(
@@ -915,8 +903,7 @@ def _validate_split_extension(
                 ),
             )
             expected_test_identities.update(
-                (item["scene_token"], item["source_digest"])
-                for item in ranked[:target]
+                (item["scene_token"], item["source_digest"]) for item in ranked[:target]
             )
         submitted_test_identities = {
             (item["scene_token"], item["source_digest"])
@@ -952,8 +939,7 @@ def _validate_split_extension(
                 continue
             count = len(items)
             expected_tests = sum(
-                (item["scene_token"], item["source_digest"])
-                in expected_test_identities
+                (item["scene_token"], item["source_digest"]) in expected_test_identities
                 for item in items
             )
             target_tests = quotas.get(scenario, expected_tests)
@@ -969,8 +955,7 @@ def _validate_split_extension(
             )
             if (
                 audit.get("population_count") != count
-                or audit.get("expected_test_count")
-                != str(Decimal(count) * Decimal(str(fraction)))
+                or audit.get("expected_test_count") != str(Decimal(count) * Decimal(str(fraction)))
                 or audit.get("target_test_count") != target_tests
                 or audit.get("actual_test_count") != expected_tests
                 or audit.get("actual_train_count") != count - expected_tests
@@ -1000,9 +985,7 @@ def _validate_split_extension(
     split_by_scene = {cast(str, item["scene_token"]): item["split"] for item in typed}
     expected_pairs: list[dict[str, object]] = []
     graph_sequence = (
-        pipeline_audit.get("graph_scene_sequence")
-        if isinstance(pipeline_audit, dict)
-        else None
+        pipeline_audit.get("graph_scene_sequence") if isinstance(pipeline_audit, dict) else None
     )
     sequence_fields = {
         "source_digest",
@@ -1073,12 +1056,191 @@ def _validate_split_extension(
                 or actual.get("later_scene_token") != expected["later_scene_token"]
                 or actual.get("earlier_split") != expected["earlier_split"]
                 or actual.get("later_split") != expected["later_split"]
-                or actual.get("earlier_last_timestamp_ns")
-                != expected["earlier_last_timestamp_ns"]
-                or actual.get("later_first_timestamp_ns")
-                != expected["later_first_timestamp_ns"]
+                or actual.get("earlier_last_timestamp_ns") != expected["earlier_last_timestamp_ns"]
+                or actual.get("later_first_timestamp_ns") != expected["later_first_timestamp_ns"]
             ):
                 fail("adjacent-scene leakage pair differs from chronology")
+
+
+def _validate_indus_ad_extensions(
+    root: Path,
+    *,
+    fingerprints: dict[str, IndusAdSourceFingerprint],
+    scenes: set[str],
+    samples: set[str],
+    sample_data: set[str],
+    findings: list[ValidationFinding],
+    scene_sources: dict[str, str] | None = None,
+    sample_scenes: dict[str, str] | None = None,
+    data_samples: dict[str, str] | None = None,
+) -> None:
+    directory = root / "mz_extensions" / "indus_ad"
+    contract = _load_json(directory / "contract.json", findings, "indus_ad/contract")
+    contract_keys = {
+        "schema_version",
+        "contract",
+        "source_repo_id",
+        "source_revision",
+        "annotation_schema_sha256",
+        "selected_layers",
+        "camera_rows",
+        "gnss_rows",
+        "dense_rows",
+        "join_audit",
+        "weak_label_provenance",
+    }
+    contract_bad = (
+        not isinstance(contract, dict)
+        or set(contract) != contract_keys
+        or contract.get("schema_version") != 1
+        or contract.get("contract") != "indus_ad_integrated_v1"
+        or contract.get("weak_label_provenance") != "machine_generated_weak_pseudo_label"
+    )
+    if isinstance(contract, dict) and fingerprints:
+        contract_bad = contract_bad or (
+            any(item.repo_id != contract.get("source_repo_id") for item in fingerprints.values())
+            or any(
+                item.revision != contract.get("source_revision") for item in fingerprints.values()
+            )
+            or any(
+                item.annotation_schema_sha256 != contract.get("annotation_schema_sha256")
+                for item in fingerprints.values()
+            )
+        )
+    if contract_bad:
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_value",
+                "indus_ad/contract",
+                "integrated annotation contract differs from source fingerprints",
+            )
+        )
+    expected_schemas = {
+        "camera_annotations": camera_annotation_schema(),
+        "gnss_annotations": gnss_annotation_schema(),
+        "dense_assets": dense_asset_schema(),
+    }
+    rows: dict[str, list[dict[str, Any]]] = {}
+    for name, expected in expected_schemas.items():
+        try:
+            parquet = pq.ParquetFile(directory / f"{name}.parquet")
+            if not parquet.schema_arrow.remove_metadata().equals(expected, check_metadata=False):
+                raise ValueError("schema differs")
+            rows[name] = cast(list[dict[str, Any]], parquet.read().to_pylist())
+        except Exception:
+            findings.append(
+                ValidationFinding(
+                    "error",
+                    "extension_schema",
+                    f"indus_ad/{name}",
+                    "integrated extension Parquet is missing or has the wrong schema",
+                )
+            )
+            rows[name] = []
+    camera_rows = rows["camera_annotations"]
+    gnss_rows = rows["gnss_annotations"]
+    dense_rows = rows["dense_assets"]
+    from dataset_devkit.dataset import (
+        _camera_annotation_record,
+        _dense_asset_record,
+        _gnss_annotation_record,
+    )
+
+    try:
+        for camera_row in camera_rows:
+            _camera_annotation_record(camera_row)
+        for gnss_row in gnss_rows:
+            _gnss_annotation_record(gnss_row)
+        for dense_row in dense_rows:
+            _dense_asset_record(dense_row)
+    except (ValueError, TypeError, KeyError, OverflowError):
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_value",
+                "indus_ad",
+                "integrated annotation values violate their typed contract",
+            )
+        )
+    if isinstance(contract, dict) and any(
+        contract.get(key) != len(value)
+        for key, value in (
+            ("camera_rows", camera_rows),
+            ("gnss_rows", gnss_rows),
+            ("dense_rows", dense_rows),
+        )
+    ):
+        findings.append(
+            ValidationFinding("error", "extension_value", "indus_ad", "row counts differ")
+        )
+    camera_ids = [row.get("frame_id") for row in camera_rows]
+    dense_ids = [(row.get("frame_id"), row.get("kind")) for row in dense_rows]
+    gnss_ids = [(row.get("recording_id"), row.get("window_index")) for row in gnss_rows]
+    bad = (
+        len(camera_ids) != len(set(camera_ids))
+        or len(dense_ids) != len(set(dense_ids))
+        or len(gnss_ids) != len(set(gnss_ids))
+    )
+    provenance = "machine_generated_weak_pseudo_label"
+    for row in camera_rows:
+        fingerprint = fingerprints.get(cast(str, row.get("source_digest")))
+        bad = bad or (
+            fingerprint is None
+            or row.get("recording_id") != fingerprint.recording_id
+            or row.get("scene_token") not in scenes
+            or row.get("sample_token") not in samples
+            or row.get("sample_data_token") not in sample_data
+            or row.get("weak_label_provenance") != provenance
+            or (
+                scene_sources is not None
+                and scene_sources.get(cast(str, row.get("scene_token"))) != row.get("source_digest")
+            )
+            or (
+                sample_scenes is not None
+                and sample_scenes.get(cast(str, row.get("sample_token"))) != row.get("scene_token")
+            )
+            or (
+                data_samples is not None
+                and data_samples.get(cast(str, row.get("sample_data_token")))
+                != row.get("sample_token")
+            )
+        )
+    for row in gnss_rows:
+        fingerprint = fingerprints.get(cast(str, row.get("source_digest")))
+        scene_tokens = row.get("scene_tokens")
+        sample_tokens = row.get("sample_tokens")
+        bad = bad or (
+            fingerprint is None
+            or row.get("recording_id") != fingerprint.recording_id
+            or not isinstance(scene_tokens, list)
+            or not isinstance(sample_tokens, list)
+            or any(token not in scenes for token in scene_tokens or [])
+            or any(token not in samples for token in sample_tokens or [])
+            or row.get("weak_label_provenance") != provenance
+        )
+    camera_frames = set(camera_ids)
+    for row in dense_rows:
+        fingerprint = fingerprints.get(cast(str, row.get("source_digest")))
+        digest = row.get("payload_sha256")
+        bad = bad or (
+            fingerprint is None
+            or row.get("recording_id") != fingerprint.recording_id
+            or row.get("frame_id") not in camera_frames
+            or row.get("scene_token") not in scenes
+            or row.get("sample_data_token") not in sample_data
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        )
+    if bad:
+        findings.append(
+            ValidationFinding(
+                "error",
+                "extension_reference",
+                "indus_ad",
+                "integrated annotation identities or references are invalid",
+            )
+        )
 
 
 def _extensions(
@@ -1129,23 +1291,23 @@ def _extensions(
         "pose_frame",
         "global_horizontal_resolution_m",
     }
-    source_type = (
-        source_metadata.get("source_type")
-        if isinstance(source_metadata, dict)
-        else None
-    )
+    source_type = source_metadata.get("source_type") if isinstance(source_metadata, dict) else None
     expected_source_contract = (
         ("privacy_transformed", "recording_local_enu_v1", 1.0)
-        if source_type == "decoded_hf"
+        if source_type in {"decoded_hf", "indus_ad_hf"}
         else ("restricted_raw", "web_mercator_v1", None)
         if source_type == "mcap_hf"
         else None
     )
     actual_source_contract = (
-        source_metadata.get("privacy_classification"),
-        source_metadata.get("pose_frame"),
-        source_metadata.get("global_horizontal_resolution_m"),
-    ) if isinstance(source_metadata, dict) else None
+        (
+            source_metadata.get("privacy_classification"),
+            source_metadata.get("pose_frame"),
+            source_metadata.get("global_horizontal_resolution_m"),
+        )
+        if isinstance(source_metadata, dict)
+        else None
+    )
     if (
         not isinstance(source_metadata, dict)
         or set(source_metadata) != source_metadata_keys
@@ -1163,14 +1325,13 @@ def _extensions(
         )
     recordings = loaded["recordings"]
     log_tokens = {
-        cast(str, item.get("token"))
-        for item in tables["log"]
-        if isinstance(item.get("token"), str)
+        cast(str, item.get("token")) for item in tables["log"] if isinstance(item.get("token"), str)
     }
     recording_sources: set[str] = set()
     log_to_source: dict[str, str] = {}
     source_repo_paths: dict[str, str] = {}
     source_types_by_digest: dict[str, str] = {}
+    indus_ad_fingerprints: dict[str, IndusAdSourceFingerprint] = {}
     channels_by_source: dict[str, dict[str, str]] = {}
     recording_keys = {"source", "source_digest", "log_token", "channels"}
     legacy_source_keys = {"repo_id", "revision", "repo_path", "sha256", "size"}
@@ -1209,11 +1370,7 @@ def _extensions(
                         if set(source_value) == legacy_source_keys
                         else fingerprint_from_dict(source_value)
                     )
-            repo_path = (
-                None
-                if parsed_source is None
-                else fingerprint_locator(parsed_source)
-            )
+            repo_path = None if parsed_source is None else fingerprint_locator(parsed_source)
             channels = item.get("channels")
             channel_rows = (
                 cast(list[dict[str, Any]], channels) if isinstance(channels, list) else []
@@ -1244,13 +1401,16 @@ def _extensions(
             else:
                 source_repo_paths[source] = repo_path
                 source_types_by_digest[source] = (
-                    "decoded_hf"
+                    "indus_ad_hf"
+                    if isinstance(parsed_source, IndusAdSourceFingerprint)
+                    else "decoded_hf"
                     if isinstance(parsed_source, DecodedSourceFingerprint)
                     else "mcap_hf"
                 )
+                if isinstance(parsed_source, IndusAdSourceFingerprint):
+                    indus_ad_fingerprints[source] = parsed_source
                 channels_by_source[source] = {
-                    cast(str, row["normalized"]): cast(str, row["original"])
-                    for row in channel_rows
+                    cast(str, row["normalized"]): cast(str, row["original"]) for row in channel_rows
                 }
     else:
         findings.append(
@@ -1270,7 +1430,7 @@ def _extensions(
                 "recording log coverage differs from official logs",
             )
         )
-    if source_type in {"mcap_hf", "decoded_hf"} and any(
+    if source_type in {"mcap_hf", "decoded_hf", "indus_ad_hf"} and any(
         item != source_type for item in source_types_by_digest.values()
     ):
         findings.append(
@@ -1352,9 +1512,7 @@ def _extensions(
             )
     sample_by_token = {cast(str, item["token"]): item for item in tables["sample"]}
     data_by_token = {cast(str, item["token"]): item for item in tables["sample_data"]}
-    calibration_by_token = {
-        cast(str, item["token"]): item for item in tables["calibrated_sensor"]
-    }
+    calibration_by_token = {cast(str, item["token"]): item for item in tables["calibrated_sensor"]}
     sensor_by_token = {cast(str, item["token"]): item for item in tables["sensor"]}
     samples_by_scene: dict[str, set[str]] = {scene: set() for scene in scenes}
     data_by_scene: dict[str, set[str]] = {scene: set() for scene in scenes}
@@ -1369,9 +1527,7 @@ def _extensions(
         scene_token = sample.get("scene_token")
         if isinstance(scene_token, str) and scene_token in data_by_scene:
             data_by_scene[scene_token].add(token)
-        calibration = calibration_by_token.get(
-            cast(str, data.get("calibrated_sensor_token")), {}
-        )
+        calibration = calibration_by_token.get(cast(str, data.get("calibrated_sensor_token")), {})
         sensor = sensor_by_token.get(cast(str, calibration.get("sensor_token")), {})
         channel = sensor.get("channel")
         if isinstance(channel, str):
@@ -1443,9 +1599,7 @@ def _extensions(
                 else []
             )
             data_rows = (
-                cast(list[dict[str, Any]], nested_data)
-                if isinstance(nested_data, list)
-                else []
+                cast(list[dict[str, Any]], nested_data) if isinstance(nested_data, list) else []
             )
             sample_ids = [row.get("sample_token") for row in sample_rows]
             data_ids = [row.get("sample_data_token") for row in data_rows]
@@ -1454,10 +1608,7 @@ def _extensions(
                     not _finite_number(value) or not 0 <= cast(float, value) <= 1
                     for value in ratios
                 )
-                or any(
-                    not _finite_number(value) or cast(float, value) < 0
-                    for value in sync_values
-                )
+                or any(not _finite_number(value) or cast(float, value) < 0 for value in sync_values)
                 or not isinstance(coverage, list)
                 or any(
                     not isinstance(row, dict)
@@ -1518,8 +1669,7 @@ def _extensions(
                     or not isinstance(row.get("gnss_source_validity"), list)
                     or len(row.get("gnss_source_validity", [])) != 2
                     or any(
-                        not isinstance(value, bool)
-                        for value in row.get("gnss_source_validity", [])
+                        not isinstance(value, bool) for value in row.get("gnss_source_validity", [])
                     )
                     for row in data_rows
                 )
@@ -1586,10 +1736,7 @@ def _extensions(
                 or (isinstance(timestamp, int) and not isinstance(timestamp, bool))
                 for timestamp in timestamps
             )
-            and (
-                value.get("camera_name") is None
-                or isinstance(value.get("camera_name"), str)
-            )
+            and (value.get("camera_name") is None or isinstance(value.get("camera_name"), str))
             and isinstance(value.get("enabled"), bool)
         )
 
@@ -1678,10 +1825,7 @@ def _extensions(
             recording_validity_malformed = True
             continue
         if row.get("valid") != (
-            not any(
-                isinstance(item, dict) and item.get("enabled") is True
-                for item in observations
-            )
+            not any(isinstance(item, dict) and item.get("enabled") is True for item in observations)
         ):
             recording_validity_malformed = True
         final_identities: set[tuple[int, int]] = set()
@@ -1736,8 +1880,7 @@ def _extensions(
                     or isinstance(item.get("camera_index"), bool)
                     or not isinstance(item.get("camera_name"), str)
                     or any(
-                        not isinstance(item.get(key), int)
-                        or isinstance(item.get(key), bool)
+                        not isinstance(item.get(key), int) or isinstance(item.get(key), bool)
                         for key in (
                             "camera_timestamp_ns",
                             "batch_timestamp_ns",
@@ -1751,10 +1894,7 @@ def _extensions(
                 or (
                     audit.get("final_candidate") != audit.get("valid")
                     or audit.get("audit_only")
-                    != (
-                        row.get("policy") == "retain_for_audit"
-                        and audit.get("valid") is False
-                    )
+                    != (row.get("policy") == "retain_for_audit" and audit.get("valid") is False)
                 )
             ):
                 recording_validity_malformed = True
@@ -1890,8 +2030,7 @@ def _extensions(
                 or item.get("original_channel") != original
                 or not isinstance(item.get("timestamp_ns"), int)
                 or isinstance(item.get("timestamp_ns"), bool)
-                or cast(int, item.get("timestamp_ns")) // 1000
-                != official.get("timestamp")
+                or cast(int, item.get("timestamp_ns")) // 1000 != official.get("timestamp")
                 or item.get("image_sha256") != image_digest
                 or not _sha256_text(item.get("image_sha256"))
                 or not isinstance(available, bool)
@@ -1902,8 +2041,7 @@ def _extensions(
                 or not _finite_json_tree(item.get("before"))
                 or not _finite_json_tree(item.get("after"))
                 or any(
-                    value is not None and not _finite_number(value)
-                    for value in nullable_scalars
+                    value is not None and not _finite_number(value) for value in nullable_scalars
                 )
                 or (
                     fraction is not None
@@ -1945,7 +2083,7 @@ def _extensions(
                 or (item.get("before") is not None and not isinstance(item.get("before"), dict))
                 or (item.get("after") is not None and not isinstance(item.get("after"), dict))
             )
-            if source_type == "decoded_hf":
+            if source_type in {"decoded_hf", "indus_ad_hf"}:
                 pose = pose_by_token.get(cast(str, official.get("ego_pose_token")), {})
                 translation = item.get("translation_xyz_m")
                 published_east = item.get("published_east_m")
@@ -2006,8 +2144,7 @@ def _extensions(
         )
     elif isinstance(assignments, list) and any(
         isinstance(item, dict)
-        and item.get("source_digest")
-        != scene_to_source.get(cast(str, item.get("scene_token")))
+        and item.get("source_digest") != scene_to_source.get(cast(str, item.get("scene_token")))
         for item in assignments
     ):
         findings.append(
@@ -2035,8 +2172,7 @@ def _extensions(
     if (
         not isinstance(annotations, dict)
         or set(annotations) != {"scenes", "records", "matches", "windows"}
-        or
-        not isinstance(annotation_scenes, list)
+        or not isinstance(annotation_scenes, list)
         or any(
             not isinstance(item, dict) or set(item) != annotation_scene_keys
             for item in annotation_scenes
@@ -2052,8 +2188,7 @@ def _extensions(
         )
     elif any(
         isinstance(item, dict)
-        and item.get("source_digest")
-        != scene_to_source.get(cast(str, item.get("scene_token")))
+        and item.get("source_digest") != scene_to_source.get(cast(str, item.get("scene_token")))
         for item in annotation_scenes
     ):
         findings.append(
@@ -2128,8 +2263,7 @@ def _extensions(
         }
         malformed_annotations = malformed_annotations or any(
             item.get("source_digest") not in recording_sources
-            or source_repo_paths.get(cast(str, item.get("source_digest")))
-            != item.get("repo_path")
+            or source_repo_paths.get(cast(str, item.get("source_digest"))) != item.get("repo_path")
             for item in records_typed
         )
         malformed_annotations = malformed_annotations or any(
@@ -2141,8 +2275,7 @@ def _extensions(
         malformed_annotations = malformed_annotations or any(
             item.get("source_digest") not in recording_sources
             or not isinstance(item.get("annotation_tokens"), list)
-            or len(item.get("annotation_tokens", []))
-            != len(set(item.get("annotation_tokens", [])))
+            or len(item.get("annotation_tokens", [])) != len(set(item.get("annotation_tokens", [])))
             or any(
                 record_source.get(cast(str, token)) != item.get("source_digest")
                 for token in item.get("annotation_tokens", [])
@@ -2153,8 +2286,7 @@ def _extensions(
             malformed_annotations = malformed_annotations or any(
                 not isinstance(item, dict)
                 or not isinstance(item.get("annotation_refs"), list)
-                or len(item.get("annotation_refs", []))
-                != len(set(item.get("annotation_refs", [])))
+                or len(item.get("annotation_refs", [])) != len(set(item.get("annotation_refs", [])))
                 or any(
                     record_source.get(cast(str, token)) != item.get("source_digest")
                     for token in item.get("annotation_refs", [])
@@ -2176,6 +2308,18 @@ def _extensions(
                 )
             )
     validation = loaded["validation"]
+    if source_type == "indus_ad_hf":
+        _validate_indus_ad_extensions(
+            root,
+            fingerprints=indus_ad_fingerprints,
+            scenes=scenes,
+            samples=samples,
+            sample_data=sample_data,
+            findings=findings,
+            scene_sources=scene_to_source,
+            sample_scenes={row["token"]: row["scene_token"] for row in tables["sample"]},
+            data_samples={row["token"]: row["sample_token"] for row in tables["sample_data"]},
+        )
     pipeline_audit = loaded["pipeline_audit"]
     _validate_pipeline_audit(
         pipeline_audit,
@@ -2233,9 +2377,7 @@ def _extensions(
     return validation
 
 
-def _walk_regular_files(
-    root: Path, *, root_fd: int | None = None
-) -> dict[str, tuple[int, str]]:
+def _walk_regular_files(root: Path, *, root_fd: int | None = None) -> dict[str, tuple[int, str]]:
     if root_fd is not None:
         return hash_regular_files_fd(root_fd, excluded=frozenset({_MANIFEST}))
     before = root.lstat()
@@ -2280,9 +2422,7 @@ def _verify_manifest(
         lease.assert_bound()
         root_fd = lease.duplicate_root_fd()
         try:
-            value = _read_pinned_json(
-                root_fd, ("mz_extensions", "content_manifest.json")
-            )
+            value = _read_pinned_json(root_fd, ("mz_extensions", "content_manifest.json"))
         except (OSError, ValueError, json.JSONDecodeError) as error:
             findings.append(
                 ValidationFinding("error", "json", _MANIFEST, f"malformed JSON: {error}")
@@ -2328,6 +2468,7 @@ def _read_pinned_json(root_fd: int, parts: tuple[str, ...]) -> object:
                 chunks.append(chunk)
             after = os.fstat(descriptor)
             listed = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+
             def identity(item: os.stat_result) -> tuple[int, int, int, int, int, int]:
                 return (
                     item.st_dev,
@@ -2337,6 +2478,7 @@ def _read_pinned_json(root_fd: int, parts: tuple[str, ...]) -> object:
                     item.st_mtime_ns,
                     item.st_ctime_ns,
                 )
+
             if identity(before) != identity(after) or identity(after) != identity(listed):
                 raise ValueError("pinned JSON changed while reading")
             return cast(object, json.loads(b"".join(chunks)))
@@ -2348,9 +2490,7 @@ def _read_pinned_json(root_fd: int, parts: tuple[str, ...]) -> object:
 
 def verify_publication_manifest_fd(root_fd: int, expected_content_hash: str) -> None:
     """Rebind finalized bytes to their manifest through pinned root authority."""
-    manifest = _read_pinned_json(
-        root_fd, ("mz_extensions", "content_manifest.json")
-    )
+    manifest = _read_pinned_json(root_fd, ("mz_extensions", "content_manifest.json"))
     actual = build_content_manifest(Path("."), root_fd=root_fd)
     if manifest != actual or actual.get("root_sha256") != expected_content_hash:
         raise DatasetValidationError(
@@ -2436,9 +2576,7 @@ def validate_dataset(
             or sensor_record.get("modality") != "camera"
         ):
             findings.append(
-                ValidationFinding(
-                    "error", "sensor", f"sensor[{ordinal}]", "invalid camera sensor"
-                )
+                ValidationFinding("error", "sensor", f"sensor[{ordinal}]", "invalid camera sensor")
             )
     sensor_channels = [item.get("channel") for item in tables["sensor"]]
     if len(sensor_channels) != len(set(map(str, sensor_channels))):
@@ -2446,9 +2584,8 @@ def validate_dataset(
             ValidationFinding("error", "sensor", "sensor", "camera channels are not unique")
         )
     pose_references = [item.get("ego_pose_token") for item in tables["sample_data"]]
-    if (
-        len(pose_references) != len(set(map(str, pose_references)))
-        or set(pose_references) != set(indexes["ego_pose"])
+    if len(pose_references) != len(set(map(str, pose_references))) or set(pose_references) != set(
+        indexes["ego_pose"]
     ):
         findings.append(
             ValidationFinding(
@@ -2512,9 +2649,7 @@ def validate_dataset(
     for item in tables["sample_data"]:
         calibration_key = item.get("calibrated_sensor_token")
         calibration = (
-            calibrations.get(calibration_key)
-            if isinstance(calibration_key, str)
-            else None
+            calibrations.get(calibration_key) if isinstance(calibration_key, str) else None
         )
         sensor_key = None if calibration is None else calibration.get("sensor_token")
         sensor = sensors.get(sensor_key) if isinstance(sensor_key, str) else None
@@ -2563,12 +2698,8 @@ def validate_dataset(
                     f"invalid resolved config: {error}",
                 )
             )
-    validation_evidence = _extensions(
-        root, tables, config, findings, finalized=verify_manifest
-    )
-    content_hash = (
-        _verify_manifest(root, findings, lease=lease) if verify_manifest else None
-    )
+    validation_evidence = _extensions(root, tables, config, findings, finalized=verify_manifest)
+    content_hash = _verify_manifest(root, findings, lease=lease) if verify_manifest else None
     if official_smoke and not any(item.severity == "error" for item in findings):
         try:
             _official_smoke(root, version, tables)

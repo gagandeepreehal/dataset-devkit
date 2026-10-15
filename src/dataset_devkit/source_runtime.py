@@ -8,12 +8,13 @@ from dataclasses import dataclass
 from fractions import Fraction
 from functools import partial
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from dataset_devkit.config import (
     GlobalConfig,
     GlobalConfigV1,
     GlobalConfigV2,
+    GlobalConfigV21,
     PrivacyClassification,
     normalized_source,
 )
@@ -28,13 +29,23 @@ from dataset_devkit.extraction.models import PoseFrame
 from dataset_devkit.extraction.service import OwnedRecordingExtraction, RecordingExtractor
 from dataset_devkit.huggingface_acquisition import AcquisitionResult, HuggingFaceAcquirer
 from dataset_devkit.huggingface_manifest import ManifestEntry
+from dataset_devkit.indus_ad_acquisition import (
+    AcquiredIndusAdRecording,
+    IndusAdHfAcquirer,
+)
+from dataset_devkit.indus_ad_dense import MaterializedDenseAsset
+from dataset_devkit.indus_ad_models import (
+    IndusAdAnnotationBundle,
+    IndusAdRecordingEntry,
+    IndusAdSelectionPlan,
+)
 from dataset_devkit.provenance import (
     RecordingFingerprint,
     SourceFingerprint,
     canonical_hash,
 )
 
-SourceType = Literal["mcap_hf", "decoded_hf"]
+SourceType = Literal["mcap_hf", "decoded_hf", "indus_ad_hf"]
 
 
 class McapAcquirerProtocol(Protocol):
@@ -57,6 +68,12 @@ class DecodedAcquirerProtocol(Protocol):
     def acquire(self, entry: DecodedRecordingEntry) -> AcquiredDecodedRecording: ...
 
 
+class IndusAdAcquirerProtocol(Protocol):
+    def load_plan(self) -> IndusAdSelectionPlan: ...
+
+    def acquire(self, entry: IndusAdRecordingEntry) -> AcquiredIndusAdRecording: ...
+
+
 class SourceRuntimeProtocol(Protocol):
     @property
     def mcap_acquirer_factory(
@@ -67,6 +84,11 @@ class SourceRuntimeProtocol(Protocol):
     def decoded_acquirer_factory(
         self,
     ) -> Callable[[GlobalConfigV2], DecodedAcquirerProtocol]: ...
+
+    @property
+    def indus_ad_acquirer_factory(
+        self,
+    ) -> Callable[[GlobalConfigV21], IndusAdAcquirerProtocol]: ...
 
     @property
     def decoder_factory(self) -> Callable[[], HevcDecoder] | None: ...
@@ -82,6 +104,10 @@ class PreparedRecording:
     preparation_error: Exception | None = None
     cache_reusable: Callable[[str], bool] | None = None
     record_extraction_complete: Callable[[str], Path] | None = None
+    indus_ad_annotations: IndusAdAnnotationBundle | None = None
+    materialize_dense_assets: (
+        Callable[[frozenset[str]], tuple[MaterializedDenseAsset, ...]] | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -98,9 +124,7 @@ def _raise_preparation_error(error: Exception) -> OwnedRecordingExtraction:
     raise error
 
 
-def _prepare_mcap(
-    config: GlobalConfigV1, runtime: SourceRuntimeProtocol
-) -> PreparedSourceBatch:
+def _prepare_mcap(config: GlobalConfigV1, runtime: SourceRuntimeProtocol) -> PreparedSourceBatch:
     acquirer = runtime.mcap_acquirer_factory(config)
     entries = acquirer.load_entries()
     extractor_kwargs: dict[str, object] = {}
@@ -112,9 +136,7 @@ def _prepare_mcap(
         target_fps=Fraction(str(config.downsampling.target_fps)),
         tolerance_ns=int(config.downsampling.tolerance_ms * 1_000_000),
         staging_root=config.paths.work_dir,
-        compatible_gnss_numeric_types=(
-            config.mcap_compatibility.compatible_gnss_numeric_types
-        ),
+        compatible_gnss_numeric_types=(config.mcap_compatibility.compatible_gnss_numeric_types),
         allow_gnss_rec_timestamp_log_time_fallback=(
             config.mcap_compatibility.allow_gnss_rec_timestamp_log_time_fallback
         ),
@@ -166,9 +188,7 @@ def _prepare_mcap(
                 fingerprint,
                 outcome.artifact_path,
                 partial(extractor.extract_owned, outcome.artifact_path),
-                cache_reusable=partial(
-                    acquirer.extraction_cache_reusable, fingerprint
-                ),
+                cache_reusable=partial(acquirer.extraction_cache_reusable, fingerprint),
                 record_extraction_complete=partial(
                     acquirer.record_extraction_complete, fingerprint
                 ),
@@ -184,9 +204,7 @@ def _prepare_mcap(
     )
 
 
-def _prepare_decoded(
-    config: GlobalConfigV2, runtime: SourceRuntimeProtocol
-) -> PreparedSourceBatch:
+def _prepare_decoded(config: GlobalConfigV2, runtime: SourceRuntimeProtocol) -> PreparedSourceBatch:
     acquirer = runtime.decoded_acquirer_factory(config)
     plan = acquirer.load_plan()
     extractor = DecodedRecordingExtractor(
@@ -226,7 +244,7 @@ def _prepare_decoded(
                 entry.recording_id,
                 entry.fingerprint,
                 working_path,
-                partial(extractor.extract_owned, outcome),
+                partial(extractor.extract_owned, cast(Any, outcome)),
             )
         )
     return PreparedSourceBatch(
@@ -239,13 +257,70 @@ def _prepare_decoded(
     )
 
 
-def prepare_source(
-    config: GlobalConfig, runtime: SourceRuntimeProtocol
+def _prepare_indus_ad(
+    config: GlobalConfigV21, runtime: SourceRuntimeProtocol
 ) -> PreparedSourceBatch:
+    acquirer = runtime.indus_ad_acquirer_factory(config)
+    plan = acquirer.load_plan()
+    extractor = DecodedRecordingExtractor(
+        target_fps=Fraction(str(config.downsampling.target_fps)),
+        tolerance_ns=int(config.downsampling.tolerance_ms * 1_000_000),
+        staging_root=config.paths.work_dir,
+    )
+
+    def acquire_one(
+        entry: IndusAdRecordingEntry,
+    ) -> AcquiredIndusAdRecording | Exception:
+        try:
+            return acquirer.acquire(entry)
+        except Exception as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=config.execution.workers) as executor:
+        outcomes = tuple(executor.map(acquire_one, plan.recordings))
+    prepared: list[PreparedRecording] = []
+    for entry, outcome in zip(plan.recordings, outcomes, strict=True):
+        if isinstance(outcome, Exception):
+            prepared.append(
+                PreparedRecording(
+                    entry.recording_id,
+                    entry.recording_id,
+                    entry.fingerprint,
+                    Path(entry.recording_id),
+                    partial(_raise_preparation_error, outcome),
+                    preparation_error=outcome,
+                )
+            )
+            continue
+        working_path = outcome.path(outcome.entry.videos[0].path)
+        prepared.append(
+            PreparedRecording(
+                entry.recording_id,
+                entry.recording_id,
+                outcome.entry.fingerprint,
+                working_path,
+                partial(extractor.extract_owned, cast(Any, outcome)),
+                indus_ad_annotations=outcome.annotations,
+                materialize_dense_assets=outcome.materialize_dense_assets,
+            )
+        )
+    return PreparedSourceBatch(
+        "indus_ad_hf",
+        "privacy_transformed",
+        "recording_local_enu_v1",
+        1.0,
+        canonical_hash(config.source.model_dump(mode="json")),
+        tuple(prepared),
+    )
+
+
+def prepare_source(config: GlobalConfig, runtime: SourceRuntimeProtocol) -> PreparedSourceBatch:
     """Acquire and bind exactly the backend selected by the versioned config."""
     if isinstance(config, GlobalConfigV1):
         return _prepare_mcap(config, runtime)
-    return _prepare_decoded(config, runtime)
+    if isinstance(config, GlobalConfigV2):
+        return _prepare_decoded(config, runtime)
+    return _prepare_indus_ad(config, runtime)
 
 
 DEFAULT_MCAP_ACQUIRER_FACTORY = cast(
@@ -253,4 +328,8 @@ DEFAULT_MCAP_ACQUIRER_FACTORY = cast(
 )
 DEFAULT_DECODED_ACQUIRER_FACTORY = cast(
     Callable[[GlobalConfigV2], DecodedAcquirerProtocol], DecodedHfAcquirer.from_config
+)
+DEFAULT_INDUS_AD_ACQUIRER_FACTORY = cast(
+    Callable[[GlobalConfigV21], IndusAdAcquirerProtocol],
+    IndusAdHfAcquirer.from_config,
 )

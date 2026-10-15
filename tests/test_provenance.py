@@ -15,6 +15,7 @@ from dataset_devkit.provenance import (
     ArtifactIdentity,
     DecodedSourceFingerprint,
     ExtractionManifest,
+    IndusAdSourceFingerprint,
     SourceFingerprint,
     canonical_json,
     extraction_config_hash,
@@ -23,6 +24,23 @@ from dataset_devkit.provenance import (
     load_manifest,
     write_manifest,
 )
+
+
+def test_indus_ad_fingerprint_round_trip_and_digest() -> None:
+    fingerprint = IndusAdSourceFingerprint(
+        repo_id="owner/dataset",
+        revision="0" * 40,
+        contract="indus_ad_integrated_v1",
+        recording_id="recording-code",
+        catalog_sha256="a" * 64,
+        selected_artifacts_sha256="b" * 64,
+        annotation_schema_sha256="c" * 64,
+        total_size=123,
+    )
+
+    assert fingerprint_from_dict(fingerprint_to_dict(fingerprint)) == fingerprint
+    assert fingerprint.source_type == "indus_ad_hf"
+    assert fingerprint.cache_key == fingerprint.digest
 
 
 def test_decoded_fingerprint_binds_recording_and_artifact_set() -> None:

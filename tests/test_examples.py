@@ -36,6 +36,16 @@ def test_decoded_example_is_schema_and_runtime_valid() -> None:
     assert privacy_classification(config) == "privacy_transformed"
 
 
+def test_indus_ad_example_is_schema_and_runtime_valid() -> None:
+    path = ROOT / "examples" / "indus_ad_v21_config.json"
+
+    config = validate_config_schema_and_runtime(path)
+
+    assert config.schema_version == "2.1"
+    assert config.source.type == "indus_ad_hf"
+    assert privacy_classification(config) == "privacy_transformed"
+
+
 def test_readme_distinguishes_raw_and_privacy_transformed_sources() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 

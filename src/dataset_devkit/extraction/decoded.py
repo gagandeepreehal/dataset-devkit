@@ -5,17 +5,16 @@ from __future__ import annotations
 import json
 import math
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import av
 import pyarrow.parquet as pq
 
 from dataset_devkit.config import CameraName
-from dataset_devkit.decoded_acquisition import AcquiredDecodedRecording
 from dataset_devkit.extraction.decoded_gnss import (
     interpolate_privacy_gnss,
     parse_privacy_gnss,
@@ -98,6 +97,38 @@ class _CameraRow:
     height: int
 
 
+class _ArtifactLike(Protocol):
+    @property
+    def path(self) -> str: ...
+
+
+class _VideoLike(_ArtifactLike, Protocol):
+    @property
+    def camera(self) -> CameraName: ...
+
+    @property
+    def frame_count(self) -> int | None: ...
+
+
+class _EntryLike(Protocol):
+    @property
+    def recording_id(self) -> str: ...
+
+    @property
+    def videos(self) -> Sequence[_VideoLike]: ...
+
+    def artifacts_of(self, kind: str) -> Sequence[_ArtifactLike]: ...
+
+    def artifact(self, kind: str) -> _ArtifactLike: ...
+
+
+class _DecodedBundle(Protocol):
+    @property
+    def entry(self) -> _EntryLike: ...
+
+    def path(self, repo_path: str) -> Path: ...
+
+
 def _read_rows(path: Path, label: str) -> tuple[set[str], list[dict[str, object]]]:
     try:
         parquet = pq.ParquetFile(path)
@@ -141,7 +172,7 @@ def _camera(value: object) -> CameraName:
     return cast(CameraName, value)
 
 
-def _camera_rows(bundle: AcquiredDecodedRecording) -> tuple[_CameraRow, ...]:
+def _camera_rows(bundle: _DecodedBundle) -> tuple[_CameraRow, ...]:
     result: list[_CameraRow] = []
     next_index: dict[CameraName, int] = defaultdict(int)
     previous_offset: dict[CameraName, int] = {}
@@ -257,7 +288,7 @@ def _calibration_from_values(
 
 
 def _calibrations(
-    bundle: AcquiredDecodedRecording,
+    bundle: _DecodedBundle,
 ) -> dict[CameraName, CameraCalibration]:
     result: dict[CameraName, CameraCalibration] = {}
     for artifact in bundle.entry.artifacts_of("calibration"):
@@ -332,7 +363,7 @@ class DecodedRecordingExtractor:
         self.staging_root = staging_root
 
     def extract_owned(
-        self, bundle: AcquiredDecodedRecording
+        self, bundle: _DecodedBundle
     ) -> OwnedRecordingExtraction:
         rows = _camera_rows(bundle)
         selected_cameras = tuple(video.camera for video in bundle.entry.videos)
@@ -343,7 +374,7 @@ class DecodedRecordingExtractor:
         for row in rows:
             by_camera[row.camera].append(row)
         for video in bundle.entry.videos:
-            if len(by_camera[video.camera]) != video.frame_count:
+            if video.frame_count is None or len(by_camera[video.camera]) != video.frame_count:
                 raise StructuralExtractionError(
                     f"decoded frame count differs for {video.camera}"
                 )
@@ -370,7 +401,7 @@ class DecodedRecordingExtractor:
 
     def _decode(
         self,
-        bundle: AcquiredDecodedRecording,
+        bundle: _DecodedBundle,
         by_camera: Mapping[CameraName, list[_CameraRow]],
         calibrations: Mapping[CameraName, CameraCalibration],
         gnss: tuple[PrivacyGnssSample, ...],

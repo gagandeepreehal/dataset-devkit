@@ -8,7 +8,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Lock
 
-from dataset_devkit.config import GlobalConfig, GlobalConfigV1, GlobalConfigV2
+from dataset_devkit.config import (
+    GlobalConfig,
+    GlobalConfigV1,
+    GlobalConfigV2,
+    GlobalConfigV21,
+)
 from dataset_devkit.coordinator import (
     PublicationBlockedError,
     RecordingCoordinator,
@@ -30,6 +35,14 @@ from dataset_devkit.extraction.errors import StructuralExtractionError
 from dataset_devkit.extraction.models import RecordingExtractionResult
 from dataset_devkit.features import SceneFeatures, compute_recording_features
 from dataset_devkit.filtering import filter_scenes
+from dataset_devkit.indus_ad_join import (
+    AnnotationJoinAudit,
+    JoinedCameraAnnotation,
+    JoinedDenseAsset,
+    JoinedGnssAnnotation,
+    JoinedIndusAdAnnotations,
+    join_indus_ad_annotations,
+)
 from dataset_devkit.provenance import canonical_hash, extraction_config_hash
 from dataset_devkit.publication import (
     OwnedDirectoryAuthority,
@@ -43,8 +56,10 @@ from dataset_devkit.scenario_selection import select_scenarios
 from dataset_devkit.scenes import build_recording_scenes
 from dataset_devkit.source_runtime import (
     DEFAULT_DECODED_ACQUIRER_FACTORY,
+    DEFAULT_INDUS_AD_ACQUIRER_FACTORY,
     DEFAULT_MCAP_ACQUIRER_FACTORY,
     DecodedAcquirerProtocol,
+    IndusAdAcquirerProtocol,
     McapAcquirerProtocol,
     prepare_source,
 )
@@ -66,6 +81,9 @@ class BuildRuntime:
     )
     decoded_acquirer_factory: Callable[[GlobalConfigV2], DecodedAcquirerProtocol] = (
         DEFAULT_DECODED_ACQUIRER_FACTORY
+    )
+    indus_ad_acquirer_factory: Callable[[GlobalConfigV21], IndusAdAcquirerProtocol] = (
+        DEFAULT_INDUS_AD_ACQUIRER_FACTORY
     )
     decoder_factory: Callable[[], HevcDecoder] | None = None
     extraction_cache_factory: Callable[[Path], ExtractionResultCache] = ExtractionResultCache
@@ -109,6 +127,11 @@ class InspectionSummary:
     source_type: str
     privacy_classification: str
     pose_frame: str
+    camera_annotation_count: int = 0
+    gnss_annotation_count: int = 0
+    dense_asset_count: int = 0
+    annotation_contract: str | None = None
+    annotation_source_revision: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -126,6 +149,11 @@ class InspectionSummary:
             "source_type": self.source_type,
             "privacy_classification": self.privacy_classification,
             "pose_frame": self.pose_frame,
+            "camera_annotation_count": self.camera_annotation_count,
+            "gnss_annotation_count": self.gnss_annotation_count,
+            "dense_asset_count": self.dense_asset_count,
+            "annotation_contract": self.annotation_contract,
+            "annotation_source_revision": self.annotation_source_revision,
         }
 
 
@@ -158,9 +186,7 @@ class _WorkingExtractionRegistry:
                 self._authorities[recording_id] = authority
         except Exception as handoff_error:
             if not authority.cleanup():
-                raise OwnedDirectoryCleanupError(
-                    (authority.cleanup_failure(),)
-                ) from handoff_error
+                raise OwnedDirectoryCleanupError((authority.cleanup_failure(),)) from handoff_error
             raise
 
     @staticmethod
@@ -235,17 +261,12 @@ def _build_evidence_owned(
     prepared_by_id = {item.recording_id: item for item in batch.recordings}
     if len(prepared_by_id) != len(batch.recordings):
         raise BuildOperationalError("source runtime produced duplicate recording IDs")
-    if len(prepared_by_path) != sum(
-        item.preparation_error is None for item in batch.recordings
-    ):
+    if len(prepared_by_path) != sum(item.preparation_error is None for item in batch.recordings):
         raise BuildOperationalError("source runtime produced duplicate working paths")
 
     def extract_prepared(path: Path) -> RecordingExtractionResult:
         prepared = prepared_by_path[path.resolve()]
-        can_reuse = (
-            prepared.cache_reusable is None
-            or prepared.cache_reusable(extraction_hash)
-        )
+        can_reuse = prepared.cache_reusable is None or prepared.cache_reusable(extraction_hash)
         if can_reuse:
             cached = extraction_cache._materialize_owned(
                 prepared.fingerprint,
@@ -255,15 +276,11 @@ def _build_evidence_owned(
                 prepared.recording_id,
             )
             if cached is not None:
-                working.register(
-                    prepared.recording_id, cached.result, cached.authority
-                )
+                working.register(prepared.recording_id, cached.result, cached.authority)
                 return cached.result
         owned_extraction = prepared.extract_owned()
         extracted = owned_extraction.result
-        working.register(
-            prepared.recording_id, extracted, owned_extraction.authority
-        )
+        working.register(prepared.recording_id, extracted, owned_extraction.authority)
         try:
             extraction_cache.store(
                 prepared.fingerprint,
@@ -336,9 +353,7 @@ def _build_evidence_owned(
     for success in successes:
         prepared = prepared_by_id[success.recording_id]
         try:
-            graph = build_recording_scenes(
-                success.validity, prepared.fingerprint, config
-            )
+            graph = build_recording_scenes(success.validity, prepared.fingerprint, config)
         except Exception as error:
             request = request_by_id[success.recording_id]
             scene_failures.append(
@@ -438,20 +453,14 @@ def _build_evidence_owned(
                 config.quarantine.directory,
                 config.quarantine.manifest_name,
                 tuple(
-                    item.quarantine.report
-                    for item in all_failures
-                    if item.quarantine is not None
+                    item.quarantine.report for item in all_failures if item.quarantine is not None
                 ),
             )
         except Exception:
             quarantine_complete = False
-    failures = tuple(
-        prepared_by_id[item.recording_id].locator for item in all_failures
-    )
+    failures = tuple(prepared_by_id[item.recording_id].locator for item in all_failures)
     if failures and (
-        not config.execution.allow_partial_export
-        or not quarantine_complete
-        or not cleanup_complete
+        not config.execution.allow_partial_export or not quarantine_complete or not cleanup_complete
     ):
         raise BuildOperationalError(
             f"publication blocked after {len(failures)} quarantined recording failure(s)"
@@ -463,12 +472,9 @@ def _build_evidence_owned(
     if not selection.selected_scenes:
         raise BuildOperationalError("scenario selection produced an empty dataset")
     selected_sources = {item.source_digest for item in selection.assignments}
-    selected_graphs = tuple(
-        graph for graph in graphs if graph.source.digest in selected_sources
-    )
+    selected_graphs = tuple(graph for graph in graphs if graph.source.digest in selected_sources)
     selected_validity = tuple(
-        (graph.source, success_by_source[graph.source.digest].validity)
-        for graph in selected_graphs
+        (graph.source, success_by_source[graph.source.digest].validity) for graph in selected_graphs
     )
     split = split_selected_scenes(
         selection,
@@ -476,6 +482,50 @@ def _build_evidence_owned(
         config.scenarios,
         selected_graphs,
         config.split,
+    )
+    joined_camera: list[JoinedCameraAnnotation] = []
+    joined_gnss: list[JoinedGnssAnnotation] = []
+    joined_dense: list[JoinedDenseAsset] = []
+    join_audits: list[AnnotationJoinAudit] = []
+    if isinstance(config, GlobalConfigV21):
+        selected_tokens_by_source: dict[str, set[str]] = {}
+        for assignment in selection.assignments:
+            selected_tokens_by_source.setdefault(assignment.source_digest, set()).add(
+                assignment.scene_token
+            )
+        for graph in sorted(selected_graphs, key=lambda item: item.source.digest):
+            prepared = prepared_by_id[success_by_source[graph.source.digest].recording_id]
+            annotations = prepared.indus_ad_annotations
+            if annotations is None:
+                raise BuildOperationalError("integrated source omitted its annotation bundle")
+            selected_tokens = frozenset(selected_tokens_by_source.get(graph.source.digest, set()))
+            initial = join_indus_ad_annotations(
+                graph=graph,
+                selected_scene_tokens=selected_tokens,
+                annotations=annotations,
+            )
+            materialized = (
+                ()
+                if prepared.materialize_dense_assets is None
+                else prepared.materialize_dense_assets(
+                    frozenset(item.annotation.frame_id for item in initial.camera)
+                )
+            )
+            joined = join_indus_ad_annotations(
+                graph=graph,
+                selected_scene_tokens=selected_tokens,
+                annotations=annotations,
+                materialized=materialized,
+            )
+            joined_camera.extend(joined.camera)
+            joined_gnss.extend(joined.gnss)
+            joined_dense.extend(joined.dense)
+            join_audits.extend(joined.audits)
+    indus_ad_annotations = JoinedIndusAdAnnotations(
+        tuple(joined_camera),
+        tuple(joined_gnss),
+        tuple(joined_dense),
+        tuple(join_audits),
     )
     evidence = ExportEvidence(
         filtered.accepted,
@@ -515,15 +565,14 @@ def _build_evidence_owned(
                 "rule_audits": [asdict(item) for item in selection.rule_audits],
                 "unselected": [asdict(item) for item in selection.unselected],
             },
-            "graph_scene_sequence": pipeline_graph_scene_sequence(
-                tuple(graphs), selection
-            ),
+            "graph_scene_sequence": pipeline_graph_scene_sequence(tuple(graphs), selection),
         },
         selected_validity,
         source_type=batch.source_type,
         privacy_classification=batch.privacy_classification,
         pose_frame=batch.pose_frame,
         global_horizontal_resolution_m=batch.global_horizontal_resolution_m,
+        indus_ad_annotations=indus_ad_annotations,
     )
     return evidence, tuple(failures)
 
@@ -622,6 +671,9 @@ def inspect_dataset(
     validation = dataset.validation_report()
     manifest = json.loads((Path(dataroot) / "mz_extensions/content_manifest.json").read_text())
     source = dataset.source_metadata()
+    annotation_contract = (
+        dataset.indus_ad_contract() if source["source_type"] == "indus_ad_hf" else {}
+    )
     try:
         state = validation["state"]
         content_hash = manifest["root_sha256"]
@@ -645,4 +697,9 @@ def inspect_dataset(
         str(source["source_type"]),
         str(source["privacy_classification"]),
         str(source["pose_frame"]),
+        int(annotation_contract.get("camera_rows", 0)),
+        int(annotation_contract.get("gnss_rows", 0)),
+        int(annotation_contract.get("dense_rows", 0)),
+        annotation_contract.get("contract"),
+        annotation_contract.get("source_revision"),
     )

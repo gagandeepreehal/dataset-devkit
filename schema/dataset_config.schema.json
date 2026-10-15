@@ -123,6 +123,31 @@
       "title": "DecodedHfSourceConfig",
       "type": "object"
     },
+    "DenseAssetSelection": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "default": "none",
+          "enum": [
+            "none",
+            "selected_frames"
+          ],
+          "title": "Depth",
+          "type": "string"
+        },
+        "semantic": {
+          "default": "none",
+          "enum": [
+            "none",
+            "selected_frames"
+          ],
+          "title": "Semantic",
+          "type": "string"
+        }
+      },
+      "title": "DenseAssetSelection",
+      "type": "object"
+    },
     "DownsamplingConfig": {
       "additionalProperties": false,
       "properties": {
@@ -738,6 +763,117 @@
       "title": "GlobalConfigV2",
       "type": "object"
     },
+    "GlobalConfigV21": {
+      "additionalProperties": false,
+      "properties": {
+        "annotations": {
+          "$ref": "#/$defs/AnnotationsConfig"
+        },
+        "downsampling": {
+          "$ref": "#/$defs/DownsamplingConfig"
+        },
+        "execution": {
+          "$ref": "#/$defs/ExecutionConfig"
+        },
+        "filters": {
+          "$ref": "#/$defs/FiltersConfig"
+        },
+        "frame_validity": {
+          "$ref": "#/$defs/FrameValidityConfig"
+        },
+        "gnss": {
+          "$ref": "#/$defs/GnssConfig"
+        },
+        "image": {
+          "$ref": "#/$defs/ImageConfig"
+        },
+        "mcap_compatibility": {
+          "$ref": "#/$defs/McapCompatibilityConfig"
+        },
+        "paths": {
+          "$ref": "#/$defs/PathsConfig"
+        },
+        "publication": {
+          "$ref": "#/$defs/PublicationConfig"
+        },
+        "quarantine": {
+          "$ref": "#/$defs/QuarantineConfig"
+        },
+        "sanity_checks": {
+          "$ref": "#/$defs/SanityChecksConfig"
+        },
+        "scenarios": {
+          "$ref": "#/$defs/ScenariosConfig"
+        },
+        "scenes": {
+          "$ref": "#/$defs/ScenesConfig"
+        },
+        "schema_version": {
+          "const": "2.1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/IndusAdHfSourceConfig"
+        },
+        "split": {
+          "$ref": "#/$defs/SplitConfig"
+        },
+        "tags": {
+          "$ref": "#/$defs/TagsConfig"
+        }
+      },
+      "required": [
+        "paths",
+        "downsampling",
+        "image",
+        "gnss",
+        "frame_validity",
+        "sanity_checks",
+        "scenes",
+        "annotations",
+        "tags",
+        "filters",
+        "scenarios",
+        "split",
+        "execution",
+        "publication",
+        "schema_version",
+        "source"
+      ],
+      "title": "GlobalConfigV21",
+      "type": "object"
+    },
+    "GnssAnnotationSourceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "const": "indus_ad_gnss_annotations_v1",
+          "title": "Contract",
+          "type": "string"
+        },
+        "expected_source_revision": {
+          "title": "Expected Source Revision",
+          "type": "string"
+        },
+        "repo_id": {
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_id",
+        "revision",
+        "contract",
+        "expected_source_revision"
+      ],
+      "title": "GnssAnnotationSourceConfig",
+      "type": "object"
+    },
     "GnssConfig": {
       "additionalProperties": false,
       "properties": {
@@ -802,6 +938,110 @@
         "jpeg_quality"
       ],
       "title": "ImageConfig",
+      "type": "object"
+    },
+    "IndusAdHfSourceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "annotation_layers": {
+          "items": {
+            "enum": [
+              "camera_scalar",
+              "semantic_fractions",
+              "depth_summary",
+              "weather",
+              "gnss_scenarios"
+            ],
+            "type": "string"
+          },
+          "title": "Annotation Layers",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "cameras": {
+          "items": {
+            "enum": [
+              "cam_front",
+              "cam_front_left",
+              "cam_front_right",
+              "cam_front_tilted",
+              "cam_rear",
+              "cam_rear_left",
+              "cam_rear_right"
+            ],
+            "type": "string"
+          },
+          "title": "Cameras",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "contract": {
+          "const": "indus_ad_integrated_v1",
+          "title": "Contract",
+          "type": "string"
+        },
+        "dense_assets": {
+          "$ref": "#/$defs/DenseAssetSelection"
+        },
+        "gnss_annotation_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GnssAnnotationSourceConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "privacy_classification": {
+          "const": "privacy_transformed",
+          "default": "privacy_transformed",
+          "title": "Privacy Classification",
+          "type": "string"
+        },
+        "recording_ids": {
+          "items": {
+            "minLength": 1,
+            "pattern": "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$",
+            "type": "string"
+          },
+          "title": "Recording Ids",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "repo_id": {
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        },
+        "splits": {
+          "items": {
+            "minLength": 1,
+            "pattern": "^(?!\\.{1,2}$)(?!\\s)(?!.*(?:\\.|\\s)$)(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|$))[^\\u0000-\\u001f/\\\\<>:\\\"|?*]+$",
+            "type": "string"
+          },
+          "title": "Splits",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "type": {
+          "const": "indus_ad_hf",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_id",
+        "revision",
+        "type",
+        "contract",
+        "annotation_layers"
+      ],
+      "title": "IndusAdHfSourceConfig",
       "type": "object"
     },
     "InvalidationRulesConfig": {
@@ -1371,7 +1611,8 @@
   "discriminator": {
     "mapping": {
       "1.0": "#/$defs/GlobalConfigV1",
-      "2.0": "#/$defs/GlobalConfigV2"
+      "2.0": "#/$defs/GlobalConfigV2",
+      "2.1": "#/$defs/GlobalConfigV21"
     },
     "propertyName": "schema_version"
   },
@@ -1381,6 +1622,9 @@
     },
     {
       "$ref": "#/$defs/GlobalConfigV2"
+    },
+    {
+      "$ref": "#/$defs/GlobalConfigV21"
     }
   ]
 }

@@ -6,11 +6,11 @@
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE.md)
 
 Welcome to the development kit for creating compact, reproducible, nuScenes-compatible datasets
-from Minus Zero autonomous-driving releases. The recommended public-consumer input is the decoded
-V2 Hugging Face release after its privacy transformation. Original MCAP is also supported, but it
+from Minus Zero autonomous-driving releases. For the integrated INDUS-AD release with annotations,
+use the schema 2.1 Hugging Face backend. The decoded V2 backend remains supported. Original MCAP is also supported, but it
 is classified as **restricted raw** input and carries no anonymization claim.
 
-Neither source is a nuScenes dataset. This devkit selects useful driving scenes, subsamples the
+These sources are not nuScenes datasets. This devkit selects useful driving scenes, subsamples the
 sensor streams, and publishes a derived dataset using the nuScenes table and directory format.
 
 > [!IMPORTANT]
@@ -39,7 +39,7 @@ sensor streams, and publishes a derived dataset using the nuScenes table and dir
 experimentation, and model development:
 
 ```text
-Pinned decoded V2 or restricted raw MCAP release
+Pinned INDUS-AD, decoded V2, or restricted raw MCAP release
                          │
                          ▼
         verified acquisition and extraction
@@ -56,14 +56,15 @@ Pinned decoded V2 or restricted raw MCAP release
 
 The pipeline provides:
 
-- immutable, commit-pinned decoded V2 or MCAP acquisition from Hugging Face;
+- immutable, commit-pinned INDUS-AD, decoded V2, or MCAP acquisition from Hugging Face;
 - selective decoded artifact downloads with public privacy-manifest verification;
 - deterministic camera-frame downsampling and GNSS interpolation;
 - automatic, annotation-driven, or hybrid scene construction;
 - scene tagging, quality filtering, and deterministic scenario quotas;
 - deterministic scene-level train/test splitting;
 - validated nuScenes-compatible tables and camera assets; and
-- provenance, audit, quarantine, and content-manifest extensions.
+- provenance, audit, quarantine, and content-manifest extensions;
+- selected INDUS-AD camera, semantic, depth, weather, and optional GNSS weak pseudo-labels.
 
 The result is a **derived subset** of a Minus Zero release. Source artifacts are not modified. A
 decoded build never falls back to raw MCAP if its catalog, manifest, or privacy checks fail.
@@ -86,10 +87,16 @@ and descriptor-relative, no-follow filesystem operations.
 
 ## Source dataset setup
 
+The integrated INDUS-AD release uses schema `2.1` and the separate `indus_ad_hf`
+backend. Start with [examples/indus_ad_v21_config.json](examples/indus_ad_v21_config.json).
+It pins the source commit and adds camera, semantic-fraction, depth-summary, and
+weather weak pseudo-labels to selected output frames. Dense semantic/depth assets
+default to metadata only. See [the integrated workflow](docs/indus-ad.md).
+
 Minus Zero dataset releases are hosted as Hugging Face dataset repositories. Every source uses an
 exact repository name and full 40-character commit SHA; branch and tag names are rejected.
 
-For public-consumer work, start with
+For a release using the older decoded V2 layout, use
 [`examples/decoded_v2_config.json`](examples/decoded_v2_config.json). Its all-zero revision is an
 intentional non-release placeholder: replace it with the full commit SHA of a verified privacy
 release before running a build. `decoded_hf` is fixed to `privacy_transformed`; it verifies
@@ -131,22 +138,25 @@ recordings are not accepted as build inputs.
 
 ## Getting started
 
-Copy the recommended decoded configuration and annotations into the working directory:
+For integrated INDUS-AD, copy the schema 2.1 configuration and human annotation template:
 
 ```bash
-cp examples/decoded_v2_config.json dataset_config.json
+cp examples/indus_ad_v21_config.json dataset_config.json
 cp examples/annotations.jsonl annotations.jsonl
 ```
 
-Replace the all-zero revision with a verified privacy-release commit. Review recording/split,
-camera and modality selection, sampling rate, scene rules, scenario quotas, and output paths, then
+The integrated example pins a verified release commit. Review recording/split,
+camera and annotation-layer selection, sampling rate, scene rules, scenario quotas, and output paths, then
 build the derived dataset:
 
 ```bash
 dataset-devkit build --config dataset_config.json
 ```
 
-The command downloads only the selected decoded artifacts, processes each recording independently,
+For the legacy decoded V2 layout, use `examples/decoded_v2_config.json` and replace its all-zero
+revision with a verified release commit.
+
+The command downloads only the selected source artifacts and controls, processes each recording independently,
 and publishes the result only after final validation succeeds. Keep production payload processing
 and caches on `mzcloud`; the included fixture smoke test is intentionally tiny and local.
 
@@ -199,7 +209,7 @@ For example, a scenario rule can request a deterministic subset of left-turn sce
 The selected result records its source identities, filtering decisions, scenario assignments, and
 split evidence so it can be audited and reproduced.
 
-For decoded V2, trajectory features and official ego poses are calculated from the precise
+For integrated INDUS-AD and decoded V2, trajectory features and official ego poses are calculated from the precise
 per-recording **recording-local ENU** stream created by the privacy transformation. Published global
 east/north and inverse-derived latitude/longitude are one-metre-rounded context only. Each
 recording starts its own local frame; the devkit never creates cross-recording continuity.
@@ -228,6 +238,10 @@ information that does not belong in the standard tables, including the fixed sou
 contract, source fingerprints, validity evidence, scenario assignments, split decisions, pipeline
 audit data, and the final content manifest.
 
+Integrated output adds `mz_extensions/indus_ad/contract.json` and fixed-schema Parquet tables
+for camera annotations, GNSS scenario annotations, and dense asset references. These model outputs
+are weak pseudo-labels. Official object annotation tables remain empty.
+
 Published outputs are read-only artifacts. The devkit validates the complete staging dataset and
 then performs one atomic, no-overwrite publication. To change a dataset, rebuild it into a new,
 absent destination.
@@ -249,6 +263,16 @@ front_camera = dataset.camera(samples[0]["token"], "CAM_FRONT")
 ego_pose = dataset.ego_pose(front_camera["token"])
 ```
 
+For integrated output, query immutable weak-label records using source frame identities:
+
+```python
+camera_labels = dataset.camera_annotations(camera_name="cam_front")
+if camera_labels:
+    camera_label = dataset.camera_annotation(camera_labels[0].frame_id)
+    weather = camera_label.annotation.weather
+contract = dataset.indus_ad_contract()
+```
+
 The official `nuscenes-devkit` is also smoke-tested against the exported table structure during
 publication. Minus Zero extension files remain specific to this project.
 
@@ -257,6 +281,8 @@ publication. Minus Zero extension files remain specific to this project.
 | Guide | Contents |
 | --- | --- |
 | [Configuration](docs/configuration.md) | Source identity, paths, sensors, policies, and publication settings |
+| [Integrated INDUS-AD](docs/indus-ad.md) | Schema 2.1, annotation layers, exact joins, dense references, and SDK queries |
+| [INDUS-AD acceptance](docs/indus-ad-acceptance.md) | Verification results and production-testing limits |
 | [Extraction](docs/extraction.md) | MCAP and decoded V2 extraction, timestamps, local ENU poses, and staging |
 | [Validity](docs/validity.md) | Quality rules, sanity checks, quarantine, and partial publication |
 | [Scenes](docs/scenes.md) | Automatic, annotation-only, and hybrid scene construction |
@@ -273,6 +299,8 @@ publication. Minus Zero extension files remain specific to this project.
 - `v1.0-trainval` is the only publication version currently supported.
 - Input releases must be hosted on Hugging Face and pinned by a full commit SHA and the applicable
   manifest/control-plane contract.
+- Integrated dense payloads remain in the verified cache; exported rows retain their source
+  references and materialization state. Dense acquisition failures block publication.
 - LiDAR ingestion, arbitrary source repositories, symbolic revisions, and Windows are not
   supported.
 
