@@ -104,6 +104,23 @@ def test_indus_ad_v21_requires_consistent_layers_and_selectors() -> None:
             GLOBAL_CONFIG_ADAPTER.validate_python(data)
 
 
+@pytest.mark.parametrize("kind", ["semantic", "depth"])
+@pytest.mark.parametrize("has_camera_scalar", [False, True])
+def test_indus_ad_dense_selection_requires_camera_scalar(
+    tmp_path: Path, kind: str, has_camera_scalar: bool
+) -> None:
+    data = minimal_indus_ad_config()
+    source = data["source"]
+    assert isinstance(source, dict)
+    source["annotation_layers"] = ["camera_scalar"] if has_camera_scalar else []
+    source["dense_assets"] = {kind: "selected_frames"}
+    if has_camera_scalar:
+        load_config(write_config(tmp_path, data))
+    else:
+        with pytest.raises(ValidationError, match="dense assets require camera_scalar"):
+            load_config(write_config(tmp_path, data))
+
+
 def minimal_config() -> dict[str, object]:
     return {
         "schema_version": "1.0",
@@ -187,9 +204,7 @@ def test_decoded_source_has_fixed_privacy_classification() -> None:
         ("modalities", ["video", "gnss"]),
     ],
 )
-def test_decoded_source_rejects_mutable_or_incomplete_input(
-    field: str, value: object
-) -> None:
+def test_decoded_source_rejects_mutable_or_incomplete_input(field: str, value: object) -> None:
     payload = decoded_source()
     payload[field] = value
 
@@ -448,9 +463,7 @@ def test_huggingface_repo_id_must_be_owner_and_name(tmp_path: Path, repo_id: str
         "g" * 40,
     ],
 )
-def test_huggingface_revision_requires_full_lowercase_commit(
-    tmp_path: Path, revision: str
-) -> None:
+def test_huggingface_revision_requires_full_lowercase_commit(tmp_path: Path, revision: str) -> None:
     data = minimal_config()
     set_nested(data, "huggingface.revision", revision)
 
@@ -539,9 +552,7 @@ def test_bearer_prefixed_ordinary_strings_and_paths_are_allowed(tmp_path: Path) 
         ("publication.refuse_overwrite", False),
     ],
 )
-def test_v1_publication_contract_is_exact(
-    tmp_path: Path, field: str, value: object
-) -> None:
+def test_v1_publication_contract_is_exact(tmp_path: Path, field: str, value: object) -> None:
     data = minimal_config()
     set_nested(data, field, value)
 
@@ -673,11 +684,11 @@ def test_extended_policy_models_are_typed_and_resolve_paths(tmp_path: Path) -> N
     data["scenarios"] = {
         "seed": 42,
         "rules": [
-                {
-                    "name": "turns",
-                    "quota": 100,
-                    "required_all_tags": ["left_turn"],
-                }
+            {
+                "name": "turns",
+                "quota": 100,
+                "required_all_tags": ["left_turn"],
+            }
         ],
     }
     data["quarantine"] = {

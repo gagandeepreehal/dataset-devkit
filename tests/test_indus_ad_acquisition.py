@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 from collections.abc import Callable
 from dataclasses import replace
@@ -14,6 +15,45 @@ from dataset_devkit.huggingface_acquisition import AcquisitionError, IntegrityEr
 from dataset_devkit.indus_ad_acquisition import IndusAdHfAcquirer
 from dataset_devkit.indus_ad_annotations import gnss_scenario_schema
 from indus_ad_fixture import _repo_tree, write_executable_indus_ad_fixture, write_indus_ad_fixture
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("lfs", [False, True])
+def test_video_must_match_manifest_even_when_tree_accepts_same_size_bytes(
+    tmp_path: Path, cached: bool, lfs: bool
+) -> None:
+    fixture = write_indus_ad_fixture(tmp_path / "source")
+    video = next(item for item in fixture.tree if item.path.endswith(".mp4"))
+    path = fixture.root / video.path
+    original = path.read_bytes()
+    changed = bytes([original[0] ^ 1]) + original[1:]
+    path.write_bytes(changed)
+    tree = _repo_tree(fixture.root)
+    identity = next(item for item in tree if item.path == video.path)
+    if not lfs:
+        identity = replace(
+            identity,
+            blob_id=hashlib.sha1(
+                f"blob {len(changed)}\0".encode() + changed, usedforsecurity=False
+            ).hexdigest(),
+            sha256=None,
+        )
+        tree = tuple(identity if item.path == video.path else item for item in tree)
+    calls: list[str] = []
+    acquirer = IndusAdHfAcquirer(
+        source=fixture.source,
+        cache_dir=tmp_path / "cache",
+        list_tree=lambda repo_id, revision: tree,
+        download_file=_downloader(fixture.root, calls),
+    )
+    entry = acquirer.load_plan().recordings[0]
+    if cached:
+        acquirer._acquire_one(identity, "indus-ad-payload")
+        calls.clear()
+    with pytest.raises(IntegrityError, match="artifact integrity manifest"):
+        acquirer.acquire(entry)
+    if cached:
+        assert video.path not in calls
 
 
 def _downloader(source_root: Path, calls: list[str]) -> Callable[..., str]:

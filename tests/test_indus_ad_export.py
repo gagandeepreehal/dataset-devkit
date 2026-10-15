@@ -30,11 +30,13 @@ from test_export_dataset import _evidence
 
 
 @pytest.mark.parametrize("mutation", [None, "provenance", "revision", "token", "schema"])
+@pytest.mark.parametrize("scalar_only", [False, True])
 def test_export_and_sdk_expose_selected_indus_weak_labels(
     tmp_path: Path,
     config_factory: Callable[[], GlobalConfig],
     feature_factory: FeatureFactory,
     mutation: str | None,
+    scalar_only: bool,
 ) -> None:
     evidence = _evidence(tmp_path, config_factory, feature_factory)
     fixture = write_indus_ad_fixture(tmp_path / "indus")
@@ -73,7 +75,12 @@ def test_export_and_sdk_expose_selected_indus_weak_labels(
     common.pop("schema_version")
     common.pop("huggingface")
     common.pop("topics")
-    resolved = GlobalConfigV21(schema_version="2.1", source=fixture.source, **common)
+    selected_source = (
+        fixture.source.model_copy(update={"annotation_layers": ["camera_scalar"]})
+        if scalar_only
+        else fixture.source
+    )
+    resolved = GlobalConfigV21(schema_version="2.1", source=selected_source, **common)
     scene = graph.scenes[0]
     sample_data = next(item for item in graph.sample_data if item.scene_token == scene.token)
     camera_bundle = parse_camera_annotations(
@@ -119,8 +126,17 @@ def test_export_and_sdk_expose_selected_indus_weak_labels(
         root / "mz_extensions/indus_ad/camera_annotations.parquet"
     ).to_pylist()
     assert camera_rows[0]["weak_label_provenance"] == ("machine_generated_weak_pseudo_label")
+    assert camera_rows[0]["dark_fraction"] == 0.5
+    assert camera_rows[0]["overexposed_fraction"] == 0.5
+    if scalar_only:
+        assert camera_rows[0]["semantic_fractions"] == []
+        assert camera_rows[0]["drivable_fraction"] is None
     dataset = Dataset(root)
     assert dataset.camera_annotation("frame-fixture").sample_data_token == sample_data.token
+    assert (
+        dataset.camera_annotation("frame-fixture").annotation.image_quality.values["dark_fraction"]
+        == 0.5
+    )
     assert {dataset.dense_asset("frame-fixture", kind).kind for kind in ("semantic", "depth")} == {
         "semantic",
         "depth",

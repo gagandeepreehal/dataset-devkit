@@ -236,9 +236,17 @@ def serialize_indus_ad_extensions(
     for row in camera_rows:
         if "semantic_fractions" not in selected_layers:
             row["semantic_fractions"] = []
-            for key in tuple(row):
-                if key.endswith("_fraction"):
-                    row[key] = None
+            for category in (
+                "drivable",
+                "lane_marking",
+                "person_rider",
+                "two_wheeler",
+                "four_wheeler",
+                "building",
+                "vegetation",
+                "sky",
+            ):
+                row[f"{category}_fraction"] = None
         if "depth_summary" not in selected_layers:
             for key in ("depth_p10", "depth_p50", "depth_p90"):
                 row[key] = None

@@ -124,6 +124,7 @@ def _verify_tree_file(
     path: Path,
     local_root: Path,
     identity: RepositoryFile,
+    expected_sha256: str | None = None,
 ) -> str:
     verified = _verify_file(path, local_root)
     if verified.size != identity.size:
@@ -133,6 +134,8 @@ def _verify_tree_file(
             raise IntegrityError("downloaded SHA-256 differs from pinned repository tree")
     elif _git_blob_id(path.read_bytes()) != identity.blob_id:
         raise IntegrityError("downloaded blob ID differs from pinned repository tree")
+    if expected_sha256 is not None and verified.sha256 != expected_sha256:
+        raise IntegrityError("downloaded SHA-256 differs from artifact integrity manifest")
     return verified.sha256
 
 
@@ -185,7 +188,9 @@ class IndusAdHfAcquirer:
             raise AcquisitionError("INDUS-AD acquirer requires an indus_ad_hf source")
         return cls(source=config.source, cache_dir=config.paths.cache_dir)
 
-    def _acquire_one(self, identity: RepositoryFile, namespace: str) -> Path:
+    def _acquire_one(
+        self, identity: RepositoryFile, namespace: str, *, expected_sha256: str | None = None
+    ) -> Path:
         cache_identity = canonical_hash(
             {
                 "repo_id": self.source.repo_id,
@@ -201,7 +206,12 @@ class IndusAdHfAcquirer:
         receipt = directory / "receipt.json"
         with _recording_lock(directory):
             if final.exists():
-                digest = _verify_tree_file(path=final, local_root=directory, identity=identity)
+                digest = _verify_tree_file(
+                    path=final,
+                    local_root=directory,
+                    identity=identity,
+                    expected_sha256=expected_sha256,
+                )
                 if not receipt.exists():
                     _atomic_write(
                         receipt,
@@ -223,9 +233,19 @@ class IndusAdHfAcquirer:
                 filename=identity.path,
                 local_dir=scratch,
             )
-            digest = _verify_tree_file(path=returned, local_root=scratch, identity=identity)
+            digest = _verify_tree_file(
+                path=returned,
+                local_root=scratch,
+                identity=identity,
+                expected_sha256=expected_sha256,
+            )
             os.replace(returned, final)
-            promoted = _verify_tree_file(path=final, local_root=directory, identity=identity)
+            promoted = _verify_tree_file(
+                path=final,
+                local_root=directory,
+                identity=identity,
+                expected_sha256=expected_sha256,
+            )
             if promoted != digest:
                 raise IntegrityError("promoted INDUS-AD artifact changed identity")
             _atomic_write(
@@ -314,7 +334,9 @@ class IndusAdHfAcquirer:
             if item.kind in {"video", "camera_frames", "calibration", "gnss"}
         ]
         files = {
-            item.path: self._acquire_one(self._tree[item.path], "indus-ad-payload")
+            item.path: self._acquire_one(
+                self._tree[item.path], "indus-ad-payload", expected_sha256=item.sha256
+            )
             for item in selected_artifacts
         }
         files.update(self._control_files)
