@@ -1,12 +1,12 @@
-# Native MCAP and decoded V2 extraction contracts
+# Camera and GNSS extraction
 
 `dataset_devkit.extraction.RecordingExtractor` is the restricted-raw MCAP boundary between verified
 acquisition and validity/scene/export policy. It reads a local MCAP, stages selected camera images,
 and returns immutable typed records. It does not decide whether timestamp gaps, GNSS quality, or
-individual samples are acceptable; `evaluate_validity` applies those Task 4 policies afterward.
+individual samples are acceptable; `evaluate_validity` applies those policies afterward.
 
-`dataset_devkit.decoded_extraction.DecodedRecordingExtractor` implements the same downstream
-recording contract from privacy-transformed decoded V2 videos and Parquet tables. It does not
+`dataset_devkit.extraction.decoded.DecodedRecordingExtractor` implements the same downstream
+recording contract from integrated INDUS-AD and decoded V2 videos and Parquet tables. It does not
 reconstruct an MCAP, use absolute dates, or search for a raw fallback.
 
 ## Required source streams

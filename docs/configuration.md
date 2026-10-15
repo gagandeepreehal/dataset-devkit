@@ -2,9 +2,8 @@
 
 `dataset_config.json` is validated by the strict, versioned Pydantic `GlobalConfig` model. Schema
 `"1.0"` is the legacy MCAP form, schema `"2.0"` selects decoded V2, and schema `"2.1"`
-selects integrated INDUS-AD. Unknown
-keys are rejected and relative local paths resolve from the directory containing the configuration
-file.
+selects integrated INDUS-AD. Unknown keys are rejected. Relative paths resolve from
+the directory containing the configuration file.
 
 For integrated INDUS-AD with annotations, start with
 [`examples/indus_ad_v21_config.json`](../examples/indus_ad_v21_config.json) and
@@ -39,8 +38,8 @@ The following example describes the decoded V2 backend:
 }
 ```
 
-`decoded_hf` is the only schema `"2.0"` backend. It
-is fixed to `privacy_classification: "privacy_transformed"`. `recording_ids` and `splits` are
+`decoded_hf` is the schema `"2.0"` backend, fixed to
+`privacy_classification: "privacy_transformed"`. `recording_ids` and `splits` are
 intersected; at least one must select data. The six untilted cameras are the default. The seventh
 supported camera, `cam_front_tilted`, is opt-in. Video, GNSS, and calibration are required
 modalities; camera labels, semantic masks, and depth can be selected for acquisition without
@@ -88,8 +87,7 @@ downloaded and independently hashed. These are structural privacy-release checks
 not rerun face/plate detection or independently prove the anonymizer's model behavior.
 
 A decoded privacy, catalog, schema, size, or hash failure stops the build. There is no raw MCAP
-fallback. Production decoded payloads, work directories, and caches belong on `mzcloud`; local
-execution is intended for configuration checks and tiny fixtures.
+fallback.
 
 ## MCAP compatibility
 

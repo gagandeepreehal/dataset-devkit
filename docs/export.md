@@ -1,12 +1,12 @@
 # nuScenes export and Dataset SDK
 
-`export_dataset(staging_dataroot, evidence)` consumes immutable Task 5 through Task 7 evidence.
+`export_dataset(staging_dataroot, evidence)` consumes immutable scene, selection, and split evidence.
 It recomputes scenario selection, scene splits, and every recording scene graph before writing.
 The resolved global scenario/split configuration and dataset namespace must match that evidence.
 The destination must be absent or an empty real directory; existing content is never
 overwritten. Every destination write uses pinned no-follow directory descriptors and exclusive
 leaf creation. A failed export may leave a partial staging root for audit; direct callers must
-remove that root before retrying. Task 9 owns sibling-staging cleanup, validation, and atomic
+remove that root before retrying. The build service owns staging cleanup, validation, and atomic
 publication.
 
 ## Official layout
@@ -40,15 +40,16 @@ and camera-time ego poses are required and must be finite.
 `mz_extensions` contains canonical `source.json`, `recordings.json`, `gnss.json`, `validity.json`,
 `validation.json`, `tags.json`, `annotations.json`, `split.json`, `config.json`, and
 `content_manifest.json`, plus `pipeline_audit.json` for filtering, rejection, and ordered
-scenario-selection evidence. The pipeline audit also retains a compact, complete Task 5 scene
+scenario-selection evidence. The pipeline audit also retains a compact, complete scene
 chronology so validation distinguishes genuinely adjacent scenes from selected scenes separated
-by an unselected scene. Computed tags and human labels stay separate. Before Task 9 runs,
+by an unselected scene. Computed tags and human labels stay separate. Before finalization,
 `validation.json` truthfully records `state: "not_run"` and never claims success.
 `validity.json` uses schema version 2 with `recordings` for complete per-source observations and
 grid/sample audits, plus `scenes` for selected-scene aggregates and official sample references.
 
-`source.json` makes the backend boundary machine-readable. Decoded output must declare
-`decoded_hf`, `privacy_transformed`, `recording_local_enu_v1`, and global horizontal resolution
+`source.json` records the source type, privacy classification, and pose frame.
+Integrated INDUS-AD and decoded V2 declare `indus_ad_hf` or `decoded_hf`, respectively,
+with `privacy_transformed`, `recording_local_enu_v1`, and global horizontal resolution
 `1.0`. Restricted-raw MCAP declares `mcap_hf`, `restricted_raw`, and the legacy Web Mercator pose
 frame with no privacy resolution claim. `recordings.json` stores a source-discriminated fingerprint
 for each recording.
@@ -146,6 +147,5 @@ duplicate tokens. Its stable methods are:
 - `recordings()`, `source_metadata()`, `validation_report()`, and `pipeline_audit()`.
 
 Camera lookup uses a load-time validated `(sample_token, channel)` index, requires exactly one row,
-and rejects missing, malformed, or ambiguous references. Every returned table, record, traversal,
-or extension value is a defensive deep copy, so caller mutation cannot alter cached indexes or
-subsequent queries.
+and rejects missing, malformed, or ambiguous references. JSON table and extension accessors return
+defensive deep copies; integrated annotation accessors return immutable typed records.
