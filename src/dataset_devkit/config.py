@@ -748,9 +748,7 @@ class DecodedHfSourceConfig(HuggingFaceIdentityConfig):
     recording_ids: list[SafeSegment] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    splits: list[SafeSegment] = Field(
-        default_factory=list, json_schema_extra={"uniqueItems": True}
-    )
+    splits: list[SafeSegment] = Field(default_factory=list, json_schema_extra={"uniqueItems": True})
     cameras: list[CameraName] = Field(
         default_factory=lambda: list(DEFAULT_DECODED_CAMERAS),
         json_schema_extra={"uniqueItems": True},
@@ -800,16 +798,12 @@ class IndusAdHfSourceConfig(HuggingFaceIdentityConfig):
     recording_ids: list[SafeSegment] = Field(
         default_factory=list, json_schema_extra={"uniqueItems": True}
     )
-    splits: list[SafeSegment] = Field(
-        default_factory=list, json_schema_extra={"uniqueItems": True}
-    )
+    splits: list[SafeSegment] = Field(default_factory=list, json_schema_extra={"uniqueItems": True})
     cameras: list[CameraName] = Field(
         default_factory=lambda: list(DEFAULT_DECODED_CAMERAS),
         json_schema_extra={"uniqueItems": True},
     )
-    annotation_layers: list[IndusAdAnnotationLayer] = Field(
-        json_schema_extra={"uniqueItems": True}
-    )
+    annotation_layers: list[IndusAdAnnotationLayer] = Field(json_schema_extra={"uniqueItems": True})
     dense_assets: DenseAssetSelection = Field(default_factory=DenseAssetSelection)
     gnss_annotation_source: GnssAnnotationSourceConfig | None = None
     privacy_classification: Literal["privacy_transformed"] = "privacy_transformed"
@@ -832,6 +826,11 @@ class IndusAdHfSourceConfig(HuggingFaceIdentityConfig):
         ):
             raise ValueError("camera-derived layers require camera_scalar")
         has_gnss_layer = "gnss_scenarios" in self.annotation_layers
+        if (
+            self.dense_assets.semantic == "selected_frames"
+            or self.dense_assets.depth == "selected_frames"
+        ) and "camera_scalar" not in self.annotation_layers:
+            raise ValueError("selected-frame dense assets require camera_scalar")
         if has_gnss_layer != (self.gnss_annotation_source is not None):
             raise ValueError(
                 "gnss_scenarios and gnss_annotation_source must be configured together"

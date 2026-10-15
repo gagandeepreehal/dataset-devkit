@@ -12,7 +12,9 @@ Schema `2.1` selects `source.type: "indus_ad_hf"` and
 SHAs. Six untilted cameras are selected by default; `cam_front_tilted` is optional.
 
 The adapter verifies agreement among metadata, video Viewer, video integrity, and
-privacy-release controls. The reference release contains 1,469 recordings, 9,927
+privacy-release controls. Acquired video bytes must match both the pinned tree
+identity and the integrity-manifest SHA-256, including when reused from cache.
+The reference release contains 1,469 recordings, 9,927
 non-null videos marked `face_plate_blurred`, and 356 missing tilted-camera slots.
 These status and integrity checks do not independently measure residual privacy
 risk. Original MCAP remains `restricted_raw` and has no anonymization claim.
@@ -52,7 +54,10 @@ contract = dataset.indus_ad_contract()
 Singular queries raise `DatasetFormatError` for missing or ambiguous identities.
 `dense_assets.semantic` and `dense_assets.depth` default to `none`; enabling
 `selected_frames` verifies the requested archive members only after final scene
-selection. Dense export rows describe source identities and materialization state.
+selection and requires `camera_scalar` in `annotation_layers`. Invalid combinations
+are rejected during configuration validation. Dense export rows describe source
+identities and materialization state. Scalar image-quality measurements, including
+dark and overexposed fractions, are retained when semantic fractions are disabled.
 
 Run the control-only compatibility gate with:
 
